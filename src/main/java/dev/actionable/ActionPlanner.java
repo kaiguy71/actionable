@@ -28,6 +28,9 @@ final class ActionPlanner {
             Choose one next action based on the latest world state; the plan will be requested again as the
             player moves or the surroundings change. Use mine to gather resources. Baritone build requires
             an existing schematic; do not claim to craft tools or create schematics.
+            Prioritize immediate danger: nearby hostile mobs marked as targeting the player or low health
+            should take precedence over the task. Use only navigation or cancellation to respond; combat
+            commands are not available.
             Return only JSON: {"summary":"brief next-step explanation","complete":false,"actions":[{"command":"mine stone"}]}.
             Commands are sent to Baritone and must begin with one of: mine, goto, build, explore, find, pickup, farm, cancel, come, follow.
             Return at most one short action. Do not invent inventory or world facts. If uncertain, return no actions.

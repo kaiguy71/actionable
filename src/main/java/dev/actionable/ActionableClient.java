@@ -75,7 +75,7 @@ public final class ActionableClient implements ClientModInitializer {
             return;
         }
         if (!FabricLoader.getInstance().isModLoaded("baritone")) {
-            tell(client, "Baritone is required to execute actions; install the Minecraft 26.3 Baritone mod.");
+            tell(client, "Baritone is required (Fabric mod ID 'baritone', version 1.20.0 or newer, for Minecraft 26.3).");
             return;
         }
 

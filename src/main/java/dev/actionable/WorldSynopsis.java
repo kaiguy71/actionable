@@ -48,7 +48,9 @@ final class WorldSynopsis {
                 threats.append(BuiltInRegistries.ENTITY_TYPE.getKey(monster.getType()))
                         .append('@').append(monster.blockPosition().getX()).append(',')
                         .append(monster.blockPosition().getY()).append(',')
-                        .append(monster.blockPosition().getZ());
+                        .append(monster.blockPosition().getZ())
+                        .append("(d=").append(Math.round(monster.distanceTo(player)))
+                        .append(monster.getTarget() == player ? ",targeting_player" : "").append(')');
             }
         }
         synopsis.append("; nearby_hostile_mobs=").append(threatCount == 0 ? "none" : threats);

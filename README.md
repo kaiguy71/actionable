@@ -1,4 +1,5 @@
 # Actionable
+Readme Date: 9/30/2026
 
 A client-side Fabric mod framework for turning natural-language tasks into local Gemma plans and Baritone actions.
 
@@ -16,3 +17,7 @@ In game, use `/action <task>`, for example `/action Build a 30x30 house made out
 Press **Ctrl+`** to pause or resume planning. Pausing invalidates pending plans and sends Baritone `#stop`; the active task resumes when re-enabled. Only a small allowlist of Baritone commands is accepted from the model. Set `-Dactionable.ollama.url=http://localhost:11434/api/chat` or `-Dactionable.ollama.model=gemma3:4b` to override the Ollama endpoint or model.
 
 The prompt, compact world snapshot, and previous action are sent to the configured Ollama endpoint. Keep the endpoint local or use a service you trust. Actions are limited to Baritone commands; this first framework does not craft tools or generate schematics, so construction requires an existing usable schematic.
+
+
+## Contributors
+Kai Battistoni, ChatGPT, Claude Code

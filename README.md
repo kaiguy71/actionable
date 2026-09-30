@@ -9,7 +9,7 @@ A client-side Fabric mod framework for turning natural-language tasks into local
 - Ollama running locally with a Gemma model (by default, `gemma3:4b`)
 - Baritone for Minecraft 26.3 installed as a client mod
 
-Run `ollama pull gemma3:4b`, start Ollama, then build with `gradle build`. Install the generated JAR from `build/libs` with Fabric API and Baritone.
+Run `ollama pull gemma3:4b`, start Ollama, then build with `./gradlew build`. Install the generated JAR from `build/libs` with Fabric API and Baritone.
 
 In game, use `/action <task>`, for example `/action Build a 30x30 house made out of light-colored stone blocks`. Actionable sends a compact snapshot of the player's position, inventory, nearby sampled blocks, and nearby hostile mobs to Ollama. It asks for one next action at a time and refreshes the snapshot every ten seconds so the plan can adapt while Baritone works. The model can use Baritone's `mine` command to gather resources and its `build` command to build an available schematic.
 

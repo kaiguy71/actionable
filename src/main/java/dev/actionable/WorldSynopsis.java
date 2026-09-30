@@ -17,7 +17,7 @@ final class WorldSynopsis {
         var player = client.player;
         var level = client.level;
         StringBuilder synopsis = new StringBuilder(512);
-        synopsis.append("dimension=").append(level.dimension().location())
+        synopsis.append("dimension=").append(level.dimension().identifier())
                 .append("; position=").append(player.blockPosition().getX()).append(',')
                 .append(player.blockPosition().getY()).append(',')
                 .append(player.blockPosition().getZ())
@@ -57,7 +57,7 @@ final class WorldSynopsis {
 
     private static String inventory(net.minecraft.world.entity.player.Player player) {
         Map<String, Integer> items = new TreeMap<>();
-        for (ItemStack stack : player.getInventory().items) {
+        for (ItemStack stack : player.getInventory().getNonEquipmentItems()) {
             if (!stack.isEmpty()) {
                 items.merge(BuiltInRegistries.ITEM.getKey(stack.getItem()).toString(), stack.getCount(), Integer::sum);
             }

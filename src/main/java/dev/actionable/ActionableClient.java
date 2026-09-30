@@ -3,15 +3,14 @@ package dev.actionable;
 import com.mojang.blaze3d.platform.InputConstants;
 import com.mojang.brigadier.arguments.StringArgumentType;
 import net.fabricmc.api.ClientModInitializer;
-import net.fabricmc.fabric.api.client.command.v2.ClientCommandManager;
 import net.fabricmc.fabric.api.client.command.v2.ClientCommandRegistrationCallback;
+import net.fabricmc.fabric.api.client.command.v2.ClientCommands;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
-import net.fabricmc.fabric.api.client.keybinding.v1.KeyBindingHelper;
+import net.fabricmc.fabric.api.client.keymapping.v1.KeyMappingHelper;
 import net.fabricmc.loader.api.FabricLoader;
 import net.minecraft.client.KeyMapping;
 import net.minecraft.client.Minecraft;
 import net.minecraft.network.chat.Component;
-import org.lwjgl.glfw.GLFW;
 
 public final class ActionableClient implements ClientModInitializer {
     private final ActionPlanner planner = new ActionPlanner();
@@ -26,17 +25,17 @@ public final class ActionableClient implements ClientModInitializer {
 
     @Override
     public void onInitializeClient() {
-        toggleKey = KeyBindingHelper.registerKeyBinding(
+        toggleKey = KeyMappingHelper.registerKeyMapping(
                 new KeyMapping(
                         "key.actionable.toggle",
-                        InputConstants.Type.KEYSYM,
-                        GLFW.GLFW_KEY_GRAVE_ACCENT,
+                        InputConstants.Type.KEYBOARD,
+                        InputConstants.KEY_GRAVE,
                         KeyMapping.Category.MISC
                 )
         );
         ClientCommandRegistrationCallback.EVENT.register((dispatcher, registryAccess) ->
-                dispatcher.register(ClientCommandManager.literal("action")
-                        .then(ClientCommandManager.argument("prompt", StringArgumentType.greedyString())
+                dispatcher.register(ClientCommands.literal("action")
+                        .then(ClientCommands.argument("prompt", StringArgumentType.greedyString())
                                 .executes(context -> {
                                     submit(context.getArgument("prompt", String.class));
                                     return 1;
@@ -45,9 +44,8 @@ public final class ActionableClient implements ClientModInitializer {
         ClientTickEvents.END_CLIENT_TICK.register(client -> {
             ticksSinceAction++;
             while (toggleKey.consumeClick()) {
-                long window = client.getWindow().getWindow();
-                boolean controlDown = GLFW.glfwGetKey(window, GLFW.GLFW_KEY_LEFT_CONTROL) == GLFW.GLFW_PRESS
-                        || GLFW.glfwGetKey(window, GLFW.GLFW_KEY_RIGHT_CONTROL) == GLFW.GLFW_PRESS;
+                boolean controlDown = InputConstants.isKeyDown(InputConstants.KEY_LCONTROL)
+                        || InputConstants.isKeyDown(InputConstants.KEY_RCONTROL);
                 if (controlDown) {
                     toggle(client);
                 }
@@ -146,7 +144,7 @@ public final class ActionableClient implements ClientModInitializer {
 
     private static void tell(Minecraft client, String message) {
         if (client.player != null) {
-            client.player.displayClientMessage(Component.literal("[Actionable] " + message), false);
+            client.player.sendSystemMessage(Component.literal("[Actionable] " + message));
         }
     }
 }

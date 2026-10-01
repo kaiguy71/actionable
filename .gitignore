@@ -1,6 +1,8 @@
 .vscode/
 .gradle/
 build/
+bin/
+gen/
 *.iml
 *.log
 *.tmp

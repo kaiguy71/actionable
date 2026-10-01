@@ -32,8 +32,9 @@ final class ActionPlanner {
             integer coordinate only for goto.
 
             Baritone commands have these exact forms:
-            - mine <block_id> [quantity]: searches loaded chunks, navigates to matching blocks, and keeps
-              mining until the quantity is reached or the command is replaced. No coordinates or extra args.
+            - mine <quantity> <block_id>: searches loaded chunks, navigates to matching blocks, and keeps
+              mining until the quantity is reached or the command is replaced. Quantity comes first; no
+              coordinates or extra args.
             - goto <x> <y> <z>: exactly three integer coordinates; goto does not accept block IDs.
             - explore: no arguments; continues toward the nearest unexplored/unloaded region.
             - build <schematic_filename>: existing schematic only; never a block/item ID.
@@ -61,7 +62,7 @@ final class ActionPlanner {
 
             Return only JSON:
             {"summary":"short status","goal":"current subgoal","complete":false,
-             "action":{"type":"baritone","command":"mine minecraft:oak_log 4"}}
+             "action":{"type":"baritone","command":"mine 4 minecraft:oak_log"}}
             or {"summary":"still moving","goal":"reach destination","complete":false,
                 "action":{"type":"wait"}}
             or {"summary":"place block","goal":"place table","complete":false,
@@ -183,10 +184,9 @@ final class ActionPlanner {
         }
         switch (verb) {
             case "mine" -> {
-                if ((parts.length < 2 || parts.length > 3)
-                        || !parts[1].matches("[a-zA-Z0-9_.-]+(?::[a-zA-Z0-9_./-]+)?")
-                        || (parts.length == 3 && (!parts[2].matches("\\d{1,4}")
-                        || Integer.parseInt(parts[2]) <= 0 || Integer.parseInt(parts[2]) > 4096))) {
+                if (parts.length != 3 || !parts[1].matches("\\d{1,4}")
+                        || Integer.parseInt(parts[1]) <= 0 || Integer.parseInt(parts[1]) > 4096
+                        || !parts[2].matches("[a-zA-Z0-9_.-]+(?::[a-zA-Z0-9_./-]+)?")) {
                     return Optional.empty();
                 }
             }

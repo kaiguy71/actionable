@@ -31,6 +31,7 @@ final class WorldSynopsis {
         synopsis.append("dimension=").append(level.dimension().identifier())
                 .append("; player_block_position_xyz=")
                 .append(playerPos.getX()).append(',').append(playerPos.getY()).append(',').append(playerPos.getZ())
+                .append("; coordinate_axes=+X:east,+Y:up,+Z:south;yaw_0:south,yaw_90:west,yaw_-90:east")
                 .append("; player_position_xyz=")
                 .append(String.format(java.util.Locale.ROOT, "%.1f,%.1f,%.1f",
                         player.getX(), player.getY(), player.getZ()))

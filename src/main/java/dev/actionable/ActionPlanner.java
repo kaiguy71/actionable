@@ -20,42 +20,60 @@ final class ActionPlanner {
     private static final int MAX_COMMAND_LENGTH = 256;
     private static final Set<String> ALLOWED_COMMANDS =
             Set.of("mine", "goto", "build", "explore", "find", "pickup", "farm", "cancel", "come", "follow");
-    private static final Set<String> COMMANDS_REQUIRING_ARGUMENTS =
-            Set.of("mine", "goto", "build", "find", "pickup", "farm", "follow");
-    private static final String DEFAULT_ENDPOINT = "http://localhost:11434/api/chat";
     private static final String SYSTEM_PROMPT = """
-            You are an execution planner for Minecraft. The world synopsis gives player position, facing,
-            aimed-at block, inventory, nearby blocks and candidate surfaces. Coordinates are x,y,z in blocks.
-            Nearby biome vectors are relative to the player; angle_from_facing is signed degrees from current
-            facing (0 is straight ahead). Only listed nearby_loaded_biomes_sampled are known; do not infer
-            unobserved terrain or resources.
-            Before acting, compare the goal's required items/materials to inventory. If missing, plan to gather
-            the required source blocks first with Baritone mine, using nearby sampled blocks and loaded biomes
-            as evidence. For wood recipes, gather logs before asking for planks or a crafting table. Do not
-            attempt final placement while the required block is missing. This mod cannot craft items or make
-            schematics yet; state the blocker instead of claiming the craft succeeded.
-            Choose one achievable next step, report it as goal, and issue exactly one action.
-            Baritone goto requires three numeric coordinates: "goto x y z". Never output bare "goto".
-            Baritone build accepts an existing schematic filename only; it does not place individual
-            blocks. Use only filenames ending in .schematic, .schem, or .litematic; never use build with a
-            block/item name. To place one block, use a place_block action with its minecraft: block id and
-            exact x,y,z target. Only request blocks shown in the hotbar or inventory. Choose a target from
-            nearby_placement_candidates with a replaceable target, clear overhead space and a sturdy ground block.
-            Never place inside the player's occupied cell. For a replaceable flower/plant at the target, Actionable
-            will clear it and ask for another plan before placing. If the target is not safely reachable,
-            navigate close first. Do not repeat an action after its reported failure.
-            Prioritize immediate danger: nearby hostile mobs marked as targeting the player or low health
-            should take precedence; combat commands are not available.
-            Return only JSON: {"summary":"short status","goal":"current subgoal","complete":false,
-            "action":{"type":"baritone","command":"goto -11 120 15"}}
-            or {"summary":"short status","goal":"place crafting table","complete":false,
-            "action":{"type":"place_block","block":"minecraft:crafting_table","x":-11,"y":120,"z":15}}.
-            Baritone command allowlist: mine, goto, build, explore, find, pickup, farm, cancel, come, follow.
-            Return complete=true with action omitted only when the user's entire task is truly done.
-            Do not invent inventory, location, block, or command result facts. If blocked, report why in summary
-            and choose no action rather than repeating a failing action.
-            Set complete to true only when the requested task is finished.
+            You plan Minecraft tasks and can issue one next action per turn.
+            Coordinates are integer block positions x,y,z. Minecraft convention: +X is east, +Z is south,
+            +Y is up; -X west and -Z north. Yaw 0 faces +Z (south), yaw 90 faces -X (west),
+            and yaw -90 faces +X (east).
+            The world synopsis includes exact position, yaw/pitch, target looked at, biome, loaded nearby
+            biome samples, sampled blocks, nearby resources, valid placement candidates and inventory.
+            Biome sample vectors are world dx,0,dz; angle_from_facing is the signed angle from current facing.
+            Never convert directions to coordinates from memory: calculate from current x,z and use a three-
+            integer coordinate only for goto.
+
+            Baritone commands have these exact forms:
+            - mine <block_id> [quantity]: searches loaded chunks, navigates to matching blocks, and keeps
+              mining until the quantity is reached or the command is replaced. No coordinates or extra args.
+            - goto <x> <y> <z>: exactly three integer coordinates; goto does not accept block IDs.
+            - explore: no arguments; continues toward the nearest unexplored/unloaded region.
+            - build <schematic_filename>: existing schematic only; never a block/item ID.
+            Never emit coordinates after mine and never emit a block ID to goto.
+            Other approved commands use their normal Baritone syntax, but do not invent arguments.
+
+            The latest observation includes Baritone's currently executing command, elapsed time, player movement,
+            distance to a goto target where applicable, and recent Baritone feedback. If it is making
+            useful progress, return action type "wait" to leave the current command running. If progress stalls,
+            the environment changes, or the current command is not appropriate, issue a different valid
+            Baritone command to replace it. Do not resend an already-running command. Explore may be left
+            running while checking newly loaded biome/world information.
+
+            Before building or placing, compare required items to inventory. Gather missing source materials
+            first with mine and use the inventory/world facts; do not try to place an item that is unavailable.
+            This version cannot craft items or create schematic files. It can place one held/inventory block;
+            use "place_block" for a nearby valid surface and "jump_place" only when placing into the player's
+            current feet cell. jump_place jumps one block and places at the original feet cell after clearing
+            replaceable flowers/plants. If a crafting recipe is needed, use lookup to inspect known recipe
+            information, but state when crafting itself is unavailable.
+            Use "lookup" with a short search query to find registered block/item IDs or player-known recipes.
+            Lookup results are local game data and will be supplied in the next turn. Do not invent global
+            biome/dimension/ore-generation ranges; only report nearby loaded observations in the synopsis.
+            Prioritize immediate hostile threats and low health; there is no combat action.
+
+            Return only JSON:
+            {"summary":"short status","goal":"current subgoal","complete":false,
+             "action":{"type":"baritone","command":"mine minecraft:oak_log 4"}}
+            or {"summary":"still moving","goal":"reach destination","complete":false,
+                "action":{"type":"wait"}}
+            or {"summary":"place block","goal":"place table","complete":false,
+                "action":{"type":"place_block","block":"minecraft:crafting_table","x":-11,"y":120,"z":15}}
+            or {"summary":"jump and place","goal":"place below player","complete":false,
+                "action":{"type":"jump_place","block":"minecraft:crafting_table","x":-11,"y":120,"z":15}}
+            or {"summary":"identify item","goal":"look up crafting table","complete":false,
+                "action":{"type":"lookup","query":"crafting table"}}
+            Return complete=true only when the entire user task is actually done. For a blocker, return action
+            omitted and explain the reason. Never claim an action succeeded before its result is observed.
             """;
+    private static final String DEFAULT_ENDPOINT = "http://localhost:11434/api/chat";
 
     private final HttpClient http = HttpClient.newBuilder()
             .connectTimeout(Duration.ofSeconds(5))
@@ -119,7 +137,7 @@ final class ActionPlanner {
                 JsonObject legacyObject = legacyAction.getAsJsonObject();
                 if (legacyObject.has("command")) {
                     action = validateCommand(legacyObject.get("command").getAsString())
-                            .map(command -> new PlannedAction("baritone", command, "", 0, 0, 0));
+                            .map(command -> new PlannedAction("baritone", command, "", 0, 0, 0, ""));
                 }
             }
         }
@@ -128,17 +146,25 @@ final class ActionPlanner {
 
     private static Optional<PlannedAction> parseAction(JsonObject action) {
         String type = action.has("type") ? action.get("type").getAsString() : "baritone";
-        if (type.equals("baritone") && action.has("command")) {
-            return validateCommand(action.get("command").getAsString())
-                    .map(command -> new PlannedAction("baritone", command, "", 0, 0, 0));
+        if (type.equals("wait")) {
+            return Optional.of(new PlannedAction("wait", "", "", 0, 0, 0, ""));
         }
-        if (type.equals("place_block") && action.has("block")
+        if (type.equals("lookup") && action.has("query")) {
+            String query = cleanText(action, "query", "", 80);
+            return query.isBlank() ? Optional.empty()
+                    : Optional.of(new PlannedAction("lookup", "", "", 0, 0, 0, query));
+        }
+        if ((type.equals("place_block") || type.equals("jump_place")) && action.has("block")
                 && action.has("x") && action.has("y") && action.has("z")) {
             String block = action.get("block").getAsString();
             if (block.matches("[a-z0-9_.-]+:[a-z0-9_./-]+")) {
-                return Optional.of(new PlannedAction("place_block", "", block,
-                        action.get("x").getAsInt(), action.get("y").getAsInt(), action.get("z").getAsInt()));
+                return Optional.of(new PlannedAction(type, "", block,
+                        action.get("x").getAsInt(), action.get("y").getAsInt(), action.get("z").getAsInt(), ""));
             }
+        }
+        if (type.equals("baritone") && action.has("command")) {
+            return validateCommand(action.get("command").getAsString())
+                    .map(command -> new PlannedAction("baritone", command, "", 0, 0, 0, ""));
         }
         return Optional.empty();
     }
@@ -150,21 +176,47 @@ final class ActionPlanner {
                 || normalized.chars().anyMatch(Character::isISOControl)) {
             return java.util.Optional.empty();
         }
-        String[] parts = normalized.split("\\s+", 2);
+        String[] parts = normalized.split("\\s+");
         String verb = parts[0].toLowerCase(Locale.ROOT);
-        if (!ALLOWED_COMMANDS.contains(verb)
-                || (COMMANDS_REQUIRING_ARGUMENTS.contains(verb)
-                && (parts.length < 2 || parts[1].isBlank()))) {
+        if (!ALLOWED_COMMANDS.contains(verb)) {
             return java.util.Optional.empty();
         }
-        if (verb.equals("goto") && !parts[1].matches("-?\\d+\\s+-?\\d+\\s+-?\\d+")) {
-            return java.util.Optional.empty();
+        switch (verb) {
+            case "mine" -> {
+                if ((parts.length < 2 || parts.length > 3)
+                        || !parts[1].matches("[a-zA-Z0-9_.-]+(?::[a-zA-Z0-9_./-]+)?")
+                        || (parts.length == 3 && (!parts[2].matches("\\d{1,4}")
+                        || Integer.parseInt(parts[2]) <= 0 || Integer.parseInt(parts[2]) > 4096))) {
+                    return Optional.empty();
+                }
+            }
+            case "goto" -> {
+                if (parts.length != 4 || !parts[1].matches("-?\\d+")
+                        || !parts[2].matches("-?\\d+") || !parts[3].matches("-?\\d+")) {
+                    return Optional.empty();
+                }
+            }
+            case "explore", "come", "cancel" -> {
+                if (parts.length != 1) {
+                    return Optional.empty();
+                }
+            }
+            case "build" -> {
+                if (parts.length != 2
+                        || !parts[1].matches("[A-Za-z0-9_.-]+\\.(?i:schematic|schem|litematic)")) {
+                    return Optional.empty();
+                }
+            }
+            case "find", "pickup", "farm", "follow" -> {
+                if (parts.length < 2) {
+                    return Optional.empty();
+                }
+            }
+            default -> {
+                return Optional.empty();
+            }
         }
-        if (verb.equals("build")
-                && !parts[1].matches("[A-Za-z0-9_.-]+\\.(?i:schematic|schem|litematic)")) {
-            return java.util.Optional.empty();
-        }
-        return java.util.Optional.of(normalized);
+        return Optional.of(normalized);
     }
 
     private static String cleanText(JsonObject root, String key, String fallback, int maxLength) {
@@ -192,7 +244,7 @@ final class ActionPlanner {
         return message == null || message.isBlank() ? cause.getClass().getSimpleName() : message;
     }
 
-    record PlannedAction(String type, String command, String block, int x, int y, int z) {
+    record PlannedAction(String type, String command, String block, int x, int y, int z, String query) {
     }
 
     record ActionPlan(String summary, String goal, boolean complete, Optional<PlannedAction> action) {

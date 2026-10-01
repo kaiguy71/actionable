@@ -34,9 +34,16 @@ public final class ActionableClient implements ClientModInitializer {
     private boolean enabled = true;
     private boolean debugEnabled;
     private boolean planning;
+    private boolean baritoneCommandRunning;
+    private String currentBaritoneCommand = "";
     private long generation;
+    private long clientTick;
+    private long baritoneCommandStartedAt;
+    private long lastBaritoneMovementAt;
+    private BlockPos baritoneStartPosition;
+    private BlockPos lastBaritonePosition;
+    private JumpPlace pendingJumpPlace;
     private int ticksUntilPlan;
-    private int ticksSinceAction;
     private String activeTask;
     private String lastAction = "";
     private String currentGoal = "Idle";
@@ -44,6 +51,7 @@ public final class ActionableClient implements ClientModInitializer {
     private String baritoneStatus = "No response captured";
     private String errorCode = "none";
     private String lastError = "none";
+    private BlockPos taskOrigin;
 
     @Override
     @SuppressWarnings("null")
@@ -86,6 +94,7 @@ public final class ActionableClient implements ClientModInitializer {
                         || text.contains("Unknown command") || text.contains("insufficient permissions")) {
                     errorCode = "BARITONE_COMMAND_REJECTED";
                     lastError = baritoneStatus;
+                    baritoneCommandRunning = false;
                     lastResult = "Baritone rejected the last command: " + lastError;
                     if (activeTask != null && !planning) {
                         ticksUntilPlan = 0;
@@ -95,7 +104,9 @@ public final class ActionableClient implements ClientModInitializer {
         });
 
         ClientTickEvents.END_CLIENT_TICK.register(client -> {
-            ticksSinceAction++;
+            clientTick++;
+            updateBaritoneProgress(client);
+            tickJumpPlace(client);
             while (toggleKey.consumeClick()) {
                 boolean controlDown = InputConstants.isKeyDown(InputConstants.KEY_LCONTROL)
                         || InputConstants.isKeyDown(InputConstants.KEY_RCONTROL);
@@ -103,7 +114,7 @@ public final class ActionableClient implements ClientModInitializer {
                     toggle(client);
                 }
             }
-            if (enabled && activeTask != null && !planning && ticksUntilPlan-- <= 0) {
+            if (enabled && activeTask != null && !planning && pendingJumpPlace == null && ticksUntilPlan-- <= 0) {
                 requestNextPlan(client);
             }
         });
@@ -138,10 +149,13 @@ public final class ActionableClient implements ClientModInitializer {
 
         generation++;
         activeTask = prompt;
+        taskOrigin = java.util.Objects.requireNonNull(client.player).blockPosition();
         lastAction = "";
         currentGoal = "Planning first step";
         lastResult = "Waiting for planner";
         baritoneStatus = "No response captured";
+        baritoneCommandRunning = false;
+        pendingJumpPlace = null;
         errorCode = "none";
         lastError = "none";
         planning = false;
@@ -157,8 +171,10 @@ public final class ActionableClient implements ClientModInitializer {
         }
         long requestGeneration = generation;
         planning = true;
-        String synopsis = WorldSynopsis.capture(client);
-        planner.plan(activeTask, synopsis, lastAction, lastResult).whenComplete((plan, error) -> client.execute(() -> {
+        String synopsis = WorldSynopsis.capture(client) + "; " + baritoneProgress(client);
+        String taskWithOrigin = activeTask + "\nTask prompt origin xyz: "
+                + (taskOrigin == null ? "unknown" : taskOrigin.getX() + "," + taskOrigin.getY() + "," + taskOrigin.getZ());
+        planner.plan(taskWithOrigin, synopsis, lastAction, lastResult).whenComplete((plan, error) -> client.execute(() -> {
             if (requestGeneration != generation) {
                 return;
             }
@@ -190,6 +206,8 @@ public final class ActionableClient implements ClientModInitializer {
             if (plan.complete()) {
                 tell(client, "Task complete.");
                 connection.sendChat("#cancel");
+                baritoneCommandRunning = false;
+                currentBaritoneCommand = "";
                 lastResult = "Planner marked the task complete";
                 currentGoal = "Complete";
                 activeTask = null;
@@ -205,28 +223,46 @@ public final class ActionableClient implements ClientModInitializer {
             }
 
             ActionPlanner.PlannedAction action = plan.action().orElseThrow();
-            if (action.type().equals("place_block")) {
-                lastAction = "place " + action.block() + " at " + action.x() + "," + action.y() + "," + action.z();
-                lastResult = placeBlock(client, action);
-                if (lastResult.startsWith("BLOCK_PLACE_FAILED")) {
-                    errorCode = lastResult.substring(0, lastResult.indexOf(':'));
-                    lastError = compact(lastResult, 140);
-                    tell(client, lastResult);
-                } else {
-                    tell(client, "Block placement: " + lastResult);
+            switch (action.type()) {
+                case "wait" -> {
+                    lastResult = baritoneCommandRunning
+                            ? "Planner chose to wait; " + baritoneProgress(client)
+                            : "Planner chose no input; reevaluate after next observation";
+                    tell(client, baritoneCommandRunning ? "Waiting on current Baritone task." : "Waiting for next observation.");
                 }
-                ticksSinceAction = 0;
-            } else {
-                String command = action.command();
-                if (!command.equals(lastAction) || ticksSinceAction >= 1200) {
-                    connection.sendChat("#" + command);
-                    tell(client, "Baritone command sent: " + command);
-                    lastAction = command;
-                    lastResult = "Command sent; awaiting Baritone response";
-                    ticksSinceAction = 0;
+                case "lookup" -> {
+                    lastAction = "lookup " + action.query();
+                    lastResult = GameKnowledge.lookup(client, action.query());
+                    tell(client, lastResult);
+                    ticksUntilPlan = 1;
+                }
+                case "place_block" -> {
+                    stopBaritone(client);
+                    lastAction = "place " + action.block() + " at " + action.x() + "," + action.y() + "," + action.z();
+                    lastResult = placeBlock(client, action);
+                    reportBlockResult(client);
+                }
+                case "jump_place" -> {
+                    stopBaritone(client);
+                    lastAction = "jump-place " + action.block() + " at " + action.x() + "," + action.y() + "," + action.z();
+                    lastResult = startJumpPlace(client, action);
+                    reportBlockResult(client);
+                }
+                case "baritone" -> executeBaritone(client, connection, action.command());
+                default -> {
+                    lastResult = "Unsupported action type: " + action.type();
+                    errorCode = "ACTION_TYPE_UNSUPPORTED";
+                    lastError = lastResult;
+                    tell(client, lastResult);
                 }
             }
-            ticksUntilPlan = lastResult.startsWith("BLOCK_PLACE_DEFERRED") ? 1 : 200;
+            if (action.type().equals("place_block")) {
+                ticksUntilPlan = lastResult.startsWith("BLOCK_PLACE_DEFERRED") ? 1 : 200;
+            } else if (action.type().equals("jump_place") && pendingJumpPlace == null) {
+                ticksUntilPlan = lastResult.startsWith("BLOCK_PLACE_DEFERRED") ? 1 : 200;
+            } else if (!action.type().equals("lookup")) {
+                ticksUntilPlan = 200;
+            }
         }));
     }
 
@@ -241,6 +277,194 @@ public final class ActionableClient implements ClientModInitializer {
             connection.sendChat("#cancel");
             lastResult = "Baritone cancellation requested";
         }
+    }
+
+    private void executeBaritone(Minecraft client,
+                                 net.minecraft.client.multiplayer.ClientPacketListener connection,
+                                 String command) {
+        if (baritoneCommandRunning && command.equals(currentBaritoneCommand)) {
+            lastAction = command;
+            lastResult = "Existing Baritone command left running; " + baritoneProgress(client);
+            tell(client, "Keeping Baritone task running: " + command);
+            return;
+        }
+        connection.sendChat("#" + command);
+        lastAction = command;
+        baritoneCommandRunning = !command.equals("cancel");
+        currentBaritoneCommand = baritoneCommandRunning ? command : "";
+        BlockPos position = client.player == null ? null : client.player.blockPosition();
+        baritoneStartPosition = position;
+        lastBaritonePosition = position;
+        baritoneCommandStartedAt = clientTick;
+        lastBaritoneMovementAt = clientTick;
+        lastResult = baritoneCommandRunning
+                ? "Started Baritone command; " + baritoneProgress(client)
+                : "Baritone cancellation requested";
+        tell(client, "Baritone: " + command);
+    }
+
+    private void stopBaritone(Minecraft client) {
+        if (!baritoneCommandRunning) {
+            return;
+        }
+        var connection = client.getConnection();
+        if (connection != null) {
+            connection.sendChat("#cancel");
+        }
+        baritoneCommandRunning = false;
+        currentBaritoneCommand = "";
+    }
+
+    private void updateBaritoneProgress(Minecraft client) {
+        if (!baritoneCommandRunning || client.player == null) {
+            return;
+        }
+        BlockPos position = java.util.Objects.requireNonNull(client.player).blockPosition();
+        if (lastBaritonePosition == null || !position.equals(lastBaritonePosition)) {
+            lastBaritonePosition = position;
+            lastBaritoneMovementAt = clientTick;
+        }
+    }
+
+    private String baritoneProgress(Minecraft client) {
+        if (!baritoneCommandRunning) {
+            return "baritone_task=idle";
+        }
+        BlockPos current = client.player == null ? lastBaritonePosition : client.player.blockPosition();
+        long elapsedTicks = clientTick - baritoneCommandStartedAt;
+        long idleTicks = clientTick - lastBaritoneMovementAt;
+        double moved = 0;
+        if (current != null && baritoneStartPosition != null) {
+            double dx = current.getX() - baritoneStartPosition.getX();
+            double dy = current.getY() - baritoneStartPosition.getY();
+            double dz = current.getZ() - baritoneStartPosition.getZ();
+            moved = Math.sqrt(dx * dx + dy * dy + dz * dz);
+        }
+        StringBuilder progress = new StringBuilder("baritone_task=running{command=")
+                .append(currentBaritoneCommand)
+                .append(",elapsed_seconds=").append(elapsedTicks / 20)
+                .append(",distance_moved_blocks=").append(String.format(java.util.Locale.ROOT, "%.1f", moved))
+                .append(",seconds_since_movement=").append(idleTicks / 20);
+        if (currentBaritoneCommand.startsWith("goto ") && current != null) {
+            String[] parts = currentBaritoneCommand.split("\\s+");
+            if (parts.length == 4) {
+                try {
+                    double distance = Math.sqrt(
+                            Math.pow(Integer.parseInt(parts[1]) - current.getX(), 2)
+                                    + Math.pow(Integer.parseInt(parts[2]) - current.getY(), 2)
+                                    + Math.pow(Integer.parseInt(parts[3]) - current.getZ(), 2));
+                    progress.append(",distance_to_goto_goal=")
+                            .append(String.format(java.util.Locale.ROOT, "%.1f", distance));
+                } catch (NumberFormatException ignored) {
+                    progress.append(",distance_to_goto_goal=unknown");
+                }
+            }
+        }
+        return progress.append('}').toString();
+    }
+
+    private void reportBlockResult(Minecraft client) {
+        if (lastResult.contains("_FAILED")) {
+            errorCode = lastResult.substring(0, lastResult.indexOf(':'));
+            lastError = compact(lastResult, 140);
+            tell(client, lastResult);
+        } else {
+            errorCode = "none";
+            lastError = "none";
+            tell(client, lastResult);
+        }
+    }
+
+    private String startJumpPlace(Minecraft client, ActionPlanner.PlannedAction action) {
+        if (client.player == null || client.level == null || client.gameMode == null) {
+            return "BLOCK_PLACE_FAILED_NO_WORLD: player world is unavailable";
+        }
+        var player = java.util.Objects.requireNonNull(client.player);
+        var level = java.util.Objects.requireNonNull(client.level);
+        var gameMode = java.util.Objects.requireNonNull(client.gameMode);
+        BlockPos target = new BlockPos(action.x(), action.y(), action.z());
+        BlockPos feet = player.blockPosition();
+        if (target.getX() != feet.getX() || target.getY() != feet.getY() || target.getZ() != feet.getZ()) {
+            return "JUMP_PLACE_FAILED_NOT_CURRENT_CELL: target must equal current feet cell "
+                    + feet.getX() + "," + feet.getY() + "," + feet.getZ();
+        }
+        Identifier blockId = Identifier.tryParse(java.util.Objects.requireNonNull(action.block()));
+        if (blockId == null || !BuiltInRegistries.BLOCK.containsKey(blockId)) {
+            return "BLOCK_PLACE_FAILED_UNKNOWN_BLOCK: " + action.block();
+        }
+        Item blockItem = BuiltInRegistries.BLOCK.getValue(blockId).asItem();
+        if (blockItem == net.minecraft.world.item.Items.AIR || !inventoryHas(player, blockItem)) {
+            return "BLOCK_PLACE_FAILED_MATERIAL_MISSING: " + action.block()
+                    + " is not in inventory; gather required materials before placing";
+        }
+        var targetState = level.getBlockState(target);
+        if (!targetState.isAir()) {
+            if (targetState.canBeReplaced() && gameMode.destroyBlock(target)) {
+                return "BLOCK_PLACE_DEFERRED_TARGET_CLEARED: cleared " + blockIdentifier(targetState.getBlock())
+                        + " at the player's feet; retry jump_place";
+            }
+            return "JUMP_PLACE_FAILED_TARGET_OCCUPIED: " + blockIdentifier(targetState.getBlock());
+        }
+        var headroom = target.above();
+        var headroomState = level.getBlockState(headroom);
+        if (!headroomState.isAir()) {
+            if (headroomState.canBeReplaced() && gameMode.destroyBlock(headroom)) {
+                return "BLOCK_PLACE_DEFERRED_HEADROOM_CLEARED: cleared plant above feet; retry jump_place";
+            }
+            return "JUMP_PLACE_FAILED_NO_HEADROOM: " + blockIdentifier(headroomState.getBlock());
+        }
+        if (!player.onGround()) {
+            return "JUMP_PLACE_FAILED_NOT_GROUNDED: wait until standing on the ground";
+        }
+        player.jumpFromGround();
+        pendingJumpPlace = new JumpPlace(action, target, clientTick);
+        lastResult = "Jump started; waiting until the player clears " + target;
+        tell(client, lastResult);
+        return lastResult;
+    }
+
+    private void tickJumpPlace(Minecraft client) {
+        if (pendingJumpPlace == null) {
+            return;
+        }
+        if (!enabled) {
+            pendingJumpPlace = null;
+            return;
+        }
+        if (client.player == null || client.level == null || client.gameMode == null) {
+            pendingJumpPlace = null;
+            errorCode = "JUMP_PLACE_FAILED_WORLD_ENDED";
+            lastError = "Player or world unavailable during jump-place";
+            lastResult = lastError;
+            return;
+        }
+        JumpPlace jumpPlace = pendingJumpPlace;
+        var player = java.util.Objects.requireNonNull(client.player);
+        BlockPos target = java.util.Objects.requireNonNull(jumpPlace.target());
+        if (player.blockPosition().getY() > target.getY()
+                && !player.getBoundingBox().intersects(new net.minecraft.world.phys.AABB(target))) {
+            pendingJumpPlace = null;
+            lastResult = placeBlock(client, jumpPlace.action());
+            reportBlockResult(client);
+            ticksUntilPlan = 1;
+        } else if (clientTick - jumpPlace.startedAtTick() > 40) {
+            pendingJumpPlace = null;
+            errorCode = "JUMP_PLACE_FAILED_JUMP_TIMEOUT";
+            lastError = "Player did not clear the target cell";
+            lastResult = errorCode + ": " + lastError;
+            tell(client, lastResult);
+            ticksUntilPlan = 1;
+        }
+    }
+
+    private static boolean inventoryHas(net.minecraft.world.entity.player.Player player, Item item) {
+        return player.getInventory().getNonEquipmentItems().stream()
+                .anyMatch(stack -> !stack.isEmpty() && stack.is(item));
+    }
+
+    private static String blockIdentifier(net.minecraft.world.level.block.Block block) {
+        return java.util.Objects.requireNonNull(
+                BuiltInRegistries.BLOCK.getKey(java.util.Objects.requireNonNull(block))).toString();
     }
 
     private String placeBlock(Minecraft client, ActionPlanner.PlannedAction action) {
@@ -349,7 +573,8 @@ public final class ActionableClient implements ClientModInitializer {
                 "Actionable DEBUG",
                 "State: " + (!enabled ? "paused" : planning ? "planning" : activeTask == null ? "idle" : "active"),
                 "Player xyz: " + position(client),
-                "Baritone cmd: " + (lastAction == null || lastAction.isBlank() ? "none" : lastAction),
+                "Baritone cmd: " + (currentBaritoneCommand.isBlank() ? "none" : currentBaritoneCommand),
+                "Baritone: " + compact(baritoneProgress(client), 100),
                 "Baritone feedback: " + baritoneStatus,
                 "LLM goal: " + currentGoal,
                 "Result: " + lastResult,
@@ -357,7 +582,7 @@ public final class ActionableClient implements ClientModInitializer {
                 "/actiondebug toggles this panel");
         java.util.List<String> lines = new java.util.ArrayList<>(rawLines.size());
         for (String line : rawLines) {
-            String shortened = client.font.plainSubstrByWidth(line, maxTextWidth);
+            String shortened = client.font.plainSubstrByWidth(java.util.Objects.requireNonNull(line), maxTextWidth);
             lines.add(shortened == null ? "" : shortened);
         }
         int lineHeight = client.font.lineHeight + 2;
@@ -403,7 +628,10 @@ public final class ActionableClient implements ClientModInitializer {
 
     private static void tell(Minecraft client, String message) {
         if (client.player != null) {
-            client.player.sendSystemMessage(Component.literal("[Actionable] " + message));
+            client.gui.hud.setOverlayMessage(Component.literal("[Actionable] " + message), false);
         }
+    }
+
+    private record JumpPlace(ActionPlanner.PlannedAction action, BlockPos target, long startedAtTick) {
     }
 }

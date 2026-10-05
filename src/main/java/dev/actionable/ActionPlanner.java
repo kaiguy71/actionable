@@ -18,6 +18,7 @@ import java.util.concurrent.Executors;
 
 final class ActionPlanner {
     private static final int MAX_COMMAND_LENGTH = 256;
+    static final int MAX_STEPS = 8;
     private static final Set<String> ALLOWED_COMMANDS =
             Set.of("mine", "goto", "build", "explore", "find", "pickup", "farm", "cancel", "come", "follow");
     private static final String SYSTEM_PROMPT = """
@@ -71,8 +72,56 @@ final class ActionPlanner {
                 "action":{"type":"jump_place","block":"minecraft:crafting_table","x":-11,"y":120,"z":15}}
             or {"summary":"identify item","goal":"look up crafting table","complete":false,
                 "action":{"type":"lookup","query":"crafting table"}}
+            or {"summary":"step objective met","goal":"move to the next step","complete":false,
+                "step_complete":true,"action":{"type":"wait"}}
             Return complete=true only when the entire user task is actually done. For a blocker, return action
             omitted and explain the reason. Never claim an action succeeded before its result is observed.
+
+            You are given a numbered plan for the overall task and the one step you are working on now.
+            Work only on the current step; do not skip ahead to later steps. Recent action history is
+            supplied so you can see what has already been tried - never repeat an action that history
+            shows already succeeded, and do not retry an identical failing action more than twice.
+            Before choosing an action, check whether the CURRENT STEP is already satisfied by the
+            inventory and the action history. If it is already satisfied, you MUST return
+            "step_complete":true so the next step begins - do not return "wait" and do not re-run an
+            action whose objective is already met. For example, if the current step is
+            "mine 4 minecraft:oak_log" and the inventory already holds 4 oak logs, return
+            "step_complete":true. Otherwise omit step_complete or set it to false.
+            Use complete=true only when the final step is finished.
+            """;
+
+    private static final String DECOMPOSE_PROMPT = """
+            You break a Minecraft task into an ordered plan of concrete, verifiable steps.
+            Each step must be achievable with these abilities only: Baritone navigation and mining
+            (mine, goto, explore, find, pickup, farm, follow), placing a single block from inventory,
+            and looking up block/item IDs and known recipes. Crafting and schematic creation are NOT
+            available, so never emit a step that requires crafting or building from a schematic.
+            Gather prerequisites before they are needed: to place blocks you must first mine them.
+            State quantities and concrete block IDs where known, for example "mine 4 minecraft:oak_log".
+            Use the fewest steps that actually accomplish the task, at most 8.
+            Return only JSON: {"steps":["mine 4 minecraft:oak_log","goto the clearing at 10 70 -5"]}
+            """;
+    private static final String JUDGE_PROMPT = """
+            You judge whether one Minecraft objective is already satisfied.
+            You are given the objective, the player's inventory, and what was recently done.
+            Answer only from that evidence. If the objective names a quantity of an item, it is
+            satisfied only when the inventory holds at least that quantity.
+            Return only JSON: {"done":true,"why":"short reason"} or {"done":false,"why":"short reason"}
+            """;
+    private static final String DIRECTOR_PROMPT = """
+            You decide what a Minecraft player should do next, with no human giving instructions.
+            You are given the world state, goals already achieved, and goals recently attempted.
+            Choose ONE short objective that makes concrete progress and is achievable right now with
+            these abilities only: Baritone navigation and mining (mine, goto, explore, find, pickup,
+            farm, follow), placing a single block from inventory, and looking up IDs and known recipes.
+            Crafting and schematic building are NOT available, so never choose a goal that needs them.
+            Prefer the natural progression: gather wood, then stone, then coal, then iron ore.
+            Survival comes first: if health is low or hostile mobs are targeting the player, choose a
+            goal that escapes the threat instead.
+            Never repeat a goal listed as already achieved, and do not repeat a recently attempted goal
+            unless the state shows it clearly failed and is still worth doing.
+            Name concrete quantities and block IDs, for example "mine 16 minecraft:oak_log".
+            Return only JSON: {"goal":"mine 16 minecraft:oak_log","why":"short reason"}
             """;
     private static final String DEFAULT_ENDPOINT = "http://localhost:11434/api/chat";
 
@@ -85,11 +134,68 @@ final class ActionPlanner {
         return thread;
     });
 
-    CompletableFuture<ActionPlan> plan(String task, String synopsis, String lastAction, String lastResult) {
-        return CompletableFuture.supplyAsync(() -> requestPlan(task, synopsis, lastAction, lastResult), executor);
+    CompletableFuture<ActionPlan> plan(String task, String synopsis, String lastAction, String lastResult,
+            String planContext, String history) {
+        return CompletableFuture.supplyAsync(
+                () -> requestPlan(task, synopsis, lastAction, lastResult, planContext, history), executor);
     }
 
-    private ActionPlan requestPlan(String task, String synopsis, String lastAction, String lastResult) {
+    CompletableFuture<java.util.List<String>> decompose(String task, String synopsis) {
+        return CompletableFuture.supplyAsync(() -> requestSteps(task, synopsis), executor);
+    }
+
+    CompletableFuture<String> chooseGoal(String synopsis, String achieved, String attempted) {
+        return CompletableFuture.supplyAsync(() -> requestGoal(synopsis, achieved, attempted), executor);
+    }
+
+    private String requestGoal(String synopsis, String achieved, String attempted) {
+        String endpoint = System.getProperty("actionable.ollama.url", DEFAULT_ENDPOINT);
+        String model = System.getProperty("actionable.ollama.model", "gemma3:4b");
+        JsonObject body = new JsonObject();
+        body.addProperty("model", model);
+        body.addProperty("stream", false);
+        body.addProperty("format", "json");
+
+        JsonArray messages = new JsonArray();
+        messages.add(message("system", DIRECTOR_PROMPT));
+        messages.add(message("user", "Goals already achieved: " + (achieved.isBlank() ? "none" : achieved)
+                + "\nGoals recently attempted: " + (attempted.isBlank() ? "none" : attempted)
+                + "\nCurrent world state: " + synopsis));
+        body.add("messages", messages);
+
+        JsonObject chosen = JsonParser.parseString(send(endpoint, body)).getAsJsonObject();
+        String goal = cleanText(chosen, "goal", "", 120).strip();
+        if (goal.isBlank()) {
+            throw new IllegalStateException("Director returned no goal");
+        }
+        return goal;
+    }
+
+    CompletableFuture<Boolean> checkStep(String objective, String inventory, String recent) {
+        return CompletableFuture.supplyAsync(() -> requestStepVerdict(objective, inventory, recent), executor);
+    }
+
+    private boolean requestStepVerdict(String objective, String inventory, String recent) {
+        String endpoint = System.getProperty("actionable.ollama.url", DEFAULT_ENDPOINT);
+        String model = System.getProperty("actionable.ollama.model", "gemma3:4b");
+        JsonObject body = new JsonObject();
+        body.addProperty("model", model);
+        body.addProperty("stream", false);
+        body.addProperty("format", "json");
+
+        JsonArray messages = new JsonArray();
+        messages.add(message("system", JUDGE_PROMPT));
+        messages.add(message("user", "Objective: " + objective + "\nInventory: "
+                + (inventory.isBlank() ? "unknown" : inventory)
+                + "\nRecently done: " + (recent.isBlank() ? "none" : recent)));
+        body.add("messages", messages);
+
+        JsonObject verdict = JsonParser.parseString(send(endpoint, body)).getAsJsonObject();
+        return verdict.has("done") && verdict.get("done").getAsBoolean();
+    }
+
+    private ActionPlan requestPlan(String task, String synopsis, String lastAction, String lastResult,
+            String planContext, String history) {
         String endpoint = System.getProperty("actionable.ollama.url", DEFAULT_ENDPOINT);
         String model = System.getProperty("actionable.ollama.model", "gemma3:4b");
         JsonObject body = new JsonObject();
@@ -99,11 +205,33 @@ final class ActionPlanner {
 
         JsonArray messages = new JsonArray();
         messages.add(message("system", SYSTEM_PROMPT));
-        messages.add(message("user", "Task: " + task + "\nPrevious action: "
+        messages.add(message("user", "Task: " + task + "\n" + planContext
+                + "\nRecent action history (oldest first): " + (history.isEmpty() ? "none" : history)
+                + "\nPrevious action: "
                 + (lastAction.isEmpty() ? "none" : lastAction) + "\nPrevious action result: "
                 + (lastResult.isEmpty() ? "none" : lastResult) + "\nLatest world state: " + synopsis));
         body.add("messages", messages);
 
+        return parsePlan(send(endpoint, body));
+    }
+
+    private java.util.List<String> requestSteps(String task, String synopsis) {
+        String endpoint = System.getProperty("actionable.ollama.url", DEFAULT_ENDPOINT);
+        String model = System.getProperty("actionable.ollama.model", "gemma3:4b");
+        JsonObject body = new JsonObject();
+        body.addProperty("model", model);
+        body.addProperty("stream", false);
+        body.addProperty("format", "json");
+
+        JsonArray messages = new JsonArray();
+        messages.add(message("system", DECOMPOSE_PROMPT));
+        messages.add(message("user", "Task: " + task + "\nCurrent world state: " + synopsis));
+        body.add("messages", messages);
+
+        return parseSteps(send(endpoint, body));
+    }
+
+    private String send(String endpoint, JsonObject body) {
         HttpRequest request = HttpRequest.newBuilder(URI.create(endpoint))
                 .timeout(Duration.ofSeconds(180))
                 .header("Content-Type", "application/json")
@@ -115,11 +243,37 @@ final class ActionPlanner {
                 throw new IllegalStateException("Ollama returned HTTP " + response.statusCode());
             }
             JsonObject responseJson = JsonParser.parseString(response.body()).getAsJsonObject();
-            String content = responseJson.getAsJsonObject("message").get("content").getAsString();
-            return parsePlan(content);
+            return responseJson.getAsJsonObject("message").get("content").getAsString();
         } catch (Exception exception) {
             throw new IllegalStateException("Could not get a plan from Ollama: " + safeMessage(exception), exception);
         }
+    }
+
+    static java.util.List<String> parseSteps(String json) {
+        JsonObject root = JsonParser.parseString(json).getAsJsonObject();
+        java.util.List<String> steps = new java.util.ArrayList<>();
+        JsonElement stepsElement = root.get("steps");
+        if (stepsElement == null || !stepsElement.isJsonArray()) {
+            return steps;
+        }
+        for (JsonElement element : stepsElement.getAsJsonArray()) {
+            if (!element.isJsonPrimitive()) {
+                continue;
+            }
+            String step = element.getAsString().codePoints()
+                    .filter(codePoint -> !Character.isISOControl(codePoint))
+                    .limit(120)
+                    .collect(StringBuilder::new, StringBuilder::appendCodePoint, StringBuilder::append)
+                    .toString()
+                    .strip();
+            if (!step.isBlank()) {
+                steps.add(step);
+            }
+            if (steps.size() == MAX_STEPS) {
+                break;
+            }
+        }
+        return steps;
     }
 
     static ActionPlan parsePlan(String json) {
@@ -127,6 +281,7 @@ final class ActionPlanner {
         String summary = cleanText(root, "summary", "No summary provided", 200);
         String goal = cleanText(root, "goal", "Choosing next step", 120);
         boolean complete = root.has("complete") && root.get("complete").getAsBoolean();
+        boolean stepComplete = root.has("step_complete") && root.get("step_complete").getAsBoolean();
         Optional<PlannedAction> action = Optional.empty();
         JsonElement actionElement = root.get("action");
         if (actionElement != null && actionElement.isJsonObject()) {
@@ -142,7 +297,7 @@ final class ActionPlanner {
                 }
             }
         }
-        return new ActionPlan(summary, goal, complete, action);
+        return new ActionPlan(summary, goal, complete, stepComplete, action);
     }
 
     private static Optional<PlannedAction> parseAction(JsonObject action) {
@@ -167,10 +322,42 @@ final class ActionPlanner {
             return validateCommand(action.get("command").getAsString())
                     .map(command -> new PlannedAction("baritone", command, "", 0, 0, 0, ""));
         }
+        // Small models often name the Baritone verb as the action type and split its arguments into
+        // fields instead of returning {"type":"baritone","command":"..."}. Rebuild the command.
+        if (ALLOWED_COMMANDS.contains(type)) {
+            return validateCommand(rebuildCommand(type, action))
+                    .map(command -> new PlannedAction("baritone", command, "", 0, 0, 0, ""));
+        }
         return Optional.empty();
     }
 
-    private static java.util.Optional<String> validateCommand(String command) {
+    private static String rebuildCommand(String verb, JsonObject action) {
+        if (action.has("command")) {
+            String command = action.get("command").getAsString().strip();
+            // Either the full command or just its arguments may appear here.
+            return command.startsWith(verb) ? command : verb + " " + command;
+        }
+        return switch (verb) {
+            case "mine" -> verb + " " + firstOf(action, "1", "quantity", "count", "amount")
+                    + " " + firstOf(action, "", "block", "block_id", "blockID", "item", "target");
+            case "goto" -> verb + " " + firstOf(action, "", "x") + " " + firstOf(action, "", "y")
+                    + " " + firstOf(action, "", "z");
+            case "explore", "cancel", "come" -> verb;
+            default -> verb + " " + firstOf(action, "", "target", "block", "block_id", "item", "name");
+        };
+    }
+
+    private static String firstOf(JsonObject action, String fallback, String... keys) {
+        for (String key : keys) {
+            JsonElement element = action.get(key);
+            if (element != null && element.isJsonPrimitive()) {
+                return element.getAsString().strip();
+            }
+        }
+        return fallback;
+    }
+
+    static java.util.Optional<String> validateCommand(String command) {
         String normalized = command.strip();
         if (normalized.isEmpty() || normalized.length() > MAX_COMMAND_LENGTH
                 || normalized.startsWith("#") || normalized.startsWith("/")
@@ -247,6 +434,7 @@ final class ActionPlanner {
     record PlannedAction(String type, String command, String block, int x, int y, int z, String query) {
     }
 
-    record ActionPlan(String summary, String goal, boolean complete, Optional<PlannedAction> action) {
+    record ActionPlan(String summary, String goal, boolean complete, boolean stepComplete,
+            Optional<PlannedAction> action) {
     }
 }

@@ -52,6 +52,23 @@ public final class ActionableClient implements ClientModInitializer {
     private String errorCode = "none";
     private String lastError = "none";
     private BlockPos taskOrigin;
+    private static final int HISTORY_LIMIT = 5;
+    private java.util.List<String> taskSteps = java.util.List.of();
+    private int currentStep;
+    private static final int DANGER_HEALTH = 6;
+    private static final int MAX_TASK_TICKS = 6000;
+    private static final int GOAL_MEMORY = 6;
+    private boolean autonomous = true;
+    private boolean choosingGoal;
+    private boolean escaping;
+    private int ticksUntilGoal;
+    private long taskStartedAtTick;
+    private final java.util.ArrayDeque<String> achievedGoals = new java.util.ArrayDeque<>();
+    private final java.util.ArrayDeque<String> attemptedGoals = new java.util.ArrayDeque<>();
+    private boolean decomposing;
+    private boolean judging;
+    private boolean stepJudged;
+    private final java.util.ArrayDeque<String> history = new java.util.ArrayDeque<>();
 
     @Override
     @SuppressWarnings("null")
@@ -77,6 +94,19 @@ public final class ActionableClient implements ClientModInitializer {
                             debugEnabled = !debugEnabled;
                             tell(Minecraft.getInstance(), "Debug sidebar " + (debugEnabled ? "enabled." : "disabled.")
                                     + " (use /actiondebug to toggle).");
+                            return 1;
+                        })));
+
+        ClientCommandRegistrationCallback.EVENT.register((dispatcher, registryAccess) ->
+                dispatcher.register(ClientCommands.literal("actionauto")
+                        .executes(context -> {
+                            autonomous = !autonomous;
+                            Minecraft client = Minecraft.getInstance();
+                            if (!autonomous && activeTask != null) {
+                                abandonTask(client, "autonomous mode turned off");
+                            }
+                            ticksUntilGoal = 0;
+                            tell(client, "Autonomous mode " + (autonomous ? "on." : "off."));
                             return 1;
                         })));
 
@@ -114,7 +144,27 @@ public final class ActionableClient implements ClientModInitializer {
                     toggle(client);
                 }
             }
-            if (enabled && activeTask != null && !planning && pendingJumpPlace == null && ticksUntilPlan-- <= 0) {
+            if (enabled && activeTask != null && clientTick - taskStartedAtTick > MAX_TASK_TICKS) {
+                abandonTask(client, "took too long");
+            }
+            if (enabled && autonomous && escaping && activeTask != null && clientTick % 20 == 0
+                    && dangerEscape(client) == null) {
+                abandonTask(client, "threat cleared");
+            }
+            if (enabled && autonomous && !escaping && clientTick % 20 == 0) {
+                String escape = dangerEscape(client);
+                if (escape != null) {
+                    stopBaritone(client);
+                    escaping = true;
+                    startGoal(client, "escape immediate danger", java.util.List.of(escape));
+                }
+            }
+            if (enabled && autonomous && activeTask == null && !choosingGoal && !decomposing
+                    && client.player != null && client.level != null && ticksUntilGoal-- <= 0) {
+                requestGoalSelection(client);
+            }
+            if (enabled && activeTask != null && !planning && !decomposing && !judging
+                    && pendingJumpPlace == null && ticksUntilPlan-- <= 0) {
                 requestNextPlan(client);
             }
         });
@@ -160,8 +210,400 @@ public final class ActionableClient implements ClientModInitializer {
         lastError = "none";
         planning = false;
         ticksUntilPlan = 0;
-        tell(client, "Starting task at " + position(client) + ": " + prompt);
+        taskSteps = java.util.List.of();
+        currentStep = 0;
+        stepJudged = false;
+        taskStartedAtTick = clientTick;
+        history.clear();
+        noteAttempt(prompt);
+        tell(client, "Planning steps for: " + prompt);
+        requestDecomposition(client);
+    }
+
+    private void requestGoalSelection(Minecraft client) {
+        String synopsis = WorldSynopsis.capture(client);
+
+        // Survival is decided in code: the model was tested and did not reliably prioritise it.
+        String escape = dangerEscape(client);
+        if (escape != null) {
+            startGoal(client, "escape immediate danger", java.util.List.of(escape));
+            return;
+        }
+
+        long requestGeneration = ++generation;
+        choosingGoal = true;
+        currentGoal = "Choosing a goal";
+        planner.chooseGoal(synopsis, joined(achievedGoals), joined(attemptedGoals))
+                .whenComplete((goal, error) -> client.execute(() -> {
+                    if (requestGeneration != generation) {
+                        return;
+                    }
+                    choosingGoal = false;
+                    if (!enabled || !autonomous || client.player == null || client.level == null) {
+                        return;
+                    }
+                    String chosen = error == null && goal != null ? goal.strip() : "";
+                    // Repeat avoidance is also in code: the model re-picked goals it had just achieved.
+                    if (chosen.isEmpty() || alreadyAchieved(chosen)) {
+                        String fallback = ladderGoal(client);
+                        if (error != null) {
+                            errorCode = plannerErrorCode(error);
+                            lastError = compact(ActionPlanner.safeMessage(error), 140);
+                        }
+                        if (fallback == null) {
+                            // Nothing useful to do right now; look around and reconsider shortly.
+                            tell(client, "No new goal available; exploring.");
+                            chosen = "explore to find new resources";
+                        } else {
+                            tell(client, "Replaced repeated goal with: " + fallback);
+                            chosen = fallback;
+                        }
+                    }
+                    activeTask = chosen;
+                    remember("chose goal", chosen);
+                    noteAttempt(chosen);
+                    tell(client, "Goal: " + chosen);
+                    beginTask(client, chosen);
+                }));
+    }
+
+    /** Hard-coded resource ladder, used when the director repeats itself or fails. */
+    private String ladderGoal(Minecraft client) {
+        var player = client.player;
+        if (player == null) {
+            return null;
+        }
+        for (String[] rung : new String[][] {
+                {"minecraft:oak_log", "mine 16 minecraft:oak_log", "8"},
+                {"minecraft:cobblestone", "mine 24 minecraft:cobblestone", "16"},
+                {"minecraft:coal", "mine 12 minecraft:coal_ore", "4"},
+                {"minecraft:raw_iron", "mine 12 minecraft:iron_ore", "4"}}) {
+            Item item = BuiltInRegistries.ITEM.getValue(Identifier.parse(rung[0]));
+            int have = 0;
+            for (int slot = 0; slot < player.getInventory().getContainerSize(); slot++) {
+                ItemStack stack = player.getInventory().getItem(slot);
+                if (stack.getItem() == item) {
+                    have += stack.getCount();
+                }
+            }
+            if (have < Integer.parseInt(rung[2]) && !alreadyAchieved(rung[1])) {
+                return rung[1];
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Cheap threat check that avoids capturing a full world synopsis, so it can run every second.
+     * Returns a goto step away from the nearest threat, or null when the player is safe.
+     */
+    private String dangerEscape(Minecraft client) {
+        var player = client.player;
+        var level = client.level;
+        if (player == null || level == null) {
+            return null;
+        }
+        boolean hurt = player.getHealth() <= DANGER_HEALTH;
+        net.minecraft.world.entity.monster.Monster nearest = null;
+        double nearestDistance = Double.MAX_VALUE;
+        for (net.minecraft.world.entity.Entity entity : level.entitiesForRendering()) {
+            if (entity instanceof net.minecraft.world.entity.monster.Monster monster && monster.isAlive()
+                    && monster.getTarget() == player) {
+                double distance = monster.distanceToSqr(player);
+                if (distance < nearestDistance) {
+                    nearestDistance = distance;
+                    nearest = monster;
+                }
+            }
+        }
+        BlockPos here = player.blockPosition();
+        if (nearest == null) {
+            return hurt ? fleeTo(here.getX(), here.getY(), here.getZ(), here.getX() + 32, here.getZ() + 32) : null;
+        }
+        if (!hurt && nearestDistance > 64) {
+            return null;
+        }
+        BlockPos threat = nearest.blockPosition();
+        return fleeTo(here.getX(), here.getY(), here.getZ(), threat.getX(), threat.getZ());
+    }
+
+    static String fleeTo(int fromX, int fromY, int fromZ, int awayX, int awayZ) {
+        int dx = fromX - awayX;
+        int dz = fromZ - awayZ;
+        if (dx == 0 && dz == 0) {
+            dx = 1;
+        }
+        double length = Math.sqrt((double) dx * dx + (double) dz * dz);
+        return "goto " + (fromX + (int) Math.round(dx / length * 40)) + " " + fromY
+                + " " + (fromZ + (int) Math.round(dz / length * 40));
+    }
+
+    private void startGoal(Minecraft client, String goal, java.util.List<String> steps) {
+        generation++;
+        activeTask = goal;
+        taskSteps = java.util.List.copyOf(steps);
+        currentStep = 0;
+        stepJudged = false;
+        history.clear();
+        taskStartedAtTick = clientTick;
+        taskOrigin = java.util.Objects.requireNonNull(client.player).blockPosition();
+        lastAction = "";
+        lastResult = "Starting: " + goal;
+        currentGoal = steps.isEmpty() ? goal : steps.get(0);
+        errorCode = "none";
+        lastError = "none";
+        planning = false;
+        ticksUntilPlan = 0;
+        tell(client, "Goal: " + goal);
+        var connection = client.getConnection();
+        java.util.Optional<String> direct = steps.size() == 1
+                ? ActionPlanner.validateCommand(steps.get(0))
+                : java.util.Optional.empty();
+        if (direct.isPresent() && connection != null) {
+            // Escaping must not wait on a planning round trip.
+            lastAction = direct.get();
+            executeBaritone(client, connection, direct.get());
+            remember(lastAction, lastResult);
+            ticksUntilPlan = 200;
+            return;
+        }
         requestNextPlan(client);
+    }
+
+    private void beginTask(Minecraft client, String prompt) {
+        taskSteps = java.util.List.of();
+        currentStep = 0;
+        stepJudged = false;
+        history.clear();
+        taskStartedAtTick = clientTick;
+        taskOrigin = java.util.Objects.requireNonNull(client.player).blockPosition();
+        lastAction = "";
+        currentGoal = "Planning steps";
+        lastResult = "Waiting for planner";
+        baritoneStatus = "No response captured";
+        baritoneCommandRunning = false;
+        pendingJumpPlace = null;
+        errorCode = "none";
+        lastError = "none";
+        planning = false;
+        ticksUntilPlan = 0;
+        requestDecomposition(client);
+    }
+
+    private void abandonTask(Minecraft client, String reason) {
+        tell(client, "Giving up on \"" + activeTask + "\" (" + reason + ").");
+        lastResult = "Abandoned: " + reason;
+        currentGoal = "Idle";
+        stopBaritone(client);
+        escaping = false;
+        activeTask = null;
+        taskSteps = java.util.List.of();
+        ticksUntilGoal = 40;
+    }
+
+    private void noteAttempt(String goal) {
+        attemptedGoals.addLast(goal);
+        while (attemptedGoals.size() > GOAL_MEMORY) {
+            attemptedGoals.removeFirst();
+        }
+    }
+
+    private void noteAchieved(String goal) {
+        if (goal == null || goal.isBlank() || achievedGoals.contains(goal)) {
+            return;
+        }
+        achievedGoals.addLast(goal);
+        while (achievedGoals.size() > GOAL_MEMORY) {
+            achievedGoals.removeFirst();
+        }
+    }
+
+    private boolean alreadyAchieved(String goal) {
+        String key = goalKey(goal);
+        if (key.isEmpty()) {
+            return false;
+        }
+        for (String done : achievedGoals) {
+            if (goalKey(done).equals(key)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /** Collapses a goal to the resource it concerns, so "mine 8 stone" and "mine 20 stone" match. */
+    static String goalKey(String goal) {
+        java.util.regex.Matcher id = java.util.regex.Pattern
+                .compile("([a-z0-9_]+:)?([a-z0-9_]+)").matcher(goal.toLowerCase(java.util.Locale.ROOT));
+        String last = "";
+        while (id.find()) {
+            String word = id.group(2);
+            if (!word.isBlank() && !word.matches("mine|get|goto|explore|find|pickup|the|a|an|to|minecraft")) {
+                last = word;
+            }
+        }
+        return last.replaceAll("s$", "").replace("cobblestone", "stone");
+    }
+
+    private static String joined(java.util.ArrayDeque<String> goals) {
+        StringBuilder text = new StringBuilder();
+        for (String goal : goals) {
+            if (!text.isEmpty()) {
+                text.append(" | ");
+            }
+            text.append(goal);
+        }
+        return text.toString();
+    }
+
+    private void requestDecomposition(Minecraft client) {
+        long requestGeneration = generation;
+        decomposing = true;
+        currentGoal = "Breaking the task into steps";
+        String synopsis = WorldSynopsis.capture(client);
+        planner.decompose(activeTask, synopsis).whenComplete((steps, error) -> client.execute(() -> {
+            if (requestGeneration != generation) {
+                return;
+            }
+            decomposing = false;
+            if (!enabled || activeTask == null || client.player == null) {
+                return;
+            }
+            if (error != null || steps == null || steps.isEmpty()) {
+                // Decomposition is an optimisation: fall back to treating the prompt as one step.
+                taskSteps = java.util.List.of(activeTask);
+                if (error != null) {
+                    errorCode = plannerErrorCode(error);
+                    lastError = compact(ActionPlanner.safeMessage(error), 140);
+                }
+                tell(client, "Could not split the task; working on it directly.");
+            } else {
+                taskSteps = java.util.List.copyOf(steps);
+                tell(client, "Plan (" + taskSteps.size() + " steps). Step 1: " + taskSteps.get(0));
+                for (int index = 0; index < taskSteps.size(); index++) {
+                    java.util.Objects.requireNonNull(client.player).sendSystemMessage(
+                            Component.literal("[Actionable] " + (index + 1) + ". " + taskSteps.get(index)));
+                }
+            }
+            currentStep = 0;
+            ticksUntilPlan = 0;
+            requestNextPlan(client);
+        }));
+    }
+
+    private void requestStepCheck(Minecraft client) {
+        long requestGeneration = generation;
+        judging = true;
+        String objective = taskSteps.get(currentStep);
+        String inventory = inventoryOf(WorldSynopsis.capture(client));
+        planner.checkStep(objective, inventory, historyText()).whenComplete((done, error) -> client.execute(() -> {
+            if (requestGeneration != generation) {
+                return;
+            }
+            judging = false;
+            if (!enabled || activeTask == null || client.player == null) {
+                return;
+            }
+            // A failed verdict must not stall the task; fall through to normal planning.
+            stepJudged = true;
+            if (error == null && Boolean.TRUE.equals(done)) {
+                advanceStep(client, objective);
+                return;
+            }
+            ticksUntilPlan = 0;
+            requestNextPlan(client);
+        }));
+    }
+
+    private void advanceStep(Minecraft client, String finished) {
+        remember("finished step " + (currentStep + 1), finished);
+        if (currentStep >= taskSteps.size() - 1) {
+            var connection = client.getConnection();
+            if (connection != null) {
+                finishTask(client, connection, "Final plan step finished: " + finished);
+            }
+            return;
+        }
+        stopBaritone(client);
+        currentStep++;
+        stepJudged = false;
+        currentGoal = taskSteps.get(currentStep);
+        lastAction = "";
+        lastResult = "Step " + currentStep + " done (" + finished + "); starting next step";
+        tell(client, "Step " + (currentStep + 1) + "/" + taskSteps.size() + ": " + taskSteps.get(currentStep));
+        ticksUntilPlan = 1;
+    }
+
+    private static String inventoryOf(String synopsis) {
+        StringBuilder items = new StringBuilder();
+        for (String field : synopsis.split("; ")) {
+            if (field.startsWith("hotbar=") || field.startsWith("inventory=")) {
+                if (!items.isEmpty()) {
+                    items.append("; ");
+                }
+                items.append(field);
+            }
+        }
+        return items.toString();
+    }
+
+    private String planContext() {
+        if (taskSteps.isEmpty()) {
+            return "Plan: none available; work directly on the task.";
+        }
+        StringBuilder context = new StringBuilder("Plan steps:");
+        for (int index = 0; index < taskSteps.size(); index++) {
+            context.append("\n").append(index + 1).append(". ").append(taskSteps.get(index));
+            if (index < currentStep) {
+                context.append(" [done]");
+            } else if (index == currentStep) {
+                context.append("   <-- CURRENT STEP");
+            }
+        }
+        return context.append("\nWork only on step ").append(currentStep + 1)
+                .append(" of ").append(taskSteps.size()).append('.').toString();
+    }
+
+    private void remember(String action, String result) {
+        stepJudged = false;
+        if (action == null || action.isBlank()) {
+            return;
+        }
+        String entry = compact(action, 60) + " -> " + compact(result, 80);
+        if (entry.equals(history.peekLast())) {
+            // A "wait" action repeats the previous action/result; don't crowd out real history.
+            return;
+        }
+        history.addLast(entry);
+        while (history.size() > HISTORY_LIMIT) {
+            history.removeFirst();
+        }
+    }
+
+    private String historyText() {
+        StringBuilder text = new StringBuilder();
+        for (String entry : history) {
+            if (!text.isEmpty()) {
+                text.append(" | ");
+            }
+            text.append(entry);
+        }
+        return text.toString();
+    }
+
+    private void finishTask(Minecraft client, net.minecraft.client.multiplayer.ClientPacketListener connection,
+            String reason) {
+        tell(client, "Task complete.");
+        connection.sendChat("#cancel");
+        baritoneCommandRunning = false;
+        currentBaritoneCommand = "";
+        lastResult = reason;
+        currentGoal = "Complete";
+        noteAchieved(activeTask);
+        escaping = false;
+        activeTask = null;
+        taskSteps = java.util.List.of();
+        ticksUntilGoal = 60;
     }
 
     private void requestNextPlan(Minecraft client) {
@@ -169,12 +611,17 @@ public final class ActionableClient implements ClientModInitializer {
             ticksUntilPlan = 20;
             return;
         }
+        if (!taskSteps.isEmpty() && !history.isEmpty() && !stepJudged) {
+            requestStepCheck(client);
+            return;
+        }
         long requestGeneration = generation;
         planning = true;
         String synopsis = WorldSynopsis.capture(client) + "; " + baritoneProgress(client);
         String taskWithOrigin = activeTask + "\nTask prompt origin xyz: "
                 + (taskOrigin == null ? "unknown" : taskOrigin.getX() + "," + taskOrigin.getY() + "," + taskOrigin.getZ());
-        planner.plan(taskWithOrigin, synopsis, lastAction, lastResult).whenComplete((plan, error) -> client.execute(() -> {
+        planner.plan(taskWithOrigin, synopsis, lastAction, lastResult, planContext(), historyText())
+                .whenComplete((plan, error) -> client.execute(() -> {
             if (requestGeneration != generation) {
                 return;
             }
@@ -204,13 +651,11 @@ public final class ActionableClient implements ClientModInitializer {
             currentGoal = plan.goal();
             tell(client, "Plan: " + plan.summary());
             if (plan.complete()) {
-                tell(client, "Task complete.");
-                connection.sendChat("#cancel");
-                baritoneCommandRunning = false;
-                currentBaritoneCommand = "";
-                lastResult = "Planner marked the task complete";
-                currentGoal = "Complete";
-                activeTask = null;
+                finishTask(client, connection, "Planner marked the task complete");
+                return;
+            }
+            if (plan.stepComplete() && !taskSteps.isEmpty()) {
+                advanceStep(client, taskSteps.get(currentStep));
                 return;
             }
             if (plan.action().isEmpty()) {
@@ -256,6 +701,7 @@ public final class ActionableClient implements ClientModInitializer {
                     tell(client, lastResult);
                 }
             }
+            remember(lastAction, lastResult);
             if (action.type().equals("place_block")) {
                 ticksUntilPlan = lastResult.startsWith("BLOCK_PLACE_DEFERRED") ? 1 : 200;
             } else if (action.type().equals("jump_place") && pendingJumpPlace == null) {
@@ -268,6 +714,9 @@ public final class ActionableClient implements ClientModInitializer {
 
     private void toggle(Minecraft client) {
         enabled = !enabled;
+        if (!enabled) {
+            history.clear();
+        }
         generation++;
         planning = false;
         tell(client, "Actionable " + (enabled ? "enabled." : "disabled."));
@@ -571,7 +1020,14 @@ public final class ActionableClient implements ClientModInitializer {
         int maxTextWidth = DEBUG_PANEL_WIDTH - 12;
         java.util.List<String> rawLines = java.util.List.of(
                 "Actionable DEBUG",
-                "State: " + (!enabled ? "paused" : planning ? "planning" : activeTask == null ? "idle" : "active"),
+                "State: " + (!enabled ? "paused" : choosingGoal ? "choosing goal"
+                        : decomposing ? "decomposing"
+                        : planning ? "planning" : activeTask == null ? "idle" : "active")
+                        + (autonomous ? " [auto]" : " [manual]"),
+                "Task: " + (activeTask == null ? "none" : activeTask),
+                "Achieved: " + (achievedGoals.isEmpty() ? "none" : joined(achievedGoals)),
+                "Step: " + (taskSteps.isEmpty() ? "no plan"
+                        : (currentStep + 1) + "/" + taskSteps.size() + " " + taskSteps.get(currentStep)),
                 "Player xyz: " + position(client),
                 "Baritone cmd: " + (currentBaritoneCommand.isBlank() ? "none" : currentBaritoneCommand),
                 "Baritone: " + compact(baritoneProgress(client), 100),
@@ -579,7 +1035,7 @@ public final class ActionableClient implements ClientModInitializer {
                 "LLM goal: " + currentGoal,
                 "Result: " + lastResult,
                 "Error: " + errorCode + (lastError.equals("none") ? "" : " - " + lastError),
-                "/actiondebug toggles this panel");
+                "/actionauto toggles autonomy");
         java.util.List<String> lines = new java.util.ArrayList<>(rawLines.size());
         for (String line : rawLines) {
             String shortened = client.font.plainSubstrByWidth(java.util.Objects.requireNonNull(line), maxTextWidth);

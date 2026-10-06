@@ -70,10 +70,13 @@ final class WorldSynopsis {
                     threats.append(',');
                 }
                 threats.append(BuiltInRegistries.ENTITY_TYPE.getKey(monster.getType()))
+                        .append("#entity_id=").append(monster.getId())
                         .append('@').append(monster.blockPosition().getX()).append(',')
                         .append(monster.blockPosition().getY()).append(',')
                         .append(monster.blockPosition().getZ())
                         .append("(d=").append(Math.round(monster.distanceTo(player)))
+                        .append(",health=").append(Math.round(monster.getHealth()))
+                        .append(",melee_reachable=").append(MeleeCombat.reachable(client, monster))
                         .append(monster.getTarget() == player ? ",targeting_player" : "").append(')');
             }
         }

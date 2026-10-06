@@ -189,4 +189,4 @@ such as `gemma3:4b` is a practical starting point on consumer hardware.
   loot or ore-generation heights, and the model is instructed not to invent them.
 
 ## Contributors
-Kai Battistoni, ChatGPT, Claude Code
+Kai Battistoni, Chayse Collins, Abram Eastham, Ethan Claybourn, Joey Ruffing, with help from ChatGPT and Claude Code

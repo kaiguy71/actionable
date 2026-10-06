@@ -1,5 +1,5 @@
-# Actionable version 0.1.2
-Readme Date: 10/5/2026
+# Actionable version 0.1.3
+Readme Date: 10/6/2026
 
 A client-side Fabric mod that plays Minecraft autonomously: a local Gemma model chooses its own goals,
 breaks them into steps, and carries them out through Baritone.

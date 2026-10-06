@@ -59,7 +59,11 @@ final class ActionPlanner {
             Use "lookup" with a short search query to find registered block/item IDs or player-known recipes.
             Lookup results are local game data and will be supplied in the next turn. Do not invent global
             biome/dimension/ore-generation ranges; only report nearby loaded observations in the synopsis.
-            Prioritize immediate hostile threats and low health; there is no combat action.
+            Basic melee combat is available: {"type":"attack","entity_id":123} sends one hit to a
+            live hostile mob identified in nearby_hostile_mobs. Only attack targets marked melee_reachable=true.
+            Attacks respect weapon cooldown and line of sight. No ranged attacks or combat pathfinding.
+            Never target players or neutral mobs. Escape creepers and flee when health is 6 or lower.
+            Observe target health/death before claiming damage or kills; repeat attack if still needed.
 
             Return only JSON:
             {"summary":"short status","goal":"current subgoal","complete":false,
@@ -94,7 +98,7 @@ final class ActionPlanner {
             You break a Minecraft task into an ordered plan of concrete, verifiable steps.
             Each step must be achievable with these abilities only: Baritone navigation and mining
             (mine, goto, explore, find, pickup, farm, follow), placing a single block from inventory,
-            and looking up block/item IDs and known recipes. Crafting and schematic creation are NOT
+            close-range melee against hostile mobs, and looking up block/item IDs and known recipes. Crafting and schematic creation are NOT
             available, so never emit a step that requires crafting or building from a schematic.
             Gather prerequisites before they are needed: to place blocks you must first mine them.
             State quantities and concrete block IDs where known, for example "mine 4 minecraft:oak_log".
@@ -113,17 +117,41 @@ final class ActionPlanner {
             You are given the world state, goals already achieved, and goals recently attempted.
             Choose ONE short objective that makes concrete progress and is achievable right now with
             these abilities only: Baritone navigation and mining (mine, goto, explore, find, pickup,
-            farm, follow), placing a single block from inventory, and looking up IDs and known recipes.
+            farm, follow), placing a single block from inventory, close-range melee against hostile mobs,
+            and looking up IDs and known recipes.
             Crafting and schematic building are NOT available, so never choose a goal that needs them.
             Prefer the natural progression: gather wood, then stone, then coal, then iron ore.
-            Survival comes first: if health is low or hostile mobs are targeting the player, choose a
-            goal that escapes the threat instead.
+            Survival comes first: escape at health 6 or lower and avoid creepers. Healthy players can
+            fight a nearby hostile mob marked melee_reachable=true; do not plan combat against distant mobs.
             Never repeat a goal listed as already achieved, and do not repeat a recently attempted goal
             unless the state shows it clearly failed and is still worth doing.
             Name concrete quantities and block IDs, for example "mine 16 minecraft:oak_log".
             Return only JSON: {"goal":"mine 16 minecraft:oak_log","why":"short reason"}
             """;
     private static final String DEFAULT_ENDPOINT = "http://localhost:11434/api/chat";
+    private static final java.util.concurrent.atomic.AtomicLong REQUEST_IDS = new java.util.concurrent.atomic.AtomicLong();
+
+    private <T> T loggedRequest(String stage, java.util.function.Supplier<T> request) {
+        long id = REQUEST_IDS.incrementAndGet();
+        long started = System.nanoTime();
+        String provider = System.getProperty("actionable.model.provider", "ollama");
+        String model = provider.equalsIgnoreCase("claude")
+                ? System.getProperty("actionable.claude.model", "claude-sonnet-5-5")
+                : System.getProperty("actionable.ollama.model", "gemma3:4b");
+        ActionableLog.LOGGER.info("[Actionable] model_request id={} stage={} provider={} model={}",
+                id, stage, ActionableLog.text(provider), ActionableLog.text(model));
+        try {
+            T result = request.get();
+            ActionableLog.LOGGER.info("[Actionable] model_response id={} stage={} elapsed_ms={}",
+                    id, stage, (System.nanoTime() - started) / 1_000_000);
+            return result;
+        } catch (RuntimeException exception) {
+            ActionableLog.LOGGER.warn("[Actionable] model_failure id={} stage={} elapsed_ms={} error={}",
+                    id, stage, (System.nanoTime() - started) / 1_000_000,
+                    ActionableLog.text(safeMessage(exception)));
+            throw exception;
+        }
+    }
 
     private final HttpClient http = HttpClient.newBuilder()
             .connectTimeout(Duration.ofSeconds(5))
@@ -137,15 +165,15 @@ final class ActionPlanner {
     CompletableFuture<ActionPlan> plan(String task, String synopsis, String lastAction, String lastResult,
             String planContext, String history) {
         return CompletableFuture.supplyAsync(
-                () -> requestPlan(task, synopsis, lastAction, lastResult, planContext, history), executor);
+                () -> loggedRequest("action", () -> requestPlan(task, synopsis, lastAction, lastResult, planContext, history)), executor);
     }
 
     CompletableFuture<java.util.List<String>> decompose(String task, String synopsis) {
-        return CompletableFuture.supplyAsync(() -> requestSteps(task, synopsis), executor);
+        return CompletableFuture.supplyAsync(() -> loggedRequest("decomposition", () -> requestSteps(task, synopsis)), executor);
     }
 
     CompletableFuture<String> chooseGoal(String synopsis, String achieved, String attempted) {
-        return CompletableFuture.supplyAsync(() -> requestGoal(synopsis, achieved, attempted), executor);
+        return CompletableFuture.supplyAsync(() -> loggedRequest("director", () -> requestGoal(synopsis, achieved, attempted)), executor);
     }
 
     private String requestGoal(String synopsis, String achieved, String attempted) {
@@ -172,7 +200,7 @@ final class ActionPlanner {
     }
 
     CompletableFuture<Boolean> checkStep(String objective, String inventory, String recent) {
-        return CompletableFuture.supplyAsync(() -> requestStepVerdict(objective, inventory, recent), executor);
+        return CompletableFuture.supplyAsync(() -> loggedRequest("judge", () -> requestStepVerdict(objective, inventory, recent)), executor);
     }
 
     private boolean requestStepVerdict(String objective, String inventory, String recent) {
@@ -232,6 +260,18 @@ final class ActionPlanner {
     }
 
     private String send(String endpoint, JsonObject body) {
+        String provider = System.getProperty("actionable.model.provider", "ollama");
+        if (provider.equalsIgnoreCase("claude")) {
+            JsonArray messages = body.getAsJsonArray("messages");
+            String system = messages.get(0).getAsJsonObject().get("content").getAsString();
+            String stage = system.equals(DIRECTOR_PROMPT) ? "director" : system.equals(DECOMPOSE_PROMPT)
+                    ? "decomposition" : system.equals(JUDGE_PROMPT) ? "judge" : "action";
+            return ClaudeCli.request(system,
+                    messages.get(1).getAsJsonObject().get("content").getAsString(), PlannerSchema.forStage(stage));
+        }
+        if (!provider.equalsIgnoreCase("ollama")) {
+            throw new IllegalStateException("Unknown actionable.model.provider: " + provider);
+        }
         HttpRequest request = HttpRequest.newBuilder(URI.create(endpoint))
                 .timeout(Duration.ofSeconds(180))
                 .header("Content-Type", "application/json")
@@ -304,6 +344,18 @@ final class ActionPlanner {
         String type = action.has("type") ? action.get("type").getAsString() : "baritone";
         if (type.equals("wait")) {
             return Optional.of(new PlannedAction("wait", "", "", 0, 0, 0, ""));
+        }
+        if (type.equals("attack") && action.has("entity_id")) {
+            String id = action.get("entity_id").toString();
+            if (id.matches("[0-9]{1,10}")) {
+                try {
+                    int entityId = Integer.parseInt(id);
+                    return Optional.of(new PlannedAction("attack", Integer.toString(entityId), "", 0, 0, 0, ""));
+                } catch (NumberFormatException ignored) {
+                    return Optional.empty();
+                }
+            }
+            return Optional.empty();
         }
         if (type.equals("lookup") && action.has("query")) {
             String query = cleanText(action, "query", "", 80);

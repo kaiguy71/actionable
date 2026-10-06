@@ -61,6 +61,7 @@ public final class ActionableClient implements ClientModInitializer {
     private boolean autonomous = true;
     private boolean choosingGoal;
     private boolean escaping;
+    private boolean defending;
     private int ticksUntilGoal;
     private long taskStartedAtTick;
     private final java.util.ArrayDeque<String> achievedGoals = new java.util.ArrayDeque<>();
@@ -73,6 +74,8 @@ public final class ActionableClient implements ClientModInitializer {
     @Override
     @SuppressWarnings("null")
     public void onInitializeClient() {
+        ActionableLog.LOGGER.info("[Actionable] initialized provider={} autonomous={} log=logs/latest.log",
+                ActionableLog.text(System.getProperty("actionable.model.provider", "ollama")), autonomous);
         toggleKey = KeyMappingHelper.registerKeyMapping(
                 new KeyMapping(
                         "key.actionable.toggle",
@@ -118,6 +121,7 @@ public final class ActionableClient implements ClientModInitializer {
         ClientReceiveMessageEvents.GAME.register((message, overlay) -> {
             String text = message.getString();
             if (text.contains("[Baritone]")) {
+                ActionableLog.LOGGER.info("[Actionable] baritone_feedback {}", ActionableLog.text(text));
                 baritoneStatus = compact(text, 140);
                 lastResult = "Baritone feedback: " + baritoneStatus;
                 if (text.contains("Error") || text.contains("error")
@@ -143,6 +147,9 @@ public final class ActionableClient implements ClientModInitializer {
                 if (controlDown) {
                     toggle(client);
                 }
+            }
+            if (tickDefense(client)) {
+                return;
             }
             if (enabled && activeTask != null && clientTick - taskStartedAtTick > MAX_TASK_TICKS) {
                 abandonTask(client, "took too long");
@@ -308,7 +315,8 @@ public final class ActionableClient implements ClientModInitializer {
         double nearestDistance = Double.MAX_VALUE;
         for (net.minecraft.world.entity.Entity entity : level.entitiesForRendering()) {
             if (entity instanceof net.minecraft.world.entity.monster.Monster monster && monster.isAlive()
-                    && monster.getTarget() == player) {
+                    && (monster.getTarget() == player
+                        || BuiltInRegistries.ENTITY_TYPE.getKey(monster.getType()).toString().equals("minecraft:creeper"))) {
                 double distance = monster.distanceToSqr(player);
                 if (distance < nearestDistance) {
                     nearestDistance = distance;
@@ -323,8 +331,56 @@ public final class ActionableClient implements ClientModInitializer {
         if (!hurt && nearestDistance > 64) {
             return null;
         }
+        if (!hurt && MeleeCombat.reachable(client, nearest)) {
+            return null;
+        }
         BlockPos threat = nearest.blockPosition();
         return fleeTo(here.getX(), here.getY(), here.getZ(), threat.getX(), threat.getZ());
+    }
+
+    /** Immediate defense does not wait for a model round trip or abandon the interrupted task. */
+    private boolean tickDefense(Minecraft client) {
+        net.minecraft.world.entity.Entity target = enabled && autonomous && !escaping
+                && client.player != null && client.player.isAlive() && client.player.getHealth() > DANGER_HEALTH
+                && client.mouseHandler.isMouseGrabbed() && client.isWindowActive()
+                && dangerEscape(client) == null ? MeleeCombat.nearest(client) : null;
+        if (target == null) {
+            if (defending) {
+                defending = false;
+                ActionableLog.LOGGER.info("[Actionable] defense_ended task={}", ActionableLog.text(activeTask));
+                stepJudged = false;
+                ticksUntilPlan = 0;
+                remember(lastAction, "Close-range defense ended; observe world before resuming task");
+            }
+            return false;
+        }
+        if (!defending) {
+            defending = true;
+            ActionableLog.LOGGER.info("[Actionable] defense_started entity_id={} task={}",
+                    target.getId(), ActionableLog.text(activeTask));
+            generation++;
+            planning = false;
+            judging = false;
+            choosingGoal = false;
+            errorCode = "none";
+            lastError = "none";
+            if (decomposing) {
+                decomposing = false;
+                if (taskSteps.isEmpty() && activeTask != null) {
+                    taskSteps = java.util.List.of(activeTask);
+                    currentStep = 0;
+                }
+            }
+            pendingJumpPlace = null;
+            stopBaritone(client);
+        }
+        lastAction = "attack entity_id=" + target.getId();
+        lastResult = MeleeCombat.attack(client, target.getId());
+        if (lastResult.startsWith("ATTACK_SENT")) {
+            ActionableLog.LOGGER.info("[Actionable] combat {}", ActionableLog.text(lastResult));
+        }
+        currentGoal = "Defending against " + BuiltInRegistries.ENTITY_TYPE.getKey(target.getType());
+        return true;
     }
 
     static String fleeTo(int fromX, int fromY, int fromZ, int awayX, int awayZ) {
@@ -575,6 +631,8 @@ public final class ActionableClient implements ClientModInitializer {
             return;
         }
         history.addLast(entry);
+        ActionableLog.LOGGER.info("[Actionable] action={} result={}",
+                ActionableLog.text(action), ActionableLog.text(result));
         while (history.size() > HISTORY_LIMIT) {
             history.removeFirst();
         }
@@ -669,6 +727,19 @@ public final class ActionableClient implements ClientModInitializer {
 
             ActionPlanner.PlannedAction action = plan.action().orElseThrow();
             switch (action.type()) {
+                case "attack" -> {
+                    stopBaritone(client);
+                    lastAction = "attack entity_id=" + action.command();
+                    lastResult = MeleeCombat.attack(client, Integer.parseInt(action.command()));
+                    if (lastResult.startsWith("ATTACK_FAILED")) {
+                        errorCode = lastResult;
+                        lastError = lastResult;
+                    } else {
+                        errorCode = "none";
+                        lastError = "none";
+                    }
+                    tell(client, lastResult);
+                }
                 case "wait" -> {
                     lastResult = baritoneCommandRunning
                             ? "Planner chose to wait; " + baritoneProgress(client)
@@ -702,7 +773,9 @@ public final class ActionableClient implements ClientModInitializer {
                 }
             }
             remember(lastAction, lastResult);
-            if (action.type().equals("place_block")) {
+            if (action.type().equals("attack")) {
+                ticksUntilPlan = 20;
+            } else if (action.type().equals("place_block")) {
                 ticksUntilPlan = lastResult.startsWith("BLOCK_PLACE_DEFERRED") ? 1 : 200;
             } else if (action.type().equals("jump_place") && pendingJumpPlace == null) {
                 ticksUntilPlan = lastResult.startsWith("BLOCK_PLACE_DEFERRED") ? 1 : 200;
@@ -1020,7 +1093,7 @@ public final class ActionableClient implements ClientModInitializer {
         int maxTextWidth = DEBUG_PANEL_WIDTH - 12;
         java.util.List<String> rawLines = java.util.List.of(
                 "Actionable DEBUG",
-                "State: " + (!enabled ? "paused" : choosingGoal ? "choosing goal"
+                "State: " + (!enabled ? "paused" : defending ? "defending" : choosingGoal ? "choosing goal"
                         : decomposing ? "decomposing"
                         : planning ? "planning" : activeTask == null ? "idle" : "active")
                         + (autonomous ? " [auto]" : " [manual]"),
@@ -1061,6 +1134,15 @@ public final class ActionableClient implements ClientModInitializer {
 
     private static String plannerErrorCode(Throwable error) {
         String message = ActionPlanner.safeMessage(error);
+        if (message.startsWith("CLAUDE_INVALID_JSON:")) {
+            return "CLAUDE_INVALID_JSON";
+        }
+        if (message.startsWith("CLAUDE_TIMEOUT:")) {
+            return "CLAUDE_TIMEOUT";
+        }
+        if (message.startsWith("CLAUDE_REQUEST_FAILED:")) {
+            return "CLAUDE_REQUEST_FAILED";
+        }
         if (message.contains("HTTP 404")) {
             return "OLLAMA_HTTP_404";
         }
@@ -1083,6 +1165,7 @@ public final class ActionableClient implements ClientModInitializer {
     }
 
     private static void tell(Minecraft client, String message) {
+        ActionableLog.LOGGER.info("[Actionable] {}", ActionableLog.text(message));
         if (client.player != null) {
             client.gui.hud.setOverlayMessage(Component.literal("[Actionable] " + message), false);
         }

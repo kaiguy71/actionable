@@ -15,7 +15,7 @@ breaks them into steps, and carries them out through Baritone.
 
 1. Run `ollama pull gemma3:4b` and start Ollama (run `ollama` in the command prompt, then exit after
    choosing to use it without an account). Ollama should now show up as a hidden icon on your taskbar.
-2. Build with `./gradlew build`.
+2. Build with `./gradlew build` (this also runs the unit tests; `./gradlew test` runs only the tests).
 3. Install the generated JAR from `build/libs` (`actionable-0.1.2-26.3-fabric.jar`) with Fabric API
    (https://fabricmc.com) and the Fabric client build of Baritone (API version from
    https://github.com/cabaletta/baritone/releases/tag/v1.20.0) for Minecraft 26.3.
@@ -48,18 +48,42 @@ history, and sends Baritone `#cancel`; the active task resumes when re-enabled.
 
 Planning runs in four layers, each a separate call to the configured model:
 
-1. **Director** — picks the next goal from the world state, the goals already achieved, and the goals
-   recently attempted. Only runs when no task is active.
+1. **Director** — picks the next goal, and must say why, from a progression briefing, the world state,
+   the goals already achieved, and the goals recently attempted. Only runs when no task is active.
 2. **Decomposition** — breaks that goal into an ordered plan of at most 8 concrete steps. The plan is
-   printed to chat and persists for the whole task.
+   printed to chat and persists for the whole task. Goals the tech tree knows (`craft 1
+   minecraft:wooden_pickaxe`, `mine 8 minecraft:stone`) are planned in code instead, with no model call.
 3. **Step loop** — works one step at a time, re-planning about every 10 seconds (200 ticks). The model
    sees the numbered plan with the current step marked, the last 5 actions and their results, Baritone's
    elapsed time and progress, and the world snapshot. It picks one action per turn, and may return
    `wait` to let a running `mine` or `explore` continue.
-4. **Judge** — a small dedicated call that decides whether the current step's objective is already
-   satisfied, from the inventory and recent history. When it says yes, the plan advances to the next step.
+4. **Judge** — decides whether the current step's objective is already satisfied. Steps that name a
+   quantity and an item (`mine 3 minecraft:oak_log`, `craft 4 minecraft:stick`) are checked against the
+   inventory every second, with no model call. Other steps use a small dedicated model call. When a step is
+   satisfied, the plan advances to the next step.
 
-Two decisions are made in code rather than by the model, because `gemma3:4b` was measured failing both:
+A step that is already an action (`mine N X`, `craft N X`, `place minecraft:crafting_table nearby`) is
+run directly the first time, without a planning round trip. If it fails or needs follow-up, the step
+loop model takes over and sees the failure.
+
+### Progression knowledge
+
+The director and decomposer get a progression briefing built from a curated tech tree:
+
+| Field | Meaning |
+| --- | --- |
+| `pickaxe_tier` | Best pickaxe held: `none`, `wood`, `stone`, `iron`, `diamond`. |
+| `cannot_mine_yet` | Blocks that drop nothing with the current tools, and the pickaxe each needs. |
+| `next_milestone` | The next step on the ladder, with the reason it matters. |
+| `milestone_plan` | The exact steps the code would use for that milestone. |
+| `craftable_now` | Items whose ingredients are already in the inventory, and whether a table is needed. |
+| `inventory_uses` | What each held item is for, or that it has no known use. |
+| `craftable_catalog` | Everything Actionable can craft. |
+
+The milestones are: wooden pickaxe, stone pickaxe, stone sword, 16 torches, furnace, then 12 raw iron.
+Each is skipped once the inventory satisfies it.
+
+Several decisions are made in code rather than by the model, because `gemma3:4b` was measured failing them:
 
 - **Survival.** Healthy players automatically defend against hostile mobs already within melee reach,
   using a hotbar sword or axe when available and respecting attack cooldown and line of sight. Defense
@@ -68,11 +92,26 @@ Two decisions are made in code rather than by the model, because `gemma3:4b` was
   from within 8 blocks, Actionable interrupts whatever is running and flees 40 blocks directly away from
   the threat. The flee command runs immediately without waiting for a planning round trip, and ends as
   soon as the threat clears.
-- **Repeat avoidance.** A chosen goal is reduced to the resource it concerns, so "mine 20 stone" and
-  "mine 8 cobblestone" count as the same goal. If the director picks something already achieved, it is
-  replaced using a built-in ladder: 16 oak logs, then 24 cobblestone, then 12 coal ore, then 12 iron
-  ore, each skipped if the inventory already holds enough. If the ladder is exhausted, Actionable
-  explores instead.
+- **Dark areas.** Every second, Actionable rates the player's surroundings from light level, sky
+  visibility, depth below the local surface (ignoring leaves), time of day, health, food and gear.
+  The rating is shown to the model as `safety={...}`. If the player is at least 4 blocks below the surface,
+  cannot see the sky, is at light level 4 or lower, and is not `cave_ready` (a pickaxe, a weapon and 4+
+  torches), Actionable abandons the current task. It then walks back to the last lit surface spot it
+  recorded, or straight up if there is none, and avoids that area when choosing later mining sites.
+- **Tools and mining sites.** Before a `mine` command reaches Baritone:
+  - Items become the block that drops them (`cobblestone` → `stone`, `coal` → `coal_ore`).
+  - A block that drops nothing without a tool the player lacks is refused with `MINE_FAILED_NO_TOOL`.
+  - Without cave gear, only deposits with a face exposed to the sky or to light 8+, and at most 6 blocks
+    below the surface, are accepted. If every loaded deposit is in the dark, the command is refused with
+    `MINE_FAILED_UNSAFE_SITE`. If the best site is more than 8 blocks away, Actionable walks there first
+    so Baritone starts next to it.
+  - A running `mine` is cancelled with `MINE_STOPPED_STRAYED` if Baritone takes the player more than
+    32 blocks from where mining started.
+- **Goal validation and repeat avoidance.** A director goal that needs a missing tool, or names
+  something Actionable cannot craft, is rejected in chat (`Rejected goal ...`). A chosen goal is also
+  reduced to the resource it concerns, so "mine 20 stone" and "mine 8 cobblestone" count as the same
+  goal. Rejected, repeated or failed goals are replaced with the next progression milestone. A milestone
+  attempted twice recently is skipped, and then Actionable explores instead.
 
 Any task still running after 5 minutes (6,000 ticks) is abandoned and a new goal is chosen. Actionable
 remembers the last 6 achieved goals and the last 6 attempted goals.
@@ -103,6 +142,8 @@ checks are not logged every tick. Restart Minecraft after installing the updated
 | `Baritone` | Elapsed time, movement, and distance to a `goto` target. |
 | `Baritone feedback` | The most recent `[Baritone]` chat line. |
 | `LLM goal` | The model's current subgoal. |
+| `Why` | The director's reason for the current goal, or the milestone's reason when code chose it. |
+| `Safety` | `safe`, `caution` or `danger`, with the first reason. |
 | `Result` | Result of the last action. |
 | `Error` | Latest error code and detail. |
 
@@ -131,6 +172,11 @@ checks are not logged every tick. Restart Minecraft after installing the updated
 | `PLAN_NO_VALID_ACTION` | The model returned no action Actionable could validate. |
 | `ACTION_TYPE_UNSUPPORTED` | The model asked for an action type that does not exist. |
 | `BARITONE_COMMAND_REJECTED` | Baritone refused the command; Actionable re-plans immediately. |
+| `MINE_FAILED_NO_TOOL` | The block drops nothing without a tool the player lacks (for example stone with no pickaxe). |
+| `MINE_FAILED_UNSAFE_SITE` | Every loaded deposit nearby is dark or deep underground, and the player lacks cave gear. |
+| `MINE_FAILED_CRAFTED_ITEM` | The model tried to mine something that is crafted, such as planks. |
+| `MINE_STOPPED_STRAYED` | Baritone took the player more than 32 blocks from where mining started. |
+| `CRAFT_FAILED_*` | A craft could not be done: `UNSUPPORTED`, `MISSING_INGREDIENTS`, `NO_TABLE`, `TABLE_OUT_OF_REACH`, `TABLE_DID_NOT_OPEN`, `NO_RESULT`, `OTHER_SCREEN_OPEN`, `NO_WORLD`. |
 | `BLOCK_PLACE_FAILED_*` | A `place_block` could not be completed: `NO_ITEM`, `MATERIAL_MISSING`, `UNKNOWN_BLOCK`, `NO_SUPPORT`, `OUT_OF_REACH`, `TARGET_OCCUPIED`, `NO_HEADROOM`, `PLAYER_IN_WAY`, `NO_WORLD`. |
 | `JUMP_PLACE_FAILED_*` | A `jump_place` could not be completed: `NOT_CURRENT_CELL`, `NOT_GROUNDED`, `JUMP_TIMEOUT`, `TARGET_OCCUPIED`, `NO_HEADROOM`, `WORLD_ENDED`. |
 | `GAME_SESSION_ENDED` | The world or connection closed while a plan was in flight. |
@@ -148,13 +194,24 @@ block IDs), and `explore` takes no arguments. Commands that fail validation are 
 `PLAN_NO_VALID_ACTION`. Small models often return a command as separate fields rather than one string,
 so Actionable reconstructs the command from either shape before validating it.
 
-Besides Baritone commands the model can return `attack`, `wait`, `lookup` (registered block/item IDs and recipes
-known to the player's recipe book), `place_block`, and `jump_place`. Baritone's own `build` command
+Besides Baritone commands the model can return `attack`, `wait`, `lookup` (registered block/item IDs,
+tech-tree uses and recipes, and recipes known to the player's recipe book), `place_block`, `jump_place`, and
+`craft`. Baritone's own `build` command
 loads an existing `.schematic`, `.schem`, or `.litematic` file; it does not place individual blocks.
 Actionable's guarded single-block placement moves an available inventory stack to the hotbar, clears a
 replaceable plant at the target, aims at an adjacent sturdy face, and places the block if the target is
 in reach. `jump_place` jumps up and places the block beneath the player, for the player's own feet cell.
 Routine status goes to the actionbar; plans go to chat.
+
+### Crafting
+
+`{"type":"craft","item":"minecraft:stick","count":4}` crafts until the inventory holds `count` of the
+item, the same "total to hold" meaning as Baritone's `mine` quantity. Actionable clicks fixed patterns
+into the inventory's 2x2 grid, or into a crafting table within reach for 3x3 recipes. It does not use the
+recipe book, so crafting works before recipes are unlocked. This needs the default
+`doLimitedCrafting=false`. Craftable items: any planks, sticks, crafting table, wooden and stone
+pickaxe/axe/sword/shovel, torches, furnace, and chest. Wood variants are interchangeable, and planks
+prefer the matching log.
 
 ### Basic combat
 
@@ -243,8 +300,9 @@ such as `gemma3:4b` is a practical starting point on consumer hardware.
 
 ## Limitations
 
-- **No crafting.** Actionable cannot craft tools or items, so the director and decomposer are instructed
-  never to choose goals or steps that need crafting. This is the main ceiling on what it can accomplish.
+- **Limited crafting, no smelting.** Only the items in the crafting catalog can be crafted, and furnaces
+  cannot be used yet, so iron stops at a raw-iron stockpile. Torches are counted toward cave readiness,
+  but Actionable does not place them.
 - **No schematic generation.** Automated building beyond individual block placements requires a
   compatible schematic already saved in Baritone's `schematics` directory.
 - **Combat is close-range melee only.** No combat pursuit, ranged weapons, shields, or boss strategy.

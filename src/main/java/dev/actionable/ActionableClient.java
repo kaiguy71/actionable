@@ -70,6 +70,18 @@ public final class ActionableClient implements ClientModInitializer {
     private boolean judging;
     private boolean stepJudged;
     private final java.util.ArrayDeque<String> history = new java.util.ArrayDeque<>();
+    private static final int AVOID_MEMORY = 4;
+    private static final int SITE_SCAN_RADIUS = 24;
+    private Crafter pendingCraft;
+    private boolean retreating;
+    private boolean stepActionTaken;
+    private int[] lastSafePosition;
+    private int[] mineStart;
+    private String pendingMine;
+    private long pendingMineSince;
+    private String goalReason = "";
+    private String safetyStatus = "unknown";
+    private final java.util.ArrayDeque<int[]> avoidAreas = new java.util.ArrayDeque<>();
 
     @Override
     @SuppressWarnings("null")
@@ -141,6 +153,9 @@ public final class ActionableClient implements ClientModInitializer {
             clientTick++;
             updateBaritoneProgress(client);
             tickJumpPlace(client);
+            tickCraft(client);
+            tickMining(client);
+            tickStepCheck(client);
             while (toggleKey.consumeClick()) {
                 boolean controlDown = InputConstants.isKeyDown(InputConstants.KEY_LCONTROL)
                         || InputConstants.isKeyDown(InputConstants.KEY_RCONTROL);
@@ -151,6 +166,7 @@ public final class ActionableClient implements ClientModInitializer {
             if (tickDefense(client)) {
                 return;
             }
+            tickSafety(client);
             if (enabled && activeTask != null && clientTick - taskStartedAtTick > MAX_TASK_TICKS) {
                 abandonTask(client, "took too long");
             }
@@ -163,6 +179,7 @@ public final class ActionableClient implements ClientModInitializer {
                 if (escape != null) {
                     stopBaritone(client);
                     escaping = true;
+                    retreating = false;
                     startGoal(client, "escape immediate danger", java.util.List.of(escape));
                 }
             }
@@ -171,7 +188,7 @@ public final class ActionableClient implements ClientModInitializer {
                 requestGoalSelection(client);
             }
             if (enabled && activeTask != null && !planning && !decomposing && !judging
-                    && pendingJumpPlace == null && ticksUntilPlan-- <= 0) {
+                    && pendingJumpPlace == null && pendingCraft == null && ticksUntilPlan-- <= 0) {
                 requestNextPlan(client);
             }
         });
@@ -220,6 +237,8 @@ public final class ActionableClient implements ClientModInitializer {
         taskSteps = java.util.List.of();
         currentStep = 0;
         stepJudged = false;
+        stepActionTaken = false;
+        goalReason = "requested with /action";
         taskStartedAtTick = clientTick;
         history.clear();
         noteAttempt(prompt);
@@ -229,6 +248,7 @@ public final class ActionableClient implements ClientModInitializer {
 
     private void requestGoalSelection(Minecraft client) {
         String synopsis = WorldSynopsis.capture(client);
+        String briefing = briefing(client, synopsis);
 
         // Survival is decided in code: the model was tested and did not reliably prioritise it.
         String escape = dangerEscape(client);
@@ -240,8 +260,8 @@ public final class ActionableClient implements ClientModInitializer {
         long requestGeneration = ++generation;
         choosingGoal = true;
         currentGoal = "Choosing a goal";
-        planner.chooseGoal(synopsis, joined(achievedGoals), joined(attemptedGoals))
-                .whenComplete((goal, error) -> client.execute(() -> {
+        planner.chooseGoal(synopsis, briefing, joined(achievedGoals), joined(attemptedGoals))
+                .whenComplete((choice, error) -> client.execute(() -> {
                     if (requestGeneration != generation) {
                         return;
                     }
@@ -249,55 +269,70 @@ public final class ActionableClient implements ClientModInitializer {
                     if (!enabled || !autonomous || client.player == null || client.level == null) {
                         return;
                     }
-                    String chosen = error == null && goal != null ? goal.strip() : "";
+                    String chosen = error == null && choice != null ? choice.goal().strip() : "";
+                    String why = error == null && choice != null ? choice.why() : "";
+                    // Goals that need a missing tool are replaced in code: the model chose to punch stone.
+                    java.util.Optional<String> problem = chosen.isEmpty() ? java.util.Optional.empty()
+                            : ProgressPlanner.goalProblem(chosen, WorldProbe.inventory(client.player));
                     // Repeat avoidance is also in code: the model re-picked goals it had just achieved.
-                    if (chosen.isEmpty() || alreadyAchieved(chosen)) {
-                        String fallback = ladderGoal(client);
+                    if (chosen.isEmpty() || alreadyAchieved(chosen) || problem.isPresent()) {
                         if (error != null) {
                             errorCode = plannerErrorCode(error);
                             lastError = compact(ActionPlanner.safeMessage(error), 140);
                         }
-                        if (fallback == null) {
+                        if (problem.isPresent()) {
+                            ActionableLog.LOGGER.info("[Actionable] goal_rejected goal={} problem={}",
+                                    ActionableLog.text(chosen), ActionableLog.text(problem.get()));
+                            tell(client, "Rejected goal \"" + chosen + "\": " + problem.get());
+                        }
+                        java.util.Optional<ProgressPlanner.Milestone> milestone = milestone(client);
+                        if (milestone.isEmpty()) {
                             // Nothing useful to do right now; look around and reconsider shortly.
                             tell(client, "No new goal available; exploring.");
                             chosen = "explore to find new resources";
+                            why = "no milestone is reachable right now; new terrain may expose resources";
                         } else {
-                            tell(client, "Replaced repeated goal with: " + fallback);
-                            chosen = fallback;
+                            chosen = milestone.get().goal();
+                            why = milestone.get().why();
+                            tell(client, "Using milestone goal: " + chosen);
                         }
                     }
                     activeTask = chosen;
+                    goalReason = why.isBlank() ? "no reason given" : why;
                     remember("chose goal", chosen);
                     noteAttempt(chosen);
-                    tell(client, "Goal: " + chosen);
+                    ActionableLog.LOGGER.info("[Actionable] goal={} why={}",
+                            ActionableLog.text(chosen), ActionableLog.text(goalReason));
+                    tell(client, "Goal: " + chosen + " (why: " + goalReason + ")");
                     beginTask(client, chosen);
                 }));
     }
 
-    /** Hard-coded resource ladder, used when the director repeats itself or fails. */
-    private String ladderGoal(Minecraft client) {
-        var player = client.player;
-        if (player == null) {
-            return null;
+    /**
+     * The next tech-tree milestone, used when the director fails, repeats itself, or picks something
+     * impossible. Inventory decides what is done; a milestone attempted twice recently is skipped.
+     */
+    private java.util.Optional<ProgressPlanner.Milestone> milestone(Minecraft client) {
+        if (client.player == null) {
+            return java.util.Optional.empty();
         }
-        for (String[] rung : new String[][] {
-                {"minecraft:oak_log", "mine 16 minecraft:oak_log", "8"},
-                {"minecraft:cobblestone", "mine 24 minecraft:cobblestone", "16"},
-                {"minecraft:coal", "mine 12 minecraft:coal_ore", "4"},
-                {"minecraft:raw_iron", "mine 12 minecraft:iron_ore", "4"}}) {
-            Item item = BuiltInRegistries.ITEM.getValue(Identifier.parse(rung[0]));
-            int have = 0;
-            for (int slot = 0; slot < player.getInventory().getContainerSize(); slot++) {
-                ItemStack stack = player.getInventory().getItem(slot);
-                if (stack.getItem() == item) {
-                    have += stack.getCount();
-                }
-            }
-            if (have < Integer.parseInt(rung[2]) && !alreadyAchieved(rung[1])) {
-                return rung[1];
-            }
+        return ProgressPlanner.nextMilestone(WorldProbe.inventory(client.player))
+                .filter(next -> attemptedGoals.stream()
+                        .filter(goal -> goalKey(goal).equals(goalKey(next.goal()))).count() < 2);
+    }
+
+    private boolean tableNearby(Minecraft client) {
+        if (client.player == null || client.level == null) {
+            return false;
         }
-        return null;
+        BlockPos table = WorldProbe.nearestCraftingTable(client.level, client.player.blockPosition());
+        return table != null && table.distSqr(client.player.blockPosition()) <= 64;
+    }
+
+    private String briefing(Minecraft client, String synopsis) {
+        var inventory = WorldProbe.inventory(java.util.Objects.requireNonNull(client.player));
+        return ProgressPlanner.briefing(inventory, tableNearby(client),
+                WorldProbe.preferredLog(inventory, synopsis));
     }
 
     /**
@@ -372,6 +407,7 @@ public final class ActionableClient implements ClientModInitializer {
                 }
             }
             pendingJumpPlace = null;
+            cancelCraft(client);
             stopBaritone(client);
         }
         lastAction = "attack entity_id=" + target.getId();
@@ -400,6 +436,7 @@ public final class ActionableClient implements ClientModInitializer {
         taskSteps = java.util.List.copyOf(steps);
         currentStep = 0;
         stepJudged = false;
+        stepActionTaken = false;
         history.clear();
         taskStartedAtTick = clientTick;
         taskOrigin = java.util.Objects.requireNonNull(client.player).blockPosition();
@@ -430,6 +467,7 @@ public final class ActionableClient implements ClientModInitializer {
         taskSteps = java.util.List.of();
         currentStep = 0;
         stepJudged = false;
+        stepActionTaken = false;
         history.clear();
         taskStartedAtTick = clientTick;
         taskOrigin = java.util.Objects.requireNonNull(client.player).blockPosition();
@@ -451,7 +489,9 @@ public final class ActionableClient implements ClientModInitializer {
         lastResult = "Abandoned: " + reason;
         currentGoal = "Idle";
         stopBaritone(client);
+        cancelCraft(client);
         escaping = false;
+        retreating = false;
         activeTask = null;
         taskSteps = java.util.List.of();
         ticksUntilGoal = 40;
@@ -513,11 +553,23 @@ public final class ActionableClient implements ClientModInitializer {
     }
 
     private void requestDecomposition(Minecraft client) {
+        String synopsis = WorldSynopsis.capture(client);
+        var inventory = WorldProbe.inventory(java.util.Objects.requireNonNull(client.player));
+        // Tech-tree goals get an exact plan from code; the model only decomposes free-form tasks.
+        java.util.List<String> known = ProgressPlanner.stepsForGoal(activeTask, inventory, tableNearby(client),
+                WorldProbe.preferredLog(inventory, synopsis));
+        if (!known.isEmpty() && known.size() <= ActionPlanner.MAX_STEPS) {
+            taskSteps = java.util.List.copyOf(known);
+            announcePlan(client);
+            currentStep = 0;
+            ticksUntilPlan = 0;
+            requestNextPlan(client);
+            return;
+        }
         long requestGeneration = generation;
         decomposing = true;
         currentGoal = "Breaking the task into steps";
-        String synopsis = WorldSynopsis.capture(client);
-        planner.decompose(activeTask, synopsis).whenComplete((steps, error) -> client.execute(() -> {
+        planner.decompose(activeTask, synopsis, briefing(client, synopsis)).whenComplete((steps, error) -> client.execute(() -> {
             if (requestGeneration != generation) {
                 return;
             }
@@ -535,16 +587,22 @@ public final class ActionableClient implements ClientModInitializer {
                 tell(client, "Could not split the task; working on it directly.");
             } else {
                 taskSteps = java.util.List.copyOf(steps);
-                tell(client, "Plan (" + taskSteps.size() + " steps). Step 1: " + taskSteps.get(0));
-                for (int index = 0; index < taskSteps.size(); index++) {
-                    java.util.Objects.requireNonNull(client.player).sendSystemMessage(
-                            Component.literal("[Actionable] " + (index + 1) + ". " + taskSteps.get(index)));
-                }
+                announcePlan(client);
             }
             currentStep = 0;
             ticksUntilPlan = 0;
             requestNextPlan(client);
         }));
+    }
+
+    private void announcePlan(Minecraft client) {
+        tell(client, "Plan (" + taskSteps.size() + " steps). Step 1: " + taskSteps.get(0));
+        ActionableLog.LOGGER.info("[Actionable] plan task={} steps={}",
+                ActionableLog.text(activeTask), ActionableLog.text(taskSteps.toString()));
+        for (int index = 0; index < taskSteps.size(); index++) {
+            java.util.Objects.requireNonNull(client.player).sendSystemMessage(
+                    Component.literal("[Actionable] " + (index + 1) + ". " + taskSteps.get(index)));
+        }
     }
 
     private void requestStepCheck(Minecraft client) {
@@ -583,6 +641,7 @@ public final class ActionableClient implements ClientModInitializer {
         stopBaritone(client);
         currentStep++;
         stepJudged = false;
+        stepActionTaken = false;
         currentGoal = taskSteps.get(currentStep);
         lastAction = "";
         lastResult = "Step " + currentStep + " done (" + finished + "); starting next step";
@@ -659,6 +718,9 @@ public final class ActionableClient implements ClientModInitializer {
         currentGoal = "Complete";
         noteAchieved(activeTask);
         escaping = false;
+        retreating = false;
+        mineStart = null;
+        pendingMine = null;
         activeTask = null;
         taskSteps = java.util.List.of();
         ticksUntilGoal = 60;
@@ -669,8 +731,24 @@ public final class ActionableClient implements ClientModInitializer {
             ticksUntilPlan = 20;
             return;
         }
+        if (!taskSteps.isEmpty()) {
+            // Quantity steps are judged from the inventory, without a model call.
+            String step = taskSteps.get(currentStep);
+            java.util.Optional<Boolean> done = ProgressPlanner.stepSatisfied(step,
+                    WorldProbe.inventory(client.player), tableNearby(client));
+            if (done.orElse(false)) {
+                advanceStep(client, step);
+                return;
+            }
+            if (done.isPresent()) {
+                stepJudged = true;
+            }
+        }
         if (!taskSteps.isEmpty() && !history.isEmpty() && !stepJudged) {
             requestStepCheck(client);
+            return;
+        }
+        if (!taskSteps.isEmpty() && !stepActionTaken && executeStepDirectly(client)) {
             return;
         }
         long requestGeneration = generation;
@@ -746,6 +824,7 @@ public final class ActionableClient implements ClientModInitializer {
                             : "Planner chose no input; reevaluate after next observation";
                     tell(client, baritoneCommandRunning ? "Waiting on current Baritone task." : "Waiting for next observation.");
                 }
+                case "craft" -> startCraft(client, action.block(), Integer.parseInt(action.command()));
                 case "lookup" -> {
                     lastAction = "lookup " + action.query();
                     lastResult = GameKnowledge.lookup(client, action.query());
@@ -764,7 +843,13 @@ public final class ActionableClient implements ClientModInitializer {
                     lastResult = startJumpPlace(client, action);
                     reportBlockResult(client);
                 }
-                case "baritone" -> executeBaritone(client, connection, action.command());
+                case "baritone" -> {
+                    if (action.command().startsWith("mine ")) {
+                        startMine(client, connection, action.command());
+                    } else {
+                        executeBaritone(client, connection, action.command());
+                    }
+                }
                 default -> {
                     lastResult = "Unsupported action type: " + action.type();
                     errorCode = "ACTION_TYPE_UNSUPPORTED";
@@ -774,6 +859,8 @@ public final class ActionableClient implements ClientModInitializer {
             }
             remember(lastAction, lastResult);
             if (action.type().equals("attack")) {
+                ticksUntilPlan = 20;
+            } else if (action.type().equals("craft") || lastResult.startsWith("MINE_FAILED")) {
                 ticksUntilPlan = 20;
             } else if (action.type().equals("place_block")) {
                 ticksUntilPlan = lastResult.startsWith("BLOCK_PLACE_DEFERRED") ? 1 : 200;
@@ -785,6 +872,273 @@ public final class ActionableClient implements ClientModInitializer {
         }));
     }
 
+    /**
+     * Runs the current step itself when it already names an action ("mine 3 minecraft:oak_log",
+     * "craft 4 minecraft:stick", "place minecraft:crafting_table nearby"), saving a model round trip.
+     * Only the first attempt is direct; failures and waiting go back to the model.
+     */
+    private boolean executeStepDirectly(Minecraft client) {
+        var connection = client.getConnection();
+        var player = client.player;
+        if (connection == null || player == null || client.level == null) {
+            return false;
+        }
+        String step = taskSteps.get(currentStep);
+        java.util.Optional<ProgressPlanner.QuantifiedStep> parsed = ProgressPlanner.parse(step);
+        if (parsed.isPresent() && parsed.get().verb().equals("craft")) {
+            stepActionTaken = true;
+            startCraft(client, parsed.get().item(), parsed.get().count());
+            ticksUntilPlan = 20;
+        } else if (parsed.isPresent() && parsed.get().verb().equals("mine")
+                && ActionPlanner.validateCommand("mine " + parsed.get().count() + " " + parsed.get().item()).isPresent()) {
+            stepActionTaken = true;
+            startMine(client, connection, "mine " + parsed.get().count() + " " + parsed.get().item());
+            ticksUntilPlan = lastResult.startsWith("MINE_FAILED") ? 20 : 200;
+        } else if (step.startsWith("place " + TechTree.CRAFTING_TABLE)) {
+            java.util.List<BlockPos> spots = WorldProbe.placementCandidates(client.level, player.blockPosition());
+            if (spots.isEmpty()) {
+                return false;
+            }
+            BlockPos spot = spots.get(0);
+            stopBaritone(client);
+            lastAction = "place " + TechTree.CRAFTING_TABLE + " at " + spot.getX() + "," + spot.getY() + "," + spot.getZ();
+            lastResult = placeBlock(client, new ActionPlanner.PlannedAction("place_block", "", TechTree.CRAFTING_TABLE,
+                    spot.getX(), spot.getY(), spot.getZ(), ""));
+            reportBlockResult(client);
+            // A cleared plant only prepares the spot, so the direct attempt is not used up yet.
+            stepActionTaken = !lastResult.startsWith("BLOCK_PLACE_DEFERRED");
+            ticksUntilPlan = stepActionTaken ? 10 : 1;
+        } else {
+            return false;
+        }
+        currentGoal = step;
+        remember(lastAction, lastResult);
+        return true;
+    }
+
+    private void startCraft(Minecraft client, String item, int count) {
+        stopBaritone(client);
+        lastAction = "craft " + count + " " + item;
+        Crafter.Start start = Crafter.start(client, item, count, clientTick);
+        if (start.crafter() == null) {
+            lastResult = start.result();
+            reportBlockResult(client);
+            return;
+        }
+        pendingCraft = start.crafter();
+        lastResult = "Crafting " + item + " until holding " + count;
+        errorCode = "none";
+        lastError = "none";
+        tell(client, lastResult);
+    }
+
+    private void tickCraft(Minecraft client) {
+        if (pendingCraft == null) {
+            return;
+        }
+        String result = enabled ? pendingCraft.tick(client, clientTick) : pendingCraft.cancel(client);
+        if (result == null) {
+            return;
+        }
+        pendingCraft = null;
+        lastResult = result;
+        reportBlockResult(client);
+        remember(lastAction, lastResult);
+        ticksUntilPlan = 1;
+    }
+
+    private void cancelCraft(Minecraft client) {
+        if (pendingCraft != null) {
+            lastResult = pendingCraft.cancel(client);
+            pendingCraft = null;
+        }
+    }
+
+    /**
+     * Gates a mine command before Baritone sees it: maps items to the block that drops them, refuses
+     * blocks the player cannot harvest, and walks to an exposed, lit deposit instead of letting Baritone
+     * pick the nearest one, which may be deep in a dark cave.
+     */
+    private void startMine(Minecraft client, net.minecraft.client.multiplayer.ClientPacketListener connection,
+            String command) {
+        String[] parts = command.split("\\s+");
+        String requested = parts[2].contains(":") ? parts[2] : "minecraft:" + parts[2];
+        lastAction = command;
+        if (TechTree.recipeFor(requested).isPresent()) {
+            lastResult = "MINE_FAILED_CRAFTED_ITEM: " + requested + " is crafted, not mined; use a craft action";
+            reportBlockResult(client);
+            return;
+        }
+        String blockId = TechTree.blockToMine(requested);
+        String mine = "mine " + parts[1] + " " + blockId;
+        var player = client.player;
+        var level = client.level;
+        Identifier id = Identifier.tryParse(blockId);
+        if (player == null || level == null || id == null || !BuiltInRegistries.BLOCK.containsKey(id)) {
+            executeBaritone(client, connection, mine);
+            return;
+        }
+        net.minecraft.world.level.block.Block block = BuiltInRegistries.BLOCK.getValue(id);
+        var state = block.defaultBlockState();
+        if (state.requiresCorrectToolForDrops() && player.getInventory().getNonEquipmentItems().stream()
+                .noneMatch(stack -> !stack.isEmpty() && stack.isCorrectToolForDrops(state))) {
+            TechTree.Tier needed = TechTree.toolFor(blockId);
+            lastResult = "MINE_FAILED_NO_TOOL: " + blockId + " drops nothing without a "
+                    + TechTree.pickaxeFor(needed == TechTree.Tier.NONE ? TechTree.Tier.WOOD : needed)
+                    + " (or the right tool); craft it first instead of mining by hand";
+            reportBlockResult(client);
+            return;
+        }
+        SafetyAssessment.Result safety = WorldProbe.safety(client);
+        java.util.List<MiningPolicy.Site> sites = WorldProbe.exposedSites(level, player.blockPosition(), block,
+                SITE_SCAN_RADIUS);
+        if (!sites.isEmpty()) {
+            java.util.Optional<MiningPolicy.Site> best = MiningPolicy.choose(sites, safety.caveReady(),
+                    java.util.List.copyOf(avoidAreas));
+            if (best.isEmpty()) {
+                lastResult = MiningPolicy.rejection(blockId, sites, safety.missingForCaves());
+                reportBlockResult(client);
+                return;
+            }
+            MiningPolicy.Site site = best.get();
+            if (site.distance() > MiningPolicy.WALK_FIRST_DISTANCE) {
+                executeBaritone(client, connection, "goto " + site.standX() + " " + site.standY() + " " + site.standZ());
+                pendingMine = mine;
+                pendingMineSince = clientTick;
+                lastAction = mine;
+                lastResult = "Walking to exposed " + blockId + " at " + site.describe() + "; mining starts on arrival";
+                ActionableLog.LOGGER.info("[Actionable] mine_site block={} site={}",
+                        ActionableLog.text(blockId), ActionableLog.text(site.describe()));
+                return;
+            }
+        }
+        executeBaritone(client, connection, mine);
+        mineStart = new int[] {player.getBlockX(), player.getBlockY(), player.getBlockZ()};
+        if (!blockId.equals(requested)) {
+            lastResult += " (mining " + blockId + ", which drops " + requested + ")";
+        }
+    }
+
+    /** Starts a deferred mine once the player reaches its site, and leashes running mine commands. */
+    private void tickMining(Minecraft client) {
+        var player = client.player;
+        var connection = client.getConnection();
+        if (!enabled || player == null || connection == null || clientTick % 10 != 0) {
+            return;
+        }
+        if (pendingMine != null) {
+            double remaining = gotoDistance(client);
+            boolean arrived = remaining >= 0 && remaining <= 3;
+            boolean stalled = clientTick - lastBaritoneMovementAt > 100 || clientTick - pendingMineSince > 1200;
+            if (arrived || stalled) {
+                String mine = pendingMine;
+                executeBaritone(client, connection, mine);
+                mineStart = new int[] {player.getBlockX(), player.getBlockY(), player.getBlockZ()};
+                remember(mine, lastResult);
+            }
+            return;
+        }
+        if (mineStart != null && baritoneCommandRunning && currentBaritoneCommand.startsWith("mine ")
+                && MiningPolicy.strayed(mineStart, player.getBlockX(), player.getBlockY(), player.getBlockZ())) {
+            String command = currentBaritoneCommand;
+            stopBaritone(client);
+            lastAction = command;
+            lastResult = "MINE_STOPPED_STRAYED: Baritone went more than " + MiningPolicy.LEASH_DISTANCE
+                    + " blocks from where mining started; choose a closer exposed deposit or explore the surface";
+            errorCode = "MINE_STOPPED_STRAYED";
+            lastError = lastResult;
+            ActionableLog.LOGGER.info("[Actionable] mine_leash command={}", ActionableLog.text(command));
+            remember(lastAction, lastResult);
+            tell(client, lastResult);
+            ticksUntilPlan = 0;
+        }
+    }
+
+    /**
+     * Pulls the player out of dark underground areas when they lack cave gear. Decided in code, like
+     * fleeing, because the model walked into dark caves bare-handed.
+     */
+    private void tickSafety(Minecraft client) {
+        var player = client.player;
+        var level = client.level;
+        if (!enabled || player == null || level == null || clientTick % 20 != 0
+                || (!autonomous && activeTask == null)) {
+            return;
+        }
+        SafetyAssessment.Result safety = WorldProbe.safety(client);
+        safetyStatus = safety.level().name().toLowerCase(java.util.Locale.ROOT)
+                + (safety.reasons().isEmpty() ? "" : " - " + safety.reasons().get(0));
+        int x = player.getBlockX();
+        int y = player.getBlockY();
+        int z = player.getBlockZ();
+        if (safety.safeSpot()) {
+            lastSafePosition = new int[] {x, y, z};
+        }
+        if (retreating) {
+            if (!safety.underground() || safety.light() > 7) {
+                tell(client, "Back in a safe, lit area.");
+                remember("retreat", "Reached safety at " + x + "," + y + "," + z);
+                stopBaritone(client);
+                retreating = false;
+                activeTask = null;
+                taskSteps = java.util.List.of();
+                lastResult = "Retreated from a dark area without cave gear";
+                currentGoal = "Idle";
+                ticksUntilGoal = 40;
+            }
+            return;
+        }
+        if (!safety.retreat() || escaping || defending) {
+            return;
+        }
+        avoidAreas.addLast(new int[] {x, y, z});
+        while (avoidAreas.size() > AVOID_MEMORY) {
+            avoidAreas.removeFirst();
+        }
+        String interrupted = activeTask;
+        if (interrupted != null) {
+            noteAttempt(interrupted + " (stopped: dark underground without cave gear at " + x + "," + y + "," + z + ")");
+        }
+        ActionableLog.LOGGER.info("[Actionable] safety_retreat task={} position={},{},{} reasons={}",
+                ActionableLog.text(interrupted), x, y, z, ActionableLog.text(safety.reasons().toString()));
+        stopBaritone(client);
+        cancelCraft(client);
+        retreating = true;
+        goalReason = "dark underground without " + String.join(", ", safety.missingForCaves());
+        startGoal(client, "retreat from dark area to safety", java.util.List.of(SafetyAssessment.retreatCommand(
+                lastSafePosition, x, y, z, WorldProbe.surfaceY(level, x, z))));
+    }
+
+    /** Advances as soon as the inventory shows the current step is done, instead of at the next plan. */
+    private void tickStepCheck(Minecraft client) {
+        if (!enabled || activeTask == null || taskSteps.isEmpty() || planning || judging || decomposing
+                || pendingCraft != null || pendingJumpPlace != null || client.player == null
+                || clientTick % 20 != 0) {
+            return;
+        }
+        String step = taskSteps.get(currentStep);
+        // Only quantity steps: a table placed earlier would otherwise skip a fresh placement step.
+        if (ProgressPlanner.parse(step).isPresent()
+                && ProgressPlanner.stepSatisfied(step, WorldProbe.inventory(client.player), false).orElse(false)) {
+            advanceStep(client, step);
+        }
+    }
+
+    /** Remaining distance to the running goto target, or -1 when no goto is running. */
+    private double gotoDistance(Minecraft client) {
+        if (!baritoneCommandRunning || !currentBaritoneCommand.startsWith("goto ") || client.player == null) {
+            return -1;
+        }
+        String[] parts = currentBaritoneCommand.split("\\s+");
+        if (parts.length != 4) {
+            return -1;
+        }
+        BlockPos current = client.player.blockPosition();
+        return Math.sqrt(Math.pow(Integer.parseInt(parts[1]) - current.getX(), 2)
+                + Math.pow(Integer.parseInt(parts[2]) - current.getY(), 2)
+                + Math.pow(Integer.parseInt(parts[3]) - current.getZ(), 2));
+    }
+
     private void toggle(Minecraft client) {
         enabled = !enabled;
         if (!enabled) {
@@ -792,6 +1146,7 @@ public final class ActionableClient implements ClientModInitializer {
         }
         generation++;
         planning = false;
+        cancelCraft(client);
         tell(client, "Actionable " + (enabled ? "enabled." : "disabled."));
         var connection = client.getConnection();
         if (!enabled && client.player != null && connection != null
@@ -812,6 +1167,8 @@ public final class ActionableClient implements ClientModInitializer {
         }
         connection.sendChat("#" + command);
         lastAction = command;
+        pendingMine = null;
+        mineStart = null;
         baritoneCommandRunning = !command.equals("cancel");
         currentBaritoneCommand = baritoneCommandRunning ? command : "";
         BlockPos position = client.player == null ? null : client.player.blockPosition();
@@ -826,6 +1183,8 @@ public final class ActionableClient implements ClientModInitializer {
     }
 
     private void stopBaritone(Minecraft client) {
+        pendingMine = null;
+        mineStart = null;
         if (!baritoneCommandRunning) {
             return;
         }
@@ -1106,6 +1465,8 @@ public final class ActionableClient implements ClientModInitializer {
                 "Baritone: " + compact(baritoneProgress(client), 100),
                 "Baritone feedback: " + baritoneStatus,
                 "LLM goal: " + currentGoal,
+                "Why: " + (goalReason.isBlank() ? "none" : goalReason),
+                "Safety: " + safetyStatus,
                 "Result: " + lastResult,
                 "Error: " + errorCode + (lastError.equals("none") ? "" : " - " + lastError),
                 "/actionauto toggles autonomy");

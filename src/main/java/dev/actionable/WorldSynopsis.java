@@ -45,6 +45,10 @@ final class WorldSynopsis {
                 .append("; nearby_placement_candidates=").append(placementSurface(level, playerPos))
                 .append("; nearby_resource_hints=").append(nearbyResources(level, playerPos))
                 .append("; health=").append(Math.round(player.getHealth()))
+                .append("; food=").append(player.getFoodData().getFoodLevel())
+                .append("; armor=").append(player.getArmorValue())
+                .append("; ").append(WorldProbe.safety(client).describe())
+                .append("; nearest_crafting_table=").append(nearestTable(level, playerPos))
                 .append("; hotbar=").append(hotbar(player))
                 .append("; inventory=").append(inventory(player));
 
@@ -135,37 +139,24 @@ final class WorldSynopsis {
 
     private static String placementSurface(ClientLevel level, BlockPos origin) {
         StringBuilder candidates = new StringBuilder("[");
-        int count = 0;
-        for (int radius = 1; radius <= 2; radius++) {
-            for (int dx = -radius; dx <= radius; dx++) {
-                for (int dz = -radius; dz <= radius; dz++) {
-                    if (Math.max(Math.abs(dx), Math.abs(dz)) != radius) {
-                        continue;
-                    }
-                    BlockPos target = origin.offset(dx, 0, dz);
-                    BlockPos ground = target.below();
-                    var targetState = level.getBlockState(target);
-                    var headState = level.getBlockState(target.above());
-                    var groundState = level.getBlockState(ground);
-                    boolean sturdy = groundState.isFaceSturdy(level, ground, net.minecraft.core.Direction.UP);
-                    if (!sturdy || !targetState.canBeReplaced() || !headState.canBeReplaced()) {
-                        continue;
-                    }
-                    if (count++ >= 8) {
-                        return candidates.append(']').toString();
-                    }
-                    if (candidates.length() > 1) {
-                        candidates.append(',');
-                    }
-                    candidates.append(target.getX()).append(',').append(target.getY()).append(',').append(target.getZ())
-                            .append("{target=").append(blockId(targetState.getBlock()))
-                            .append(targetState.canBeReplaced() ? ",replaceable" : "")
-                            .append(";above=").append(blockId(headState.getBlock()))
-                            .append(";ground=").append(blockId(groundState.getBlock())).append('}');
-                }
+        for (BlockPos target : WorldProbe.placementCandidates(level, origin).stream().limit(8).toList()) {
+            var targetState = level.getBlockState(target);
+            if (candidates.length() > 1) {
+                candidates.append(',');
             }
+            candidates.append(target.getX()).append(',').append(target.getY()).append(',').append(target.getZ())
+                    .append("{target=").append(blockId(targetState.getBlock()))
+                    .append(targetState.canBeReplaced() ? ",replaceable" : "")
+                    .append(";above=").append(blockId(level.getBlockState(target.above()).getBlock()))
+                    .append(";ground=").append(blockId(level.getBlockState(target.below()).getBlock())).append('}');
         }
         return candidates.append(']').toString();
+    }
+
+    private static String nearestTable(ClientLevel level, BlockPos origin) {
+        BlockPos table = WorldProbe.nearestCraftingTable(level, origin);
+        return table == null ? "none" : table.getX() + "," + table.getY() + "," + table.getZ()
+                + "(d=" + Math.round(Math.sqrt(table.distSqr(origin))) + ")";
     }
 
     private static String blockId(net.minecraft.world.level.block.Block block) {
@@ -224,15 +215,7 @@ final class WorldSynopsis {
     }
 
     private static String inventory(net.minecraft.world.entity.player.Player player) {
-        Map<String, Integer> items = new TreeMap<>();
-        for (ItemStack stack : player.getInventory().getNonEquipmentItems()) {
-            if (!stack.isEmpty()) {
-                String item = java.util.Objects.requireNonNull(
-                        BuiltInRegistries.ITEM.getKey(stack.getItem())).toString();
-                items.put(item, items.getOrDefault(item, 0) + stack.getCount());
-            }
-        }
-        return topEntries(items, 12);
+        return topEntries(WorldProbe.inventory(player), 16);
     }
 
     private static String hotbar(net.minecraft.world.entity.player.Player player) {

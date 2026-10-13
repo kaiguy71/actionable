@@ -8,7 +8,7 @@ final class PlannerSchema {
         return switch (stage) {
             case "director" -> """
                     {"type":"object","properties":{"goal":{"type":"string","minLength":1},
-                    "why":{"type":"string"}},"required":["goal"],"additionalProperties":false}
+                    "why":{"type":"string","minLength":1}},"required":["goal","why"],"additionalProperties":false}
                     """;
             case "decomposition" -> """
                     {"type":"object","properties":{"steps":{"type":"array","minItems":1,"maxItems":8,
@@ -22,8 +22,9 @@ final class PlannerSchema {
                     {"type":"object","properties":{"summary":{"type":"string"},"goal":{"type":"string"},
                     "complete":{"type":"boolean"},"step_complete":{"type":"boolean"},"action":{
                     "type":"object","properties":{"type":{"type":"string","enum":["baritone","wait",
-                    "lookup","place_block","jump_place","attack"]},"command":{"type":"string"},
-                    "query":{"type":"string"},"block":{"type":"string"},"x":{"type":"integer"},
+                    "lookup","place_block","jump_place","attack","craft"]},"command":{"type":"string"},
+                    "query":{"type":"string"},"block":{"type":"string"},"item":{"type":"string"},
+                    "count":{"type":"integer","minimum":1,"maximum":256},"x":{"type":"integer"},
                     "y":{"type":"integer"},"z":{"type":"integer"},
                     "entity_id":{"type":"integer","minimum":0,"maximum":2147483647}},
                     "required":["type"],"additionalProperties":false}},

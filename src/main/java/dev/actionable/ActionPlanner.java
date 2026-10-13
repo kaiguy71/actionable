@@ -51,11 +51,26 @@ final class ActionPlanner {
 
             Before building or placing, compare required items to inventory. Gather missing source materials
             first with mine and use the inventory/world facts; do not try to place an item that is unavailable.
-            This version cannot craft items or create schematic files. It can place one held/inventory block;
-            use "place_block" for a nearby valid surface and "jump_place" only when placing into the player's
-            current feet cell. jump_place jumps one block and places at the original feet cell after clearing
-            replaceable flowers/plants. If a crafting recipe is needed, use lookup to inspect known recipe
-            information, but state when crafting itself is unavailable.
+            It can place one held/inventory block; use "place_block" for a nearby valid surface and "jump_place"
+            only when placing into the player's current feet cell. jump_place jumps one block and places at the
+            original feet cell after clearing replaceable flowers/plants. It cannot create schematic files.
+
+            Crafting: {"type":"craft","item":"minecraft:stick","count":4} crafts the items in
+            craftable_catalog. count is the total to HOLD afterwards, like mine's quantity. 2x2 recipes
+            (planks, sticks, crafting table, torches) work anywhere; 3x3 recipes (pickaxes, axes, swords,
+            shovels, furnace, chest) need a placed crafting table within 4 blocks: place one, or goto the
+            nearest_crafting_table first. Plan steps map directly to actions: "craft N X" ->
+            {"type":"craft","item":X,"count":N}; "mine N X" -> Baritone "mine N X"; "place
+            minecraft:crafting_table nearby" -> place_block at a nearby_placement_candidates position.
+
+            Tools and safety are enforced. A mine command is rejected when the block drops nothing without a
+            pickaxe you lack (stone, coal ore and every ore need one; cobblestone comes from mining
+            minecraft:stone), or when every nearby deposit is in a dark cave or deep underground and you
+            lack cave gear. Mining is also stopped if Baritone drags you far from where it started. Read a
+            rejection and change plan (craft the tool, explore the surface, or pick another resource);
+            never resend the rejected command. The synopsis safety={...} field rates light, depth and
+            gear: when level=danger, get to light or the surface before anything else, and never go
+            underground while cave_ready=false.
             Use "lookup" with a short search query to find registered block/item IDs or player-known recipes.
             Lookup results are local game data and will be supplied in the next turn. Do not invent global
             biome/dimension/ore-generation ranges; only report nearby loaded observations in the synopsis.
@@ -76,6 +91,8 @@ final class ActionPlanner {
                 "action":{"type":"jump_place","block":"minecraft:crafting_table","x":-11,"y":120,"z":15}}
             or {"summary":"identify item","goal":"look up crafting table","complete":false,
                 "action":{"type":"lookup","query":"crafting table"}}
+            or {"summary":"make handles","goal":"craft sticks","complete":false,
+                "action":{"type":"craft","item":"minecraft:stick","count":4}}
             or {"summary":"step objective met","goal":"move to the next step","complete":false,
                 "step_complete":true,"action":{"type":"wait"}}
             Return complete=true only when the entire user task is actually done. For a blocker, return action
@@ -97,13 +114,18 @@ final class ActionPlanner {
     private static final String DECOMPOSE_PROMPT = """
             You break a Minecraft task into an ordered plan of concrete, verifiable steps.
             Each step must be achievable with these abilities only: Baritone navigation and mining
-            (mine, goto, explore, find, pickup, farm, follow), placing a single block from inventory,
-            close-range melee against hostile mobs, and looking up block/item IDs and known recipes. Crafting and schematic creation are NOT
-            available, so never emit a step that requires crafting or building from a schematic.
-            Gather prerequisites before they are needed: to place blocks you must first mine them.
-            State quantities and concrete block IDs where known, for example "mine 4 minecraft:oak_log".
+            (mine, goto, explore, find, pickup, farm, follow), crafting items in craftable_catalog,
+            placing a single block from inventory, close-range melee against hostile mobs, and looking up
+            block/item IDs. Building from schematics is NOT available.
+            Every material you gather must be used by a later step or by the task itself; know why you
+            collect it. Use the progression briefing: tools come before the blocks that need them (stone,
+            coal and ores drop nothing without the right pickaxe), and cobblestone is obtained by mining
+            minecraft:stone. Do not plan to go underground when cave_ready=false.
+            Write steps in these forms so they can be checked: "mine 3 minecraft:oak_log",
+            "craft 12 minecraft:oak_planks", "place minecraft:crafting_table nearby". Quantities are totals
+            to hold when the step finishes. 3x3 recipes need a placed crafting table.
             Use the fewest steps that actually accomplish the task, at most 8.
-            Return only JSON: {"steps":["mine 4 minecraft:oak_log","goto the clearing at 10 70 -5"]}
+            Return only JSON: {"steps":["mine 3 minecraft:oak_log","craft 12 minecraft:oak_planks"]}
             """;
     private static final String JUDGE_PROMPT = """
             You judge whether one Minecraft objective is already satisfied.
@@ -114,19 +136,29 @@ final class ActionPlanner {
             """;
     private static final String DIRECTOR_PROMPT = """
             You decide what a Minecraft player should do next, with no human giving instructions.
-            You are given the world state, goals already achieved, and goals recently attempted.
-            Choose ONE short objective that makes concrete progress and is achievable right now with
-            these abilities only: Baritone navigation and mining (mine, goto, explore, find, pickup,
-            farm, follow), placing a single block from inventory, close-range melee against hostile mobs,
-            and looking up IDs and known recipes.
-            Crafting and schematic building are NOT available, so never choose a goal that needs them.
-            Prefer the natural progression: gather wood, then stone, then coal, then iron ore.
-            Survival comes first: escape at health 6 or lower and avoid creepers. Healthy players can
-            fight a nearby hostile mob marked melee_reachable=true; do not plan combat against distant mobs.
+            You are given a progression briefing, the world state (including a safety assessment), goals
+            already achieved, and goals recently attempted.
+            Abilities: Baritone navigation and mining (mine, goto, explore, find, pickup, farm, follow),
+            crafting the items in craftable_catalog (2x2 anywhere, 3x3 at a placed crafting table), placing
+            a block from inventory, close-range melee against hostile mobs, and looking up IDs.
+            Schematic building is NOT available.
+            Decide WHY before WHAT. Every material must be for something: name what the goal unlocks or
+            lets you craft, using inventory_uses and next_milestone. Never gather a material that nothing
+            you plan to make uses, and never gather more of something you already hold enough of.
+            Tools gate mining: stone, coal ore and every ore drop nothing without a pickaxe, and iron ore
+            needs a stone pickaxe. Never choose to mine a block in cannot_mine_yet; craft the tool instead.
+            Cobblestone comes from mining minecraft:stone; never go looking for placed cobblestone.
+            Safety comes first. If safety level=danger, choose to reach light or the surface. Do not choose
+            goals that take you underground or into dark caves while cave_ready=false; prefer exposed
+            blocks on the surface, cliffs and hillsides near you. Escape at health 6 or lower and avoid
+            creepers. Fight only mobs marked melee_reachable=true.
+            next_milestone is normally the right goal; choose something else only when safety or the
+            world state gives a clear reason, and say what it is.
             Never repeat a goal listed as already achieved, and do not repeat a recently attempted goal
             unless the state shows it clearly failed and is still worth doing.
-            Name concrete quantities and block IDs, for example "mine 16 minecraft:oak_log".
-            Return only JSON: {"goal":"mine 16 minecraft:oak_log","why":"short reason"}
+            Goal forms: "craft 1 minecraft:wooden_pickaxe", "mine 8 minecraft:oak_log", "explore".
+            Return only JSON: {"goal":"craft 1 minecraft:wooden_pickaxe",
+             "why":"stone and coal drop nothing without a pickaxe; it unlocks cobblestone for stone tools"}
             """;
     private static final String DEFAULT_ENDPOINT = "http://localhost:11434/api/chat";
     private static final java.util.concurrent.atomic.AtomicLong REQUEST_IDS = new java.util.concurrent.atomic.AtomicLong();
@@ -168,15 +200,17 @@ final class ActionPlanner {
                 () -> loggedRequest("action", () -> requestPlan(task, synopsis, lastAction, lastResult, planContext, history)), executor);
     }
 
-    CompletableFuture<java.util.List<String>> decompose(String task, String synopsis) {
-        return CompletableFuture.supplyAsync(() -> loggedRequest("decomposition", () -> requestSteps(task, synopsis)), executor);
+    CompletableFuture<java.util.List<String>> decompose(String task, String synopsis, String briefing) {
+        return CompletableFuture.supplyAsync(
+                () -> loggedRequest("decomposition", () -> requestSteps(task, synopsis, briefing)), executor);
     }
 
-    CompletableFuture<String> chooseGoal(String synopsis, String achieved, String attempted) {
-        return CompletableFuture.supplyAsync(() -> loggedRequest("director", () -> requestGoal(synopsis, achieved, attempted)), executor);
+    CompletableFuture<GoalChoice> chooseGoal(String synopsis, String briefing, String achieved, String attempted) {
+        return CompletableFuture.supplyAsync(
+                () -> loggedRequest("director", () -> requestGoal(synopsis, briefing, achieved, attempted)), executor);
     }
 
-    private String requestGoal(String synopsis, String achieved, String attempted) {
+    private GoalChoice requestGoal(String synopsis, String briefing, String achieved, String attempted) {
         String endpoint = System.getProperty("actionable.ollama.url", DEFAULT_ENDPOINT);
         String model = System.getProperty("actionable.ollama.model", "gemma3:4b");
         JsonObject body = new JsonObject();
@@ -186,17 +220,22 @@ final class ActionPlanner {
 
         JsonArray messages = new JsonArray();
         messages.add(message("system", DIRECTOR_PROMPT));
-        messages.add(message("user", "Goals already achieved: " + (achieved.isBlank() ? "none" : achieved)
+        messages.add(message("user", briefing
+                + "\nGoals already achieved: " + (achieved.isBlank() ? "none" : achieved)
                 + "\nGoals recently attempted: " + (attempted.isBlank() ? "none" : attempted)
                 + "\nCurrent world state: " + synopsis));
         body.add("messages", messages);
 
-        JsonObject chosen = JsonParser.parseString(send(endpoint, body)).getAsJsonObject();
+        return parseGoal(send(endpoint, body));
+    }
+
+    static GoalChoice parseGoal(String json) {
+        JsonObject chosen = JsonParser.parseString(json).getAsJsonObject();
         String goal = cleanText(chosen, "goal", "", 120).strip();
         if (goal.isBlank()) {
             throw new IllegalStateException("Director returned no goal");
         }
-        return goal;
+        return new GoalChoice(goal, cleanText(chosen, "why", "", 200).strip());
     }
 
     CompletableFuture<Boolean> checkStep(String objective, String inventory, String recent) {
@@ -243,7 +282,7 @@ final class ActionPlanner {
         return parsePlan(send(endpoint, body));
     }
 
-    private java.util.List<String> requestSteps(String task, String synopsis) {
+    private java.util.List<String> requestSteps(String task, String synopsis, String briefing) {
         String endpoint = System.getProperty("actionable.ollama.url", DEFAULT_ENDPOINT);
         String model = System.getProperty("actionable.ollama.model", "gemma3:4b");
         JsonObject body = new JsonObject();
@@ -253,7 +292,7 @@ final class ActionPlanner {
 
         JsonArray messages = new JsonArray();
         messages.add(message("system", DECOMPOSE_PROMPT));
-        messages.add(message("user", "Task: " + task + "\nCurrent world state: " + synopsis));
+        messages.add(message("user", "Task: " + task + "\n" + briefing + "\nCurrent world state: " + synopsis));
         body.add("messages", messages);
 
         return parseSteps(send(endpoint, body));
@@ -356,6 +395,18 @@ final class ActionPlanner {
                 }
             }
             return Optional.empty();
+        }
+        if (type.equals("craft") && action.has("item")) {
+            String item = cleanText(action, "item", "", 80).strip().toLowerCase(Locale.ROOT);
+            int count = action.has("count") && action.get("count").isJsonPrimitive()
+                    && action.get("count").getAsJsonPrimitive().isNumber() ? action.get("count").getAsInt() : 1;
+            if (!item.contains(":")) {
+                item = "minecraft:" + item;
+            }
+            // The item travels in "block" and the total to hold in "command".
+            return item.matches("[a-z0-9_.-]+:[a-z0-9_./-]+") && count >= 1 && count <= 256
+                    ? Optional.of(new PlannedAction("craft", Integer.toString(count), item, 0, 0, 0, ""))
+                    : Optional.empty();
         }
         if (type.equals("lookup") && action.has("query")) {
             String query = cleanText(action, "query", "", 80);
@@ -484,6 +535,9 @@ final class ActionPlanner {
     }
 
     record PlannedAction(String type, String command, String block, int x, int y, int z, String query) {
+    }
+
+    record GoalChoice(String goal, String why) {
     }
 
     record ActionPlan(String summary, String goal, boolean complete, boolean stepComplete,

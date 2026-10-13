@@ -64,6 +64,12 @@ final class ActionPlanner {
             Attacks respect weapon cooldown and line of sight. No ranged attacks or combat pathfinding.
             Never target players or neutral mobs. Escape creepers and flee when health is 6 or lower.
             Observe target health/death before claiming damage or kills; repeat attack if still needed.
+            The synopsis lists everything carried: hotbar, inventory, held_item, offhand, armor worn
+            (head/chest/legs/feet) and free_inventory_slots. Use {"type":"equip","item":"minecraft:iron_sword"}
+            to hold a tool or weapon, or to wear armor or a shield, that is already in the inventory.
+            Equip only items the inventory lists; equipping cannot create items. When an item is already
+            held or worn the result is EQUIP_ALREADY: do not repeat it.
+            A result starting REPEAT_BLOCKED means the action was refused for looping; choose something else.
 
             Return only JSON:
             {"summary":"short status","goal":"current subgoal","complete":false,
@@ -76,6 +82,8 @@ final class ActionPlanner {
                 "action":{"type":"jump_place","block":"minecraft:crafting_table","x":-11,"y":120,"z":15}}
             or {"summary":"identify item","goal":"look up crafting table","complete":false,
                 "action":{"type":"lookup","query":"crafting table"}}
+            or {"summary":"hold sword","goal":"prepare to fight","complete":false,
+                "action":{"type":"equip","item":"minecraft:stone_sword"}}
             or {"summary":"step objective met","goal":"move to the next step","complete":false,
                 "step_complete":true,"action":{"type":"wait"}}
             Return complete=true only when the entire user task is actually done. For a blocker, return action
@@ -98,8 +106,10 @@ final class ActionPlanner {
             You break a Minecraft task into an ordered plan of concrete, verifiable steps.
             Each step must be achievable with these abilities only: Baritone navigation and mining
             (mine, goto, explore, find, pickup, farm, follow), placing a single block from inventory,
-            close-range melee against hostile mobs, and looking up block/item IDs and known recipes. Crafting and schematic creation are NOT
+            close-range melee against hostile mobs, equipping items already carried, and looking up
+            block/item IDs and known recipes. Crafting and schematic creation are NOT
             available, so never emit a step that requires crafting or building from a schematic.
+            Never repeat a step, and never plan more than 64 of one item in a single step.
             Gather prerequisites before they are needed: to place blocks you must first mine them.
             State quantities and concrete block IDs where known, for example "mine 4 minecraft:oak_log".
             Use the fewest steps that actually accomplish the task, at most 8.
@@ -118,7 +128,7 @@ final class ActionPlanner {
             Choose ONE short objective that makes concrete progress and is achievable right now with
             these abilities only: Baritone navigation and mining (mine, goto, explore, find, pickup,
             farm, follow), placing a single block from inventory, close-range melee against hostile mobs,
-            and looking up IDs and known recipes.
+            equipping items already carried, and looking up IDs and known recipes.
             Crafting and schematic building are NOT available, so never choose a goal that needs them.
             Prefer the natural progression: gather wood, then stone, then coal, then iron ore.
             Survival comes first: escape at health 6 or lower and avoid creepers. Healthy players can
@@ -354,6 +364,14 @@ final class ActionPlanner {
                 } catch (NumberFormatException ignored) {
                     return Optional.empty();
                 }
+            }
+            return Optional.empty();
+        }
+        if (type.equals("equip")) {
+            String item = action.has("item") ? action.get("item").getAsString()
+                    : action.has("block") ? action.get("block").getAsString() : "";
+            if (item.matches("[a-z0-9_.-]+:[a-z0-9_./-]+")) {
+                return Optional.of(new PlannedAction("equip", item, "", 0, 0, 0, ""));
             }
             return Optional.empty();
         }

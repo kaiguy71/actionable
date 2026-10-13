@@ -70,6 +70,8 @@ public final class ActionableClient implements ClientModInitializer {
     private boolean judging;
     private boolean stepJudged;
     private final java.util.ArrayDeque<String> history = new java.util.ArrayDeque<>();
+    private final ActionLoopGuard loopGuard = new ActionLoopGuard();
+    private static final boolean MODEL_JUDGE = Boolean.getBoolean("actionable.judge.model");
 
     @Override
     @SuppressWarnings("null")
@@ -129,6 +131,7 @@ public final class ActionableClient implements ClientModInitializer {
                     errorCode = "BARITONE_COMMAND_REJECTED";
                     lastError = baritoneStatus;
                     baritoneCommandRunning = false;
+                    loopGuard.markLastFailed();
                     lastResult = "Baritone rejected the last command: " + lastError;
                     if (activeTask != null && !planning) {
                         ticksUntilPlan = 0;
@@ -222,6 +225,7 @@ public final class ActionableClient implements ClientModInitializer {
         stepJudged = false;
         taskStartedAtTick = clientTick;
         history.clear();
+        loopGuard.reset();
         noteAttempt(prompt);
         tell(client, "Planning steps for: " + prompt);
         requestDecomposition(client);
@@ -250,8 +254,9 @@ public final class ActionableClient implements ClientModInitializer {
                         return;
                     }
                     String chosen = error == null && goal != null ? goal.strip() : "";
-                    // Repeat avoidance is also in code: the model re-picked goals it had just achieved.
-                    if (chosen.isEmpty() || alreadyAchieved(chosen)) {
+                    // Repeat avoidance is also in code: the model re-picked goals it had just achieved,
+                    // and goals it had already failed twice.
+                    if (chosen.isEmpty() || alreadyAchieved(chosen) || attemptedRepeatedly(chosen)) {
                         String fallback = ladderGoal(client);
                         if (error != null) {
                             errorCode = plannerErrorCode(error);
@@ -266,6 +271,7 @@ public final class ActionableClient implements ClientModInitializer {
                             chosen = fallback;
                         }
                     }
+                    chosen = PlanSanity.clampQuantity(chosen);
                     activeTask = chosen;
                     remember("chose goal", chosen);
                     noteAttempt(chosen);
@@ -286,14 +292,9 @@ public final class ActionableClient implements ClientModInitializer {
                 {"minecraft:coal", "mine 12 minecraft:coal_ore", "4"},
                 {"minecraft:raw_iron", "mine 12 minecraft:iron_ore", "4"}}) {
             Item item = BuiltInRegistries.ITEM.getValue(Identifier.parse(rung[0]));
-            int have = 0;
-            for (int slot = 0; slot < player.getInventory().getContainerSize(); slot++) {
-                ItemStack stack = player.getInventory().getItem(slot);
-                if (stack.getItem() == item) {
-                    have += stack.getCount();
-                }
-            }
-            if (have < Integer.parseInt(rung[2]) && !alreadyAchieved(rung[1])) {
+            int have = InventoryAccess.count(player, item);
+            if (have < Integer.parseInt(rung[2]) && !alreadyAchieved(rung[1])
+                    && !attemptedRepeatedly(rung[1])) {
                 return rung[1];
             }
         }
@@ -401,6 +402,7 @@ public final class ActionableClient implements ClientModInitializer {
         currentStep = 0;
         stepJudged = false;
         history.clear();
+        loopGuard.reset();
         taskStartedAtTick = clientTick;
         taskOrigin = java.util.Objects.requireNonNull(client.player).blockPosition();
         lastAction = "";
@@ -431,6 +433,7 @@ public final class ActionableClient implements ClientModInitializer {
         currentStep = 0;
         stepJudged = false;
         history.clear();
+        loopGuard.reset();
         taskStartedAtTick = clientTick;
         taskOrigin = java.util.Objects.requireNonNull(client.player).blockPosition();
         lastAction = "";
@@ -472,6 +475,29 @@ public final class ActionableClient implements ClientModInitializer {
         while (achievedGoals.size() > GOAL_MEMORY) {
             achievedGoals.removeFirst();
         }
+    }
+
+    /** True when this goal was already attempted twice recently without being achieved. */
+    private boolean attemptedRepeatedly(String goal) {
+        String key = attemptKey(goal);
+        if (key.isEmpty() || alreadyAchieved(goal)) {
+            return false;
+        }
+        int attempts = 0;
+        for (String tried : attemptedGoals) {
+            if (attemptKey(tried).equals(key)) {
+                attempts++;
+            }
+        }
+        return attempts >= 2;
+    }
+
+    /**
+     * Whole-text identity ignoring case, spacing and quantities. Deliberately not goalKey: that keeps
+     * only the last word, so every "... crafting table" goal would count as the same goal.
+     */
+    static String attemptKey(String goal) {
+        return goal.toLowerCase(java.util.Locale.ROOT).replaceAll("\\d+", "").replaceAll("\\s+", " ").strip();
     }
 
     private boolean alreadyAchieved(String goal) {
@@ -525,7 +551,12 @@ public final class ActionableClient implements ClientModInitializer {
             if (!enabled || activeTask == null || client.player == null) {
                 return;
             }
-            if (error != null || steps == null || steps.isEmpty()) {
+            java.util.List<String> usable = error == null && steps != null
+                    ? PlanSanity.sanitizeSteps(steps) : java.util.List.of();
+            if (steps != null && usable.size() < steps.size()) {
+                ActionableLog.LOGGER.info("[Actionable] plan_filtered kept={} of={}", usable.size(), steps.size());
+            }
+            if (error != null || usable.isEmpty()) {
                 // Decomposition is an optimisation: fall back to treating the prompt as one step.
                 taskSteps = java.util.List.of(activeTask);
                 if (error != null) {
@@ -534,7 +565,7 @@ public final class ActionableClient implements ClientModInitializer {
                 }
                 tell(client, "Could not split the task; working on it directly.");
             } else {
-                taskSteps = java.util.List.copyOf(steps);
+                taskSteps = java.util.List.copyOf(usable);
                 tell(client, "Plan (" + taskSteps.size() + " steps). Step 1: " + taskSteps.get(0));
                 for (int index = 0; index < taskSteps.size(); index++) {
                     java.util.Objects.requireNonNull(client.player).sendSystemMessage(
@@ -583,6 +614,7 @@ public final class ActionableClient implements ClientModInitializer {
         stopBaritone(client);
         currentStep++;
         stepJudged = false;
+        loopGuard.reset();
         currentGoal = taskSteps.get(currentStep);
         lastAction = "";
         lastResult = "Step " + currentStep + " done (" + finished + "); starting next step";
@@ -590,10 +622,19 @@ public final class ActionableClient implements ClientModInitializer {
         ticksUntilPlan = 1;
     }
 
+    /** Changes whenever carried items, the current step, or the player's coarse position change. */
+    private String progressKey(Minecraft client, String synopsis) {
+        BlockPos pos = client.player == null ? BlockPos.ZERO : client.player.blockPosition();
+        return inventoryOf(synopsis) + "|step=" + currentStep
+                + "|cell=" + (pos.getX() >> 3) + ',' + (pos.getY() >> 3) + ',' + (pos.getZ() >> 3);
+    }
+
     private static String inventoryOf(String synopsis) {
         StringBuilder items = new StringBuilder();
         for (String field : synopsis.split("; ")) {
-            if (field.startsWith("hotbar=") || field.startsWith("inventory=")) {
+            if (field.startsWith("hotbar=") || field.startsWith("inventory=")
+                    || field.startsWith("held_item=") || field.startsWith("armor=")
+                    || field.startsWith("offhand=")) {
                 if (!items.isEmpty()) {
                     items.append("; ");
                 }
@@ -669,9 +710,18 @@ public final class ActionableClient implements ClientModInitializer {
             ticksUntilPlan = 20;
             return;
         }
-        if (!taskSteps.isEmpty() && !history.isEmpty() && !stepJudged) {
-            requestStepCheck(client);
-            return;
+        if (!taskSteps.isEmpty() && !stepJudged) {
+            // Step completion is decided in code from the inventory; the model call is opt-in.
+            var verdict = StepCheck.check(taskSteps.get(currentStep), InventoryAccess.counts(client.player));
+            if (verdict == StepCheck.Verdict.DONE) {
+                advanceStep(client, taskSteps.get(currentStep));
+                return;
+            }
+            stepJudged = true;
+            if (verdict == StepCheck.Verdict.UNKNOWN && MODEL_JUDGE && !history.isEmpty()) {
+                requestStepCheck(client);
+                return;
+            }
         }
         long requestGeneration = generation;
         planning = true;
@@ -716,16 +766,35 @@ public final class ActionableClient implements ClientModInitializer {
                 advanceStep(client, taskSteps.get(currentStep));
                 return;
             }
+            String progress = progressKey(client, synopsis);
+            if (loopGuard.stalled()) {
+                abandonTask(client, "no progress for " + loopGuard.stalledRounds() + " planning rounds");
+                return;
+            }
             if (plan.action().isEmpty()) {
                 lastResult = "No valid action returned. " + plan.summary();
                 errorCode = "PLAN_NO_VALID_ACTION";
                 lastError = compact(plan.summary(), 140);
                 tell(client, "No valid action [" + errorCode + "]: " + lastError);
+                loopGuard.record("none", "NO_ACTION_FAILED", progress);
                 ticksUntilPlan = 200;
                 return;
             }
 
             ActionPlanner.PlannedAction action = plan.action().orElseThrow();
+            String signature = ActionLoopGuard.signature(action);
+            var vetoed = loopGuard.veto(signature);
+            if (vetoed.isPresent()) {
+                lastAction = signature;
+                lastResult = vetoed.get();
+                errorCode = "REPEAT_BLOCKED";
+                lastError = compact(lastResult, 140);
+                tell(client, lastResult);
+                remember(lastAction, lastResult);
+                loopGuard.record(signature, lastResult, progress);
+                ticksUntilPlan = 20;
+                return;
+            }
             switch (action.type()) {
                 case "attack" -> {
                     stopBaritone(client);
@@ -745,6 +814,18 @@ public final class ActionableClient implements ClientModInitializer {
                             ? "Planner chose to wait; " + baritoneProgress(client)
                             : "Planner chose no input; reevaluate after next observation";
                     tell(client, baritoneCommandRunning ? "Waiting on current Baritone task." : "Waiting for next observation.");
+                }
+                case "equip" -> {
+                    lastAction = "equip " + action.command();
+                    lastResult = InventoryAccess.equip(client, action.command());
+                    if (lastResult.contains("_FAILED")) {
+                        errorCode = lastResult.substring(0, lastResult.indexOf(':'));
+                        lastError = compact(lastResult, 140);
+                    } else {
+                        errorCode = "none";
+                        lastError = "none";
+                    }
+                    tell(client, lastResult);
                 }
                 case "lookup" -> {
                     lastAction = "lookup " + action.query();
@@ -773,7 +854,8 @@ public final class ActionableClient implements ClientModInitializer {
                 }
             }
             remember(lastAction, lastResult);
-            if (action.type().equals("attack")) {
+            loopGuard.record(signature, lastResult, progress);
+            if (action.type().equals("attack") || action.type().equals("equip")) {
                 ticksUntilPlan = 20;
             } else if (action.type().equals("place_block")) {
                 ticksUntilPlan = lastResult.startsWith("BLOCK_PLACE_DEFERRED") ? 1 : 200;

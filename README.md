@@ -56,8 +56,11 @@ Planning runs in four layers, each a separate call to the configured model:
    sees the numbered plan with the current step marked, the last 5 actions and their results, Baritone's
    elapsed time and progress, and the world snapshot. It picks one action per turn, and may return
    `wait` to let a running `mine` or `explore` continue.
-4. **Judge** — a small dedicated call that decides whether the current step's objective is already
-   satisfied, from the inventory and recent history. When it says yes, the plan advances to the next step.
+4. **Step check** — code, not a model call, compares the current step with the inventory. A step such
+   as `mine 4 minecraft:oak_log` (ores map to what they drop, so `iron_ore` checks `raw_iron`) is done
+   once the inventory holds that many, and the plan advances. Steps it cannot read are left to the
+   step loop, which may return `step_complete` itself. Set `-Dactionable.judge.model=true` to also
+   send unreadable steps to a small judge model call, as earlier versions always did.
 
 Two decisions are made in code rather than by the model, because `gemma3:4b` was measured failing both:
 
@@ -73,6 +76,14 @@ Two decisions are made in code rather than by the model, because `gemma3:4b` was
   replaced using a built-in ladder: 16 oak logs, then 24 cobblestone, then 12 coal ore, then 12 iron
   ore, each skipped if the inventory already holds enough. If the ladder is exhausted, Actionable
   explores instead.
+
+- **Loop and plan sanity.** The same goal attempted twice without being achieved is replaced the same way
+  as an achieved one. No game feature is filtered out of goals or plans; duplicate steps are removed
+  and any `mine` quantity is capped at 64.
+  Within a task, an action that fails twice in a row, or is repeated 3 times with no change to inventory
+  or position, is refused with `REPEAT_BLOCKED` and the model is told to pick something else. If 6
+  planning rounds pass with no change to inventory, step, or position (about a minute), the task is
+  abandoned and a new goal is chosen.
 
 Any task still running after 5 minutes (6,000 ticks) is abandoned and a new goal is chosen. Actionable
 remembers the last 6 achieved goals and the last 6 attempted goals.
@@ -131,6 +142,8 @@ checks are not logged every tick. Restart Minecraft after installing the updated
 | `PLAN_NO_VALID_ACTION` | The model returned no action Actionable could validate. |
 | `ACTION_TYPE_UNSUPPORTED` | The model asked for an action type that does not exist. |
 | `BARITONE_COMMAND_REJECTED` | Baritone refused the command; Actionable re-plans immediately. |
+| `REPEAT_BLOCKED` | The model repeated an action that kept failing or changed nothing; Actionable refused it. Not fatal. |
+| `EQUIP_FAILED_*` | An `equip` could not be completed: `NO_WORLD`, `UNKNOWN_ITEM`, `CONTAINER_OPEN`, `NOT_IN_INVENTORY`. |
 | `BLOCK_PLACE_FAILED_*` | A `place_block` could not be completed: `NO_ITEM`, `MATERIAL_MISSING`, `UNKNOWN_BLOCK`, `NO_SUPPORT`, `OUT_OF_REACH`, `TARGET_OCCUPIED`, `NO_HEADROOM`, `PLAYER_IN_WAY`, `NO_WORLD`. |
 | `JUMP_PLACE_FAILED_*` | A `jump_place` could not be completed: `NOT_CURRENT_CELL`, `NOT_GROUNDED`, `JUMP_TIMEOUT`, `TARGET_OCCUPIED`, `NO_HEADROOM`, `WORLD_ENDED`. |
 | `GAME_SESSION_ENDED` | The world or connection closed while a plan was in flight. |
@@ -149,12 +162,23 @@ block IDs), and `explore` takes no arguments. Commands that fail validation are 
 so Actionable reconstructs the command from either shape before validating it.
 
 Besides Baritone commands the model can return `attack`, `wait`, `lookup` (registered block/item IDs and recipes
-known to the player's recipe book), `place_block`, and `jump_place`. Baritone's own `build` command
+known to the player's recipe book), `equip`, `place_block`, and `jump_place`. Baritone's own `build` command
 loads an existing `.schematic`, `.schem`, or `.litematic` file; it does not place individual blocks.
 Actionable's guarded single-block placement moves an available inventory stack to the hotbar, clears a
 replaceable plant at the target, aims at an adjacent sturdy face, and places the block if the target is
 in reach. `jump_place` jumps up and places the block beneath the player, for the player's own feet cell.
 Routine status goes to the actionbar; plans go to chat.
+
+### Inventory
+
+Every snapshot lists the hotbar, up to 24 distinct inventory items with counts, the held item, the
+off-hand, worn armor (head, chest, legs, feet), and the number of free inventory slots.
+
+`{"type":"equip","item":"minecraft:iron_sword"}` puts an item the player already carries into use.
+Tools and weapons are moved to the selected hotbar slot and held; helmets, chestplates, elytra,
+leggings, boots, and shields are swapped into their wear slot. Results are `EQUIP_SENT`,
+`EQUIP_ALREADY`, or `EQUIP_FAILED_*`. Equipping cannot create items and does not open chests or other
+containers; it is refused while a container screen is open.
 
 ### Basic combat
 

@@ -22,8 +22,8 @@ final class PlannerSchema {
                     {"type":"object","properties":{"summary":{"type":"string"},"goal":{"type":"string"},
                     "complete":{"type":"boolean"},"step_complete":{"type":"boolean"},"action":{
                     "type":"object","properties":{"type":{"type":"string","enum":["baritone","wait",
-                    "lookup","place_block","jump_place","attack"]},"command":{"type":"string"},
-                    "query":{"type":"string"},"block":{"type":"string"},"x":{"type":"integer"},
+                    "lookup","place_block","jump_place","attack","equip"]},"command":{"type":"string"},
+                    "query":{"type":"string"},"block":{"type":"string"},"item":{"type":"string"},"x":{"type":"integer"},
                     "y":{"type":"integer"},"z":{"type":"integer"},
                     "entity_id":{"type":"integer","minimum":0,"maximum":2147483647}},
                     "required":["type"],"additionalProperties":false}},

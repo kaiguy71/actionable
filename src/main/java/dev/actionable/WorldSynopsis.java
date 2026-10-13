@@ -46,6 +46,7 @@ final class WorldSynopsis {
                 .append("; nearby_resource_hints=").append(nearbyResources(level, playerPos))
                 .append("; health=").append(Math.round(player.getHealth()))
                 .append("; hotbar=").append(hotbar(player))
+                .append("; ").append(InventoryAccess.describe(player))
                 .append("; inventory=").append(inventory(player));
 
         Map<String, Integer> nearbyBlocks = new TreeMap<>();
@@ -232,7 +233,7 @@ final class WorldSynopsis {
                 items.put(item, items.getOrDefault(item, 0) + stack.getCount());
             }
         }
-        return topEntries(items, 12);
+        return topEntries(items, 24);
     }
 
     private static String hotbar(net.minecraft.world.entity.player.Player player) {

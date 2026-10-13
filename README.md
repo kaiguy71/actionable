@@ -1,4 +1,4 @@
-# Actionable version 0.1.3
+# Actionable version 0.1.3b
 Readme Date: 10/6/2026
 
 A client-side Fabric mod that plays Minecraft autonomously: an Ollama or Claude model chooses its own goals,

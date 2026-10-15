@@ -63,6 +63,24 @@ final class SafetyAssessment {
         return missing;
     }
 
+    /** What a player should carry before night falls: a weapon, a light source and a bed. */
+    static List<String> nightPrepMissing(Map<String, Integer> inventory) {
+        List<String> missing = new ArrayList<>();
+        if (inventory.entrySet().stream().noneMatch(entry -> entry.getValue() > 0 && TechTree.isWeapon(entry.getKey()))) {
+            missing.add("weapon");
+        }
+        boolean light = inventory.entrySet().stream().anyMatch(entry -> entry.getValue() > 0
+                && (entry.getKey().equals("minecraft:torch") || entry.getKey().equals("minecraft:lantern")
+                        || entry.getKey().equals("minecraft:campfire")));
+        if (!light) {
+            missing.add("light source (torch, lantern or campfire)");
+        }
+        if (inventory.entrySet().stream().noneMatch(entry -> entry.getValue() > 0 && entry.getKey().endsWith("_bed"))) {
+            missing.add("bed");
+        }
+        return missing;
+    }
+
     static Result assess(Inputs in) {
         boolean underground = !in.skyVisible() && in.depthBelowSurface() >= UNDERGROUND_DEPTH;
         boolean dark = in.light() <= DARK_LIGHT;
@@ -86,6 +104,12 @@ final class SafetyAssessment {
         } else if (dark && underground) {
             reasons.add("dark underground: place torches and watch for mobs");
             level = max(level, Level.CAUTION);
+        }
+        if (in.night()) {
+            List<String> prep = nightPrepMissing(in.inventory());
+            reasons.add("night: darkness is normal and is not danger by itself, so do not search for light"
+                    + " or stop working; only real hostile mobs and low health are threats"
+                    + (prep.isEmpty() ? "" : "; missing night prep " + prep));
         }
         if (in.night() && !underground && !hasWeapon) {
             reasons.add("night on the surface without a weapon: stay near light and avoid open ground");

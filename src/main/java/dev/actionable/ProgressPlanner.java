@@ -59,6 +59,44 @@ final class ProgressPlanner {
         return MILESTONES.stream().filter(milestone -> !satisfied(milestone, inventory)).findFirst();
     }
 
+    private static final Pattern LOOSE_STEP = Pattern.compile(
+            "^(mine|craft|get|gather|collect|obtain)\\s+(\\d{1,4})\\s+(?:minecraft:)?([a-z0-9_]+)\\b(.*)");
+
+    /**
+     * Cleans model-written steps: bare item ids gain the namespace, and repeated steps for the same
+     * verb and item collapse into one with the largest total. Step quantities are totals to hold, so
+     * eight "mine 2 spruce_log" steps mean "hold 2", never 16.
+     */
+    static List<String> normalizeSteps(List<String> steps) {
+        java.util.Map<String, Integer> firstIndex = new java.util.LinkedHashMap<>();
+        List<String> out = new java.util.ArrayList<>();
+        for (String raw : steps) {
+            String step = raw.strip();
+            Matcher matcher = LOOSE_STEP.matcher(step.toLowerCase(Locale.ROOT));
+            if (!matcher.matches()) {
+                if (out.stream().noneMatch(step::equalsIgnoreCase)) {
+                    out.add(step);
+                }
+                continue;
+            }
+            String verb = matcher.group(1).equals("craft") ? "craft" : "mine";
+            int count = Integer.parseInt(matcher.group(2));
+            String item = "minecraft:" + matcher.group(3);
+            String key = verb + " " + item;
+            Integer index = firstIndex.get(key);
+            if (index == null) {
+                firstIndex.put(key, out.size());
+                out.add(matcher.group(1) + " " + count + " " + item + matcher.group(4));
+            } else {
+                Matcher existing = LOOSE_STEP.matcher(out.get(index));
+                if (existing.matches() && count > Integer.parseInt(existing.group(2))) {
+                    out.set(index, existing.group(1) + " " + count + " " + item + existing.group(4));
+                }
+            }
+        }
+        return List.copyOf(out);
+    }
+
     /** A step of the form "mine 3 minecraft:stone" or "craft 4 minecraft:stick". */
     record QuantifiedStep(String verb, int count, String item) {
     }
@@ -141,6 +179,24 @@ final class ProgressPlanner {
                 .orElse(List.of());
     }
 
+    /** The ordered progression from "get wood" to the Ender Dragon, loaded from the mod's resources. */
+    static String progression() {
+        try (var in = ProgressPlanner.class.getResourceAsStream("/assets/actionable/progression.txt")) {
+            if (in == null) {
+                return "";
+            }
+            StringBuilder out = new StringBuilder();
+            for (String line : new String(in.readAllBytes(), java.nio.charset.StandardCharsets.UTF_8).split("\\R")) {
+                if (!line.isBlank() && !line.startsWith("#")) {
+                    out.append(out.length() > 0 ? "\n" : "").append(line);
+                }
+            }
+            return out.toString();
+        } catch (java.io.IOException e) {
+            return "";
+        }
+    }
+
     /** Compact knowledge block for the director and decomposition prompts. */
     static String briefing(Map<String, Integer> inventory, boolean tableNearby, String preferredLog) {
         StringBuilder text = new StringBuilder("Progression briefing:");
@@ -162,6 +218,11 @@ final class ProgressPlanner {
         text.append("\n- craftable_now=").append(TechTree.craftableNow(inventory, tableNearby));
         text.append("\n- inventory_uses=").append(inventoryUses(inventory));
         text.append("\n- craftable_catalog=").append(TechTree.craftableItems());
+        text.append("\n- night_prep_missing=").append(SafetyAssessment.nightPrepMissing(inventory));
+        String progression = progression();
+        if (!progression.isEmpty()) {
+            text.append("\nGame progression (earliest unfinished stage first):\n").append(progression);
+        }
         return text.toString();
     }
 

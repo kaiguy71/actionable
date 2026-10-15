@@ -22,7 +22,9 @@ final class PlannerSchema {
                     {"type":"object","properties":{"summary":{"type":"string"},"goal":{"type":"string"},
                     "complete":{"type":"boolean"},"step_complete":{"type":"boolean"},"action":{
                     "type":"object","properties":{"type":{"type":"string","enum":["baritone","wait",
-                    "lookup","place_block","jump_place","attack","craft"]},"command":{"type":"string"},
+                    "lookup","place_block","jump_place","attack","craft","use_block","menu","screenshot"]},
+                    "op":{"type":"string","enum":["read","quick_move","move","drop","close"]},
+                    "slot":{"type":"integer"},"to_slot":{"type":"integer"},"command":{"type":"string"},
                     "query":{"type":"string"},"block":{"type":"string"},"item":{"type":"string"},
                     "count":{"type":"integer","minimum":1,"maximum":256},"x":{"type":"integer"},
                     "y":{"type":"integer"},"z":{"type":"integer"},

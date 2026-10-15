@@ -5,7 +5,9 @@ import com.mojang.brigadier.arguments.StringArgumentType;
 import net.fabricmc.api.ClientModInitializer;
 import net.fabricmc.fabric.api.client.command.v2.ClientCommandRegistrationCallback;
 import net.fabricmc.fabric.api.client.command.v2.ClientCommands;
+import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientLifecycleEvents;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
+import net.fabricmc.fabric.api.client.networking.v1.ClientPlayConnectionEvents;
 import net.fabricmc.fabric.api.client.keymapping.v1.KeyMappingHelper;
 import net.fabricmc.fabric.api.client.message.v1.ClientReceiveMessageEvents;
 import net.fabricmc.fabric.api.client.rendering.v1.hud.HudElementRegistry;
@@ -57,7 +59,7 @@ public final class ActionableClient implements ClientModInitializer {
     private int currentStep;
     private static final int DANGER_HEALTH = 6;
     private static final int MAX_TASK_TICKS = 6000;
-    private static final int GOAL_MEMORY = 6;
+    private static final int GOAL_MEMORY = 20;
     private boolean autonomous = true;
     private boolean choosingGoal;
     private boolean escaping;
@@ -124,6 +126,9 @@ public final class ActionableClient implements ClientModInitializer {
                             tell(client, "Autonomous mode " + (autonomous ? "on." : "off."));
                             return 1;
                         })));
+
+        ClientLifecycleEvents.CLIENT_STOPPING.register(Screenshots::archiveSession);
+        ClientPlayConnectionEvents.DISCONNECT.register((handler, client) -> Screenshots.archiveSession(client));
 
         HudElementRegistry.addLast(
                 Identifier.fromNamespaceAndPath("actionable", "debug_sidebar"),
@@ -221,6 +226,22 @@ public final class ActionableClient implements ClientModInitializer {
             return;
         }
 
+        // A new /action is a clean slate: nothing from earlier tasks may leak into this one.
+        client.getConnection().sendChat("#stop");
+        baritoneCommandRunning = false;
+        currentBaritoneCommand = "";
+        pendingMine = null;
+        mineStart = null;
+        pendingCraft = null;
+        achievedGoals.clear();
+        attemptedGoals.clear();
+        avoidAreas.clear();
+        choosingGoal = false;
+        decomposing = false;
+        judging = false;
+        escaping = false;
+        retreating = false;
+        planner.attachImage(null);
         generation++;
         activeTask = prompt;
         taskOrigin = java.util.Objects.requireNonNull(client.player).blockPosition();
@@ -586,7 +607,7 @@ public final class ActionableClient implements ClientModInitializer {
                 }
                 tell(client, "Could not split the task; working on it directly.");
             } else {
-                taskSteps = java.util.List.copyOf(steps);
+                taskSteps = ProgressPlanner.normalizeSteps(steps);
                 announcePlan(client);
             }
             currentStep = 0;
@@ -652,7 +673,7 @@ public final class ActionableClient implements ClientModInitializer {
     private static String inventoryOf(String synopsis) {
         StringBuilder items = new StringBuilder();
         for (String field : synopsis.split("; ")) {
-            if (field.startsWith("hotbar=") || field.startsWith("inventory=")) {
+            if (field.startsWith("totals=") || field.startsWith("inventory=")) {
                 if (!items.isEmpty()) {
                     items.append("; ");
                 }
@@ -830,6 +851,32 @@ public final class ActionableClient implements ClientModInitializer {
                     lastResult = GameKnowledge.lookup(client, action.query());
                     tell(client, lastResult);
                     ticksUntilPlan = 1;
+                }
+                case "use_block" -> {
+                    stopBaritone(client);
+                    lastAction = "use_block " + action.x() + "," + action.y() + "," + action.z();
+                    lastResult = MenuActions.useBlock(client, action.x(), action.y(), action.z());
+                    reportBlockResult(client);
+                    ticksUntilPlan = 10;
+                }
+                case "menu" -> {
+                    lastAction = "menu " + action.command() + (action.x() >= 0 ? " " + action.x() : "")
+                            + (action.y() >= 0 ? "->" + action.y() : "");
+                    lastResult = MenuActions.menu(client, action.command(), action.x(), action.y());
+                    reportBlockResult(client);
+                    ticksUntilPlan = 10;
+                }
+                case "screenshot" -> {
+                    lastAction = "screenshot";
+                    lastResult = "capturing screenshot; the image is attached to your next turn";
+                    long shotGeneration = generation;
+                    Screenshots.capture(client, debugEnabled, image -> {
+                        if (shotGeneration == generation && image != null) {
+                            planner.attachImage(image);
+                        }
+                    });
+                    tell(client, "Taking a screenshot for the model.");
+                    ticksUntilPlan = 15;
                 }
                 case "place_block" -> {
                     stopBaritone(client);
@@ -1205,11 +1252,31 @@ public final class ActionableClient implements ClientModInitializer {
             lastBaritonePosition = position;
             lastBaritoneMovementAt = clientTick;
         }
+        // Baritone needs a moment to pick up a freshly sent command before "idle" means finished.
+        if (clientTick % 10 == 0 && clientTick - baritoneCommandStartedAt > 40) {
+            java.util.Optional<BaritoneProbe.State> state = BaritoneProbe.query();
+            if (state.isPresent() && !state.get().active()) {
+                String finished = currentBaritoneCommand;
+                baritoneCommandRunning = false;
+                currentBaritoneCommand = "";
+                lastResult = "Baritone finished or stopped by itself (idle): " + finished
+                        + ". Check the inventory/surroundings to see if the goal was reached.";
+                if (activeTask != null && !planning) {
+                    ticksUntilPlan = 0;
+                }
+            }
+        }
+    }
+
+    /** Live Baritone state for the model, from the Baritone API when available. */
+    String baritoneLiveState() {
+        return BaritoneProbe.query().map(state -> "baritone_live=" + state.describe())
+                .orElse("baritone_live=unknown");
     }
 
     private String baritoneProgress(Minecraft client) {
         if (!baritoneCommandRunning) {
-            return "baritone_task=idle";
+            return "baritone_task=idle," + baritoneLiveState();
         }
         BlockPos current = client.player == null ? lastBaritonePosition : client.player.blockPosition();
         long elapsedTicks = clientTick - baritoneCommandStartedAt;
@@ -1223,6 +1290,7 @@ public final class ActionableClient implements ClientModInitializer {
         }
         StringBuilder progress = new StringBuilder("baritone_task=running{command=")
                 .append(currentBaritoneCommand)
+                .append(",").append(baritoneLiveState())
                 .append(",elapsed_seconds=").append(elapsedTicks / 20)
                 .append(",distance_moved_blocks=").append(String.format(java.util.Locale.ROOT, "%.1f", moved))
                 .append(",seconds_since_movement=").append(idleTicks / 20);

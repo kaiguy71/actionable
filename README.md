@@ -1,5 +1,5 @@
-# Actionable version 0.1.3b
-Readme Date: 10/6/2026
+# Actionable version 0.1.4
+Readme Date: 10/14/2026
 
 A client-side Fabric mod that plays Minecraft autonomously: an Ollama or Claude model chooses its own goals,
 breaks them into steps, and carries them out through Baritone.
@@ -212,6 +212,26 @@ recipe book, so crafting works before recipes are unlocked. This needs the defau
 `doLimitedCrafting=false`. Craftable items: any planks, sticks, crafting table, wooden and stone
 pickaxe/axe/sword/shovel, torches, furnace, and chest. Wood variants are interchangeable, and planks
 prefer the matching log.
+
+### Menus, right-click and screenshots
+
+These are internal model actions, not player commands:
+
+- `{"type":"use_block","x":..,"y":..,"z":..}` right-clicks a block within 4.5 blocks (opens crafting
+  tables, furnaces, chests, barrels; uses doors and beds).
+- `{"type":"menu","op":"read"}` lists occupied slots of the open menu (or the inventory); `quick_move`
+  (shift-click), `move` (slot to slot), `drop` and `close` operate on it.
+- `{"type":"screenshot"}` attaches the current view to the model's next turn (Ollama vision models only).
+  With `/actiondebug` on, shots are saved to `screenshots/LLM-screenshots/<timestamp>.png` and zipped into
+  `session-<timestamp>.zip` when you leave the world or quit.
+
+Each new `/action` sends `#stop` and starts with no memory of earlier tasks. Baritone's live state
+(active process, pathing) is read through its API and shown to the model as `baritone_live=`; when Baritone
+goes idle on its own the model is told. The inventory sent to the model lists only occupied slots with
+durability, plus item totals. Autonomous mode follows
+[progression.txt](src/main/resources/assets/actionable/progression.txt) (wood to Ender Dragon, including
+house, storage, farm and ranch stages). Darkness and night are cautions, not dangers; the model is told to
+prepare a weapon, light source and bed.
 
 ### Basic combat
 

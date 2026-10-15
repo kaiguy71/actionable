@@ -1,0 +1,23 @@
+# Survival progression, in order. Finish the earliest unfinished stage before starting a later one.
+# Pick ONE concrete goal from the earliest unfinished stage and stay on it until it is done.
+# Lines starting with # are comments. Format: stage | what to do | why
+1 | Get wood: 3-4 logs, then planks, sticks, crafting table | everything starts with wood
+2 | Wooden pickaxe, then mine cobblestone | stone needs a pickaxe
+3 | Stone pickaxe, stone sword, stone axe, stone shovel | iron needs a stone pickaxe; a weapon for night
+4 | Collect food: kill cows/pigs/chickens/sheep or pick sweet berries | health only regenerates when fed
+5 | Torches: coal + sticks (8-16), mine coal on exposed surface ore | light for caves and for night
+6 | Beds: 3 wool (sheep) + 3 planks; place and sleep through the first night | skips night, sets spawn
+7 | Basic shelter/house: walls and roof from planks or cobblestone, door, torches, bed inside | safe base
+8 | Furnace; smelt raw iron; cook meat | iron and cooked food
+9 | Storage room: 2-4 chests (or barrels) next to the house, sort by type | keeps the inventory usable
+10 | Iron gear: iron pickaxe, sword, axe, shovel, helmet/chestplate/leggings/boots, shield, bucket | survive and mine diamonds
+11 | Reliable food: wheat/carrot/potato farm with water, plus a cow/sheep/chicken pen to breed and slaughter | no more hunting trips
+12 | Mob drops: simple passive mob farm (cow ranch) or fenced breeding ranch with a kill chamber | steady leather, meat, wool
+13 | Mine at y=-58..-54 for diamonds (cave gear first: torches, food, weapon, iron pickaxe); diamond pickaxe, sword | strongest early tools
+14 | Obsidian (diamond pickaxe + water on lava) x10-14, flint and steel | nether portal
+15 | Enchanting: bookshelves, enchanting table, enchant tools; anvil | stronger gear
+16 | Nether: gold armor or piglin trade, fire resistance if possible, find a fortress, kill blazes for 7+ blaze rods | blaze rods give blaze powder
+17 | Gather ender pearls (kill endermen at night or trade with piglins) | eyes of ender
+18 | Craft 12+ eyes of ender (ender pearl + blaze powder), cook food, 64+ blocks, bow+arrows, water bucket, bed | stronghold navigation
+19 | Throw eyes of ender to find the stronghold, dig down to the portal room, fill the portal frame | reach the End
+20 | The End: destroy end crystals on the pillars, then kill the Ender Dragon (beds exploding or sword hits when it perches) | final boss

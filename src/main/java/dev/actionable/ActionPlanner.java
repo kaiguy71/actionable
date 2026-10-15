@@ -19,6 +19,7 @@ import java.util.concurrent.Executors;
 final class ActionPlanner {
     private static final int MAX_COMMAND_LENGTH = 256;
     static final int MAX_STEPS = 8;
+    static final Set<String> MENU_OPS = Set.of("read", "quick_move", "move", "drop", "close");
     private static final Set<String> ALLOWED_COMMANDS =
             Set.of("mine", "goto", "build", "explore", "find", "pickup", "farm", "cancel", "come", "follow");
     private static final String SYSTEM_PROMPT = """
@@ -80,6 +81,29 @@ final class ActionPlanner {
             Never target players or neutral mobs. Escape creepers and flee when health is 6 or lower.
             Observe target health/death before claiming damage or kills; repeat attack if still needed.
 
+            Counting: every quantity is a TOTAL to hold, never an amount to add. "mine 18 minecraft:birch_log"
+            mines only until the inventory holds 18 birch logs in total. Read the inventory/totals fields
+            before choosing a quantity, and say the remaining need in your summary. Different wood types
+            are different items: spruce logs never count toward birch.
+
+            Opening and using things:
+            - {"type":"use_block","x":..,"y":..,"z":..} right-clicks a block within 4 blocks (opens a crafting
+              table, furnace, chest, barrel; also doors, beds, buttons).
+            - {"type":"menu","op":"read"} lists the open menu's slots (or your inventory if nothing is open)
+              with slot numbers and the item in each; read before moving anything.
+            - {"type":"menu","op":"quick_move","slot":N} shift-clicks slot N (moves the stack between the
+              container and your inventory; in a furnace it loads input/fuel or takes the result).
+            - {"type":"menu","op":"move","slot":A,"to_slot":B} moves the stack in slot A into slot B.
+            - {"type":"menu","op":"drop","slot":N} throws the stack out; {"type":"menu","op":"close"} closes it.
+            - {"type":"screenshot"} captures what the player sees; the image arrives with your next turn.
+              Use it only when the text state is not enough (what a structure looks like, where you are).
+
+            Night and darkness: dark is a risk, never a reason to freeze. Night makes hostile mobs spawn
+            on the surface in the dark, so before dusk gather a sword, torches/lantern/campfire and a bed
+            (3 wool + 3 planks) when affordable. At night you may sleep in a bed, stay near light, keep
+            working at a lit site, or mine underground once you hold torches. Do not abandon a task only
+            because light is low; act on actual hostile mobs and low health.
+
             Return only JSON:
             {"summary":"short status","goal":"current subgoal","complete":false,
              "action":{"type":"baritone","command":"mine 4 minecraft:oak_log"}}
@@ -93,6 +117,10 @@ final class ActionPlanner {
                 "action":{"type":"lookup","query":"crafting table"}}
             or {"summary":"make handles","goal":"craft sticks","complete":false,
                 "action":{"type":"craft","item":"minecraft:stick","count":4}}
+            or {"summary":"open the table","goal":"use crafting table","complete":false,
+                "action":{"type":"use_block","x":4,"y":64,"z":-2}}
+            or {"summary":"load furnace","goal":"smelt","complete":false,
+                "action":{"type":"menu","op":"quick_move","slot":30}}
             or {"summary":"step objective met","goal":"move to the next step","complete":false,
                 "step_complete":true,"action":{"type":"wait"}}
             Return complete=true only when the entire user task is actually done. For a blocker, return action
@@ -125,6 +153,9 @@ final class ActionPlanner {
             "craft 12 minecraft:oak_planks", "place minecraft:crafting_table nearby". Quantities are totals
             to hold when the step finishes. 3x3 recipes need a placed crafting table.
             Use the fewest steps that actually accomplish the task, at most 8.
+            Each (verb, item) pair appears at most once: "mine 18 minecraft:birch_log" already collects all
+            18 logs. Never split one quantity into repeated steps. Use the exact wood/stone type the task
+            names, and check the inventory first; hold-totals already met need no step.
             Return only JSON: {"steps":["mine 3 minecraft:oak_log","craft 12 minecraft:oak_planks"]}
             """;
     private static final String JUDGE_PROMPT = """
@@ -148,10 +179,16 @@ final class ActionPlanner {
             Tools gate mining: stone, coal ore and every ore drop nothing without a pickaxe, and iron ore
             needs a stone pickaxe. Never choose to mine a block in cannot_mine_yet; craft the tool instead.
             Cobblestone comes from mining minecraft:stone; never go looking for placed cobblestone.
-            Safety comes first. If safety level=danger, choose to reach light or the surface. Do not choose
+            Safety comes first. Darkness alone is only caution: at night keep working, or prepare (weapon,
+            torches, lantern/campfire, bed) and sleep. If safety level=danger because of low health or
+            hostile mobs, choose to reach light or the surface. Do not choose
             goals that take you underground or into dark caves while cave_ready=false; prefer exposed
             blocks on the surface, cliffs and hillsides near you. Escape at health 6 or lower and avoid
             creepers. Fight only mobs marked melee_reachable=true.
+            Follow the game progression list in the briefing: pick one concrete goal from the earliest stage
+            that is not finished (judge by inventory and goals already achieved), including house, storage,
+            farm and ranch stages when reached. Commit to it: do not switch to a different stage or invent
+            a new project halfway. Before dusk, prepare per night_prep_missing.
             next_milestone is normally the right goal; choose something else only when safety or the
             world state gives a clear reason, and say what it is.
             Never repeat a goal listed as already achieved, and do not repeat a recently attempted goal
@@ -193,6 +230,13 @@ final class ActionPlanner {
         thread.setDaemon(true);
         return thread;
     });
+
+    private volatile String pendingImage;
+
+    /** Attaches a PNG (base64) to the next action request; only Ollama vision models can use it. */
+    void attachImage(String base64Png) {
+        pendingImage = base64Png;
+    }
 
     CompletableFuture<ActionPlan> plan(String task, String synopsis, String lastAction, String lastResult,
             String planContext, String history) {
@@ -277,6 +321,13 @@ final class ActionPlanner {
                 + "\nPrevious action: "
                 + (lastAction.isEmpty() ? "none" : lastAction) + "\nPrevious action result: "
                 + (lastResult.isEmpty() ? "none" : lastResult) + "\nLatest world state: " + synopsis));
+        String image = pendingImage;
+        if (image != null) {
+            pendingImage = null;
+            JsonArray images = new JsonArray();
+            images.add(image);
+            messages.get(1).getAsJsonObject().add("images", images);
+        }
         body.add("messages", messages);
 
         return parsePlan(send(endpoint, body));
@@ -379,7 +430,7 @@ final class ActionPlanner {
         return new ActionPlan(summary, goal, complete, stepComplete, action);
     }
 
-    private static Optional<PlannedAction> parseAction(JsonObject action) {
+    static Optional<PlannedAction> parseAction(JsonObject action) {
         String type = action.has("type") ? action.get("type").getAsString() : "baritone";
         if (type.equals("wait")) {
             return Optional.of(new PlannedAction("wait", "", "", 0, 0, 0, ""));
@@ -412,6 +463,27 @@ final class ActionPlanner {
             String query = cleanText(action, "query", "", 80);
             return query.isBlank() ? Optional.empty()
                     : Optional.of(new PlannedAction("lookup", "", "", 0, 0, 0, query));
+        }
+        if (type.equals("screenshot")) {
+            return Optional.of(new PlannedAction("screenshot", "", "", 0, 0, 0, ""));
+        }
+        if (type.equals("use_block") && action.has("x") && action.has("y") && action.has("z")) {
+            return Optional.of(new PlannedAction("use_block", "", "",
+                    action.get("x").getAsInt(), action.get("y").getAsInt(), action.get("z").getAsInt(), ""));
+        }
+        if (type.equals("menu")) {
+            String op = cleanText(action, "op", "read", 20).strip().toLowerCase(Locale.ROOT);
+            if (!MENU_OPS.contains(op)) {
+                return Optional.empty();
+            }
+            int slot = action.has("slot") && action.get("slot").isJsonPrimitive() ? action.get("slot").getAsInt() : -1;
+            int toSlot = action.has("to_slot") && action.get("to_slot").isJsonPrimitive()
+                    ? action.get("to_slot").getAsInt() : -1;
+            boolean needsSlot = !op.equals("read") && !op.equals("close");
+            if (needsSlot && (slot < 0 || slot > 200 || (op.equals("move") && (toSlot < 0 || toSlot > 200)))) {
+                return Optional.empty();
+            }
+            return Optional.of(new PlannedAction("menu", op, "", slot, toSlot, 0, ""));
         }
         if ((type.equals("place_block") || type.equals("jump_place")) && action.has("block")
                 && action.has("x") && action.has("y") && action.has("z")) {

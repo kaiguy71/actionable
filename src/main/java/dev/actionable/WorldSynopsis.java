@@ -49,8 +49,8 @@ final class WorldSynopsis {
                 .append("; armor=").append(player.getArmorValue())
                 .append("; ").append(WorldProbe.safety(client).describe())
                 .append("; nearest_crafting_table=").append(nearestTable(level, playerPos))
-                .append("; hotbar=").append(hotbar(player))
-                .append("; inventory=").append(inventory(player));
+                .append("; inventory=").append(inventorySlots(player))
+                .append("; totals=").append(topEntries(WorldProbe.inventory(player), 24));
 
         Map<String, Integer> nearbyBlocks = new TreeMap<>();
         BlockPos origin = playerPos;
@@ -214,24 +214,56 @@ final class WorldSynopsis {
         return wrapped;
     }
 
-    private static String inventory(net.minecraft.world.entity.player.Player player) {
-        return topEntries(WorldProbe.inventory(player), 16);
+    /** Lists only what is held: slot numbers are 1-based, stacks show count, tools show durability. */
+    static String inventorySlots(net.minecraft.world.entity.player.Player player) {
+        var inv = player.getInventory();
+        StringBuilder out = new StringBuilder("{");
+        appendArea(out, "hotbar", inv, 0, 9);
+        appendArea(out, "main", inv, 9, 36);
+        StringBuilder worn = new StringBuilder();
+        String[] names = {"feet", "legs", "chest", "head"};
+        for (int i = 0; i < 4; i++) {
+            ItemStack stack = inv.getItem(36 + i);
+            if (!stack.isEmpty()) {
+                worn.append(worn.length() > 0 ? "," : "").append(names[i]).append(':').append(describe(stack));
+            }
+        }
+        if (worn.length() > 0) {
+            out.append(out.length() > 1 ? "," : "").append("\"worn\":\"").append(worn).append('"');
+        }
+        ItemStack offhand = inv.getItem(40);
+        if (!offhand.isEmpty()) {
+            out.append(out.length() > 1 ? "," : "").append("\"offhand\":\"").append(describe(offhand)).append('"');
+        }
+        out.append("}");
+        return out.length() == 2 ? "empty" : out.toString();
     }
 
-    private static String hotbar(net.minecraft.world.entity.player.Player player) {
-        StringBuilder items = new StringBuilder("[");
-        for (int slot = 0; slot < 9; slot++) {
-            ItemStack stack = player.getInventory().getItem(slot);
-            if (stack.isEmpty()) {
-                continue;
+    private static void appendArea(StringBuilder out, String area, net.minecraft.world.entity.player.Inventory inv,
+            int from, int to) {
+        StringBuilder items = new StringBuilder();
+        for (int slot = from; slot < to; slot++) {
+            ItemStack stack = inv.getItem(slot);
+            if (!stack.isEmpty()) {
+                items.append(items.length() > 0 ? "," : "").append('"').append(slot - from + 1).append("\":\"")
+                        .append(describe(stack)).append('"');
             }
-            if (items.length() > 1) {
-                items.append(',');
-            }
-            items.append(slot).append('=').append(BuiltInRegistries.ITEM.getKey(stack.getItem()))
-                    .append(':').append(stack.getCount());
         }
-        return items.append(']').toString();
+        if (items.length() > 0) {
+            out.append(out.length() > 1 ? "," : "").append('"').append(area).append("\":{").append(items).append('}');
+        }
+    }
+
+    private static String describe(ItemStack stack) {
+        StringBuilder text = new StringBuilder(BuiltInRegistries.ITEM.getKey(stack.getItem()).getPath());
+        if (stack.getCount() > 1) {
+            text.append(" x").append(stack.getCount());
+        }
+        if (stack.isDamageableItem()) {
+            text.append(" dur=").append(stack.getMaxDamage() - stack.getDamageValue()).append('/')
+                    .append(stack.getMaxDamage());
+        }
+        return text.toString();
     }
 
     private static String topEntries(Map<String, Integer> entries, int limit) {

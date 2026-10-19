@@ -61,9 +61,14 @@ final class BlockBreaker {
         if (player == null || client.level == null || client.gameMode == null) {
             return "BREAK_FAILED_NO_WORLD: player world became unavailable";
         }
-        if (client.level.getBlockState(target).isAir()) {
+        BlockState current = client.level.getBlockState(target);
+        if (current.isAir()) {
             client.gameMode.stopDestroyBlock();
             return "BROKE: " + describe();
+        }
+        if (current.is(net.minecraft.world.level.block.Blocks.WATER)) {
+            // A block was just placed into this water and has not appeared yet; wait for it.
+            return tick - startedAt > 100 ? "BROKE: only water at " + describe() : null;
         }
         boolean inReach = MiningPolicy.inReach(player.getBlockX(), player.getBlockY(), player.getBlockZ(),
                 target.getX(), target.getY(), target.getZ());

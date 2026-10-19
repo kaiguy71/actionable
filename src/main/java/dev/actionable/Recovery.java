@@ -65,6 +65,8 @@ final class Recovery {
     static final int WALK_STALL_TICKS = 600;
     /** Seconds in water during a mine (as ticks) before mining is stopped and the player swims to land. */
     static final int WATER_STUCK_TICKS = 160;
+    /** Hunts restart after each search walk; about one full ring around home before the model is asked. */
+    static final int HUNT_RESENDS = 10;
     /** Re-sends in a row that gather nothing before the model takes over. */
     static final int DIRECT_RESENDS = 2;
 

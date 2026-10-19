@@ -32,8 +32,9 @@ class HouseAndHomeTest {
         int[] stand = HouseDesign.BED_STAND;
         assertTrue(HouseDesign.inside(origin, origin[0] + foot[0], origin[1] + foot[1], origin[2] + foot[2]));
         assertTrue(HouseDesign.inside(origin, origin[0] + stand[0], origin[1] + stand[1], origin[2] + stand[2]));
-        // The bed head goes one block west of the foot, away from the stand cell.
-        assertTrue(HouseDesign.inside(origin, origin[0] + foot[0] - 1, origin[1], origin[2] + foot[2]));
+        // Placed facing south from the stand cell, the bed head lands one block south of the foot.
+        assertEquals(foot[2] + 1 - stand[2], 2);
+        assertTrue(HouseDesign.inside(origin, origin[0] + foot[0], origin[1], origin[2] + foot[2] + 1));
         assertFalse(HouseDesign.inside(origin, origin[0], origin[1], origin[2]), "walls are not interior");
     }
 
@@ -41,20 +42,30 @@ class HouseAndHomeTest {
     void furnitureCellsAreInsideAndDoNotOverlap() {
         int[] origin = {0, 64, 0};
         java.util.Set<String> used = new java.util.HashSet<>();
-        for (int[] cell : new int[][] {HouseDesign.BED_STAND, HouseDesign.BED_FOOT, {1, 0, 2},
-                HouseDesign.TABLE_CELL, HouseDesign.DOOR_STAND}) {
+        int[] bedHead = {HouseDesign.BED_FOOT[0], 0, HouseDesign.BED_FOOT[2] + 1};
+        for (int[] cell : new int[][] {HouseDesign.BED_STAND, HouseDesign.BED_FOOT, bedHead, HouseDesign.TABLE_CELL,
+                HouseDesign.FURNACE_CELL, HouseDesign.DOOR_STAND, HouseDesign.STAIR_TOP}) {
             assertTrue(HouseDesign.inside(origin, cell[0], 64 + cell[1], cell[2]), java.util.Arrays.toString(cell));
             assertTrue(used.add(java.util.Arrays.toString(cell)), "overlap at " + java.util.Arrays.toString(cell));
         }
         assertFalse(HouseDesign.solid(HouseDesign.DOOR_CELL[0], 0, HouseDesign.DOOR_CELL[2]), "door goes in the doorway");
-        assertTrue(MiningPolicy.inReach(HouseDesign.BED_STAND[0], 64, HouseDesign.BED_STAND[2],
-                HouseDesign.TABLE_CELL[0], 64, HouseDesign.TABLE_CELL[2]), "table reachable from the stand cell");
+        for (int[] used2 : new int[][] {HouseDesign.TABLE_CELL, HouseDesign.FURNACE_CELL, HouseDesign.BED_FOOT}) {
+            assertTrue(MiningPolicy.inReach(HouseDesign.DOOR_STAND[0], 64, HouseDesign.DOOR_STAND[2], used2[0], 64, used2[2]),
+                    "reachable from just inside the door: " + java.util.Arrays.toString(used2));
+        }
+        for (int[] cell : new int[][] {HouseDesign.BED_FOOT, bedHead, HouseDesign.TABLE_CELL, HouseDesign.FURNACE_CELL}) {
+            for (int k = 1; k <= 3; k++) {
+                for (int[] stair : StairMine.cells(k)) {
+                    assertFalse(java.util.Arrays.equals(stair, cell), "stairs dig through furniture at " + k);
+                }
+            }
+        }
     }
 
     @Test
     void floorCoversTheInteriorDoorwayAndStepOutside() {
         java.util.List<int[]> floor = HouseDesign.floorCells();
-        assertEquals(11, floor.size());
+        assertEquals(9, floor.size(), "the staircase column's floor is dug on purpose");
         assertTrue(floor.stream().allMatch(cell -> cell[1] == -1), "floor cells are one below floor level");
         assertTrue(floor.stream().anyMatch(cell -> cell[0] == 2 && cell[2] == -1), "the step outside the door");
         assertTrue(floor.stream().anyMatch(cell -> cell[0] == 2 && cell[2] == 0), "under the doorway");
@@ -125,16 +136,31 @@ class HouseAndHomeTest {
     }
 
     @Test
-    void wanderTargetsStayInsideTheRangeAndVary() {
+    void searchSweepsARingAroundHomeInsteadOfCrissCrossing() {
         int[] home = {100, 70, -50};
-        int[] first = HomeRange.wanderTarget(home, 0);
-        int[] second = HomeRange.wanderTarget(home, 1);
-        assertFalse(java.util.Arrays.equals(first, second));
-        for (int attempt = 0; attempt < 10; attempt++) {
-            int[] target = HomeRange.wanderTarget(home, attempt);
-            assertFalse(HomeRange.outside(home, false, target[0], target[2], 0));
-            assertEquals(home[1], target[1]);
+        for (int attempt = 0; attempt < 7; attempt++) {
+            int[] here = HomeRange.searchTarget(home, attempt, HomeRange.HUNT_RANGE);
+            int[] next = HomeRange.searchTarget(home, attempt + 1, HomeRange.HUNT_RANGE);
+            double hop = Math.hypot(next[0] - here[0], next[2] - here[2]);
+            assertTrue(hop < 30, "neighbouring compass points, not across home: " + hop);
+            assertEquals(32, HomeRange.distance(home, here[0], here[2]), 1.0, "first ring");
         }
+        assertEquals(56, HomeRange.distance(home, HomeRange.searchTarget(home, 8, 96)[0],
+                HomeRange.searchTarget(home, 8, 96)[2]), 1.0, "then the next ring out");
+        for (int attempt = 0; attempt < 40; attempt++) {
+            int[] near = HomeRange.searchTarget(home, attempt, HomeRange.RADIUS);
+            assertFalse(HomeRange.outside(home, false, near[0], near[2], 0), "log and explore searches stay in range");
+            int[] far = HomeRange.searchTarget(home, attempt, HomeRange.HUNT_RANGE);
+            assertTrue(HomeRange.distance(home, far[0], far[2]) <= HomeRange.HUNT_RANGE);
+            assertEquals(home[1], far[1]);
+        }
+    }
+
+    @Test
+    void searchWalksNameOnlyTheColumnSoBaritoneNeverDigsDown() {
+        int[] target = HomeRange.searchTarget(new int[] {38, 63, -8}, 0, HomeRange.HUNT_RANGE);
+        assertEquals("goto " + target[0] + " " + target[2], HomeRange.surfaceGoto(target));
+        assertEquals(3, HomeRange.surfaceGoto(target).split(" ").length, "no height: Baritone picks the ground level");
     }
 
     @Test

@@ -88,6 +88,15 @@ public final class ActionableClient implements ClientModInitializer {
     private boolean houseBuiltSeen;
     private Hunter pendingHunt;
     private BlockBreaker pendingBreak;
+    private Smelter pendingSmelt;
+    private StairMiner pendingStairs;
+    /** True while the active task is a job the night routine chose (no bed, so work at home). */
+    private boolean nightJob;
+    /** Morning came while in the house mine; the task ends once the player has climbed out. */
+    private boolean morningPending;
+    private long furnaceReadyAt;
+    private long smeltCooldownUntil;
+    private long mineRestUntil;
     /** Baritone command to resume after a snag is cleared; null when the break was the model's. */
     private String unstickResume;
     private int lastX;
@@ -102,6 +111,13 @@ public final class ActionableClient implements ClientModInitializer {
     private int waterTicks;
     private long lastSleepAttempt;
     private int wanderAttempts;
+    /** 0 = not eating, 1 = waiting for Baritone to let go of the keys, 2 = eating. */
+    private int eatPhase;
+    private long eatStartedAt;
+    private long eatBackoffUntil;
+    private int eatFoodBefore;
+    private String eatItem;
+    private String eatResume;
     /** The step code started itself; while it makes progress the model is not asked. */
     private String directStep;
     private boolean houseTableSeen;
@@ -202,6 +218,13 @@ public final class ActionableClient implements ClientModInitializer {
             tickMining(client);
             tickHunt(client);
             tickBreak(client);
+            tickSmelt(client);
+            tickStairs(client);
+            tickEat(client);
+            if (clientTick % 100 == 0 && eatPhase == 0 && pendingCraft == null && pendingSmelt == null
+                    && pendingBreak == null && !defending) {
+                arrangeHotbar(client);
+            }
             tickWater(client);
             tickStepCheck(client);
             while (toggleKey.consumeClick()) {
@@ -217,7 +240,8 @@ public final class ActionableClient implements ClientModInitializer {
             tickSafety(client);
             tickNight(client);
             tickHomeRange(client);
-            if (enabled && activeTask != null && !nightRoutine && clientTick - taskStartedAtTick > MAX_TASK_TICKS) {
+            if (enabled && activeTask != null && (!nightRoutine || nightJob)
+                    && pendingStairs == null && clientTick - taskStartedAtTick > MAX_TASK_TICKS) {
                 abandonTask(client, "took too long");
             }
             if (enabled && autonomous && escaping && activeTask != null && clientTick % 20 == 0
@@ -238,9 +262,9 @@ public final class ActionableClient implements ClientModInitializer {
                 requestGoalSelection(client);
             }
             // Night, return-home and hunting are run by code; the model is not consulted while they run.
-            if (enabled && activeTask != null && !planning && !decomposing && !judging && !nightRoutine
+            if (enabled && activeTask != null && !planning && !decomposing && !judging && (!nightRoutine || nightJob)
                     && !returningHome && pendingJumpPlace == null && pendingCraft == null && pendingHunt == null
-                    && pendingBreak == null
+                    && pendingBreak == null && pendingSmelt == null && pendingStairs == null && eatPhase == 0
                     && ticksUntilPlan-- <= 0) {
                 requestNextPlan(client);
             }
@@ -327,6 +351,21 @@ public final class ActionableClient implements ClientModInitializer {
             BlockPos here = java.util.Objects.requireNonNull(client.player).blockPosition();
             startArea = new int[] {here.getX(), here.getY(), here.getZ()};
         }
+        var inventoryNow = WorldProbe.inventory(java.util.Objects.requireNonNull(client.player));
+        if (facts(client).furnaceInHouse() && clientTick >= smeltCooldownUntil && dangerEscape(client) == null
+                && FurnacePlan.choose(inventoryNow).isPresent()) {
+            // Raw meat or ore plus fuel and a furnace: cook and smelt before anything else.
+            String chosen = NeedsPlanner.SMELT;
+            activeTask = chosen;
+            goalReason = "raw items to cook or smelt, fuel to do it, and a furnace in the house";
+            remember("chose goal", chosen);
+            noteAttempt(chosen);
+            ActionableLog.LOGGER.info("[Actionable] goal={} why={} source=furnace", ActionableLog.text(chosen),
+                    ActionableLog.text(goalReason));
+            tell(client, "Goal: " + chosen + " (why: " + goalReason + ")");
+            beginTask(client, chosen);
+            return;
+        }
         java.util.Optional<ProgressPlanner.Milestone> foundation = milestone(client)
                 .filter(ProgressPlanner::isFoundation);
         if (foundation.isPresent() && dangerEscape(client) == null) {
@@ -366,12 +405,21 @@ public final class ActionableClient implements ClientModInitializer {
                     }
                     String chosen = error == null && choice != null ? choice.goal().strip() : "";
                     String why = error == null && choice != null ? choice.why() : "";
+                    String lowered = chosen.toLowerCase(java.util.Locale.ROOT);
+                    if ((lowered.contains("smelt") || lowered.contains("cook") || lowered.contains("furnace"))
+                            && facts(client).furnaceInHouse()) {
+                        // The furnace is run by code: map any smelting or cooking goal to it.
+                        chosen = NeedsPlanner.SMELT;
+                    }
                     // Goals that need a missing tool are replaced in code: the model chose to punch stone.
                     java.util.Optional<String> problem = chosen.isEmpty() ? java.util.Optional.empty()
                             : ProgressPlanner.goalProblem(chosen, WorldProbe.inventory(client.player));
                     if (problem.isEmpty() && ProgressPlanner.duplicateTable(chosen,
                             WorldProbe.inventory(client.player), tableAccess(client))) {
                         problem = java.util.Optional.of("a crafting table already exists; reuse it instead");
+                    }
+                    if (problem.isEmpty() && !chosen.isEmpty()) {
+                        problem = ProgressPlanner.coalTooEarly(chosen, WorldProbe.inventory(client.player), facts(client));
                     }
                     // Repeat avoidance is also in code: the model re-picked goals it had just achieved.
                     if (chosen.isEmpty() || alreadyAchieved(chosen) || problem.isPresent()) {
@@ -438,16 +486,26 @@ public final class ActionableClient implements ClientModInitializer {
         boolean door = false;
         boolean atHome = false;
         boolean floor = houseBuiltSeen;
+        boolean furnace = false;
+        boolean mine = false;
         if (home != null && client.level.hasChunk(home[0] >> 4, home[2] >> 4)) {
-            houseTableSeen = WorldProbe.houseHas(client.level, home,
-                    state -> state.is(net.minecraft.world.level.block.Blocks.CRAFTING_TABLE));
+            // Exact cells, so a table from the old layout (now the stairs) is moved to its new spot.
+            houseTableSeen = client.level.getBlockState(homeCell(HouseDesign.TABLE_CELL))
+                    .is(net.minecraft.world.level.block.Blocks.CRAFTING_TABLE);
+            furnace = client.level.getBlockState(homeCell(HouseDesign.FURNACE_CELL))
+                    .is(net.minecraft.world.level.block.Blocks.FURNACE);
+            StairMine.Probe probe = StairMiner.probe(client.level, home);
+            int maxStep = StairMine.maxStep(home[1]);
+            int depth = StairMine.depth(probe, maxStep);
+            mine = depth >= maxStep || (depth > 0 && StairMine.check(probe, depth) != StairMine.Check.OK);
             door = client.level.getBlockState(homeCell(HouseDesign.DOOR_CELL)).getBlock()
-                    instanceof net.minecraft.world.level.block.DoorBlock;
+                    instanceof net.minecraft.world.level.block.DoorBlock
+                    && WorldProbe.strayDoors(client.level, home).isEmpty();
             BlockPos feet = client.player.blockPosition();
             atHome = HouseDesign.inside(home, feet.getX(), feet.getY(), feet.getZ());
             floor = houseBuiltSeen && WorldProbe.houseFloorProblem(client.level, home) == null;
         }
-        return new ProgressPlanner.Facts(houseBuiltSeen, bed, houseTableSeen, door, atHome, floor);
+        return new ProgressPlanner.Facts(houseBuiltSeen, bed, houseTableSeen, door, atHome, floor, furnace, mine);
     }
 
     /** Loads this world's saved home once per world. */
@@ -499,14 +557,15 @@ public final class ActionableClient implements ClientModInitializer {
     }
 
     private boolean isHouseCell(BlockPos pos) {
-        return home != null && HouseDesign.inside(home, pos.getX(), pos.getY(), pos.getZ());
+        return home != null && pos.equals(homeCell(HouseDesign.TABLE_CELL));
     }
 
     private String briefing(Minecraft client, String synopsis) {
         var inventory = WorldProbe.inventory(java.util.Objects.requireNonNull(client.player));
         ProgressPlanner.Facts facts = facts(client);
         return ProgressPlanner.briefing(inventory, tableAccess(client), WorldProbe.preferredLog(inventory, synopsis),
-                facts, HomeRange.describe(anchor(), HomeRange.geared(inventory), facts.houseBuilt()));
+                facts, HomeRange.describe(anchor(), HomeRange.geared(inventory), facts.houseBuilt()))
+                + "\n" + NeedsPlanner.report(inventory, situation(client, facts));
     }
 
     /**
@@ -641,6 +700,12 @@ public final class ActionableClient implements ClientModInitializer {
     }
 
     private void beginTask(Minecraft client, String prompt) {
+        if (client.player != null) {
+            var inventory = WorldProbe.inventory(client.player);
+            ActionableLog.LOGGER.info("[Actionable] situation task={} inventory={} report={}", ActionableLog.text(prompt),
+                    ActionableLog.text(inventory.toString()),
+                    ActionableLog.text(NeedsPlanner.report(inventory, situation(client, facts(client)))));
+        }
         taskSteps = java.util.List.of();
         currentStep = 0;
         stepJudged = false;
@@ -672,6 +737,8 @@ public final class ActionableClient implements ClientModInitializer {
         cancelCraft(client);
         pendingHunt = null;
         cancelBreak(client);
+        cancelHomeWork(client);
+        nightJob = false;
         escaping = false;
         retreating = false;
         returningHome = false;
@@ -739,7 +806,7 @@ public final class ActionableClient implements ClientModInitializer {
         String synopsis = WorldSynopsis.capture(client);
         var inventory = WorldProbe.inventory(java.util.Objects.requireNonNull(client.player));
         // Tech-tree goals get an exact plan from code; the model only decomposes free-form tasks.
-        java.util.List<String> known = ProgressPlanner.stepsForGoal(activeTask, inventory, tableAccess(client),
+        java.util.List<String> known = planFor(client, activeTask, inventory,
                 WorldProbe.preferredLog(inventory, synopsis));
         if (!known.isEmpty() && known.size() <= ActionPlanner.MAX_STEPS) {
             taskSteps = java.util.List.copyOf(known);
@@ -901,7 +968,10 @@ public final class ActionableClient implements ClientModInitializer {
         currentBaritoneCommand = "";
         lastResult = reason;
         currentGoal = "Complete";
-        noteAchieved(activeTask);
+        if (!nightJob) {
+            noteAchieved(activeTask);
+        }
+        nightJob = false;
         escaping = false;
         retreating = false;
         mineStart = null;
@@ -1130,6 +1200,15 @@ public final class ActionableClient implements ClientModInitializer {
         if (parsed.isPresent() && parsed.get().verb().equals("craft")) {
             startCraft(client, parsed.get().item(), parsed.get().count());
             ticksUntilPlan = 20;
+        } else if (step.equalsIgnoreCase(ProgressPlanner.GATHER_FOOD)) {
+            if (baritoneBusy(client)) {
+                ticksUntilPlan = 100;
+                return true;
+            }
+            lastAction = step;
+            pendingHunt = Hunter.forFood(FoodPlan.STOCK_WANTED, clientTick);
+            lastResult = "Hunting food animals until carrying " + FoodPlan.STOCK_WANTED + " hunger points of food";
+            tell(client, lastResult);
         } else if (parsed.isPresent() && parsed.get().verb().equals("hunt")) {
             if (baritoneBusy(client)) {
                 // Still walking to a new spot to look for sheep; hunt once there.
@@ -1147,7 +1226,7 @@ public final class ActionableClient implements ClientModInitializer {
             if (home == null) {
                 return false;
             }
-            BlockPos stand = homeCell(HouseDesign.BED_STAND);
+            BlockPos stand = homeCell(HouseDesign.DOOR_STAND);
             executeBaritone(client, connection, "goto " + stand.getX() + " " + stand.getY() + " " + stand.getZ());
             lastAction = ProgressPlanner.GO_HOME;
             lastResult = "Walking home to use the house crafting table";
@@ -1159,11 +1238,26 @@ public final class ActionableClient implements ClientModInitializer {
         } else if (step.equalsIgnoreCase(ProgressPlanner.PLACE_BED)) {
             placeInHouse(client, connection, step, TechTree.WHITE_BED, HouseDesign.BED_STAND, HouseDesign.BED_FOOT);
         } else if (step.equalsIgnoreCase(ProgressPlanner.PLACE_TABLE_IN_HOUSE)) {
-            placeInHouse(client, connection, step, TechTree.CRAFTING_TABLE, HouseDesign.BED_STAND, HouseDesign.TABLE_CELL);
+            placeInHouse(client, connection, step, TechTree.CRAFTING_TABLE, HouseDesign.DOOR_STAND, HouseDesign.TABLE_CELL);
+        } else if (step.equalsIgnoreCase(NeedsPlanner.PLACE_FURNACE)) {
+            placeInHouse(client, connection, step, "minecraft:furnace", HouseDesign.DOOR_STAND, HouseDesign.FURNACE_CELL);
+        } else if (step.equalsIgnoreCase(NeedsPlanner.SMELT)) {
+            if (home == null || !startSmelt(client, connection)) {
+                return false;
+            }
+        } else if (step.startsWith("dig house mine for ")) {
+            String[] words = step.split(" ");
+            if (home == null || words.length != 6) {
+                return false;
+            }
+            pendingStairs = new StairMiner(words[5], Integer.parseInt(words[4]), home, clientTick);
+            lastAction = step;
+            lastResult = "Digging the " + pendingStairs.describe();
+            tell(client, lastResult);
         } else if (step.equalsIgnoreCase(ProgressPlanner.PLACE_DOOR)) {
-            String door = WorldProbe.inventory(player).keySet().stream().filter(TechTree::isDoor).findFirst()
-                    .orElse("minecraft:oak_door");
-            placeInHouse(client, connection, step, door, HouseDesign.DOOR_STAND, HouseDesign.DOOR_CELL);
+            if (home == null || !hangHouseDoor(client, connection, step)) {
+                return false;
+            }
         } else if (parsed.isPresent() && parsed.get().verb().equals("mine")
                 && ActionPlanner.validateCommand("mine " + parsed.get().count() + " " + parsed.get().item()).isPresent()) {
             startMine(client, connection, "mine " + parsed.get().count() + " " + parsed.get().item());
@@ -1241,6 +1335,80 @@ public final class ActionableClient implements ClientModInitializer {
         return true;
     }
 
+    /**
+     * Hangs the house door properly: first takes back doors placed anywhere else around the house, then
+     * clears whatever fills the doorway (upper block first), then places the door in the doorway from
+     * just inside. Returns false when the doorway already has its door and nothing is out of place.
+     */
+    private boolean hangHouseDoor(Minecraft client, net.minecraft.client.multiplayer.ClientPacketListener connection,
+            String step) {
+        var player = java.util.Objects.requireNonNull(client.player);
+        var level = java.util.Objects.requireNonNull(client.level);
+        lastAction = step;
+        java.util.List<BlockPos> strays = WorldProbe.strayDoors(level, home);
+        if (!strays.isEmpty()) {
+            return breakForDoor(client, strays.get(0), "Taking back a misplaced door");
+        }
+        BlockPos lower = homeCell(HouseDesign.DOOR_CELL);
+        BlockPos upper = lower.above();
+        for (BlockPos cell : java.util.List.of(upper, lower)) {
+            var state = level.getBlockState(cell);
+            if (!state.isAir() && !(state.getBlock() instanceof net.minecraft.world.level.block.DoorBlock)) {
+                return breakForDoor(client, cell, "Clearing the doorway for the door");
+            }
+        }
+        if (level.getBlockState(lower).getBlock() instanceof net.minecraft.world.level.block.DoorBlock) {
+            return false;
+        }
+        String door = WorldProbe.inventory(player).keySet().stream().filter(TechTree::isDoor).findFirst()
+                .orElse("minecraft:oak_door");
+        placeInHouse(client, connection, step, door, HouseDesign.DOOR_STAND, HouseDesign.DOOR_CELL);
+        return true;
+    }
+
+    /**
+     * The code plan for a goal. Doors placed in the wrong spots are taken back by the door step itself,
+     * so with any lying around the plan skips crafting new ones.
+     */
+    private java.util.List<String> planFor(Minecraft client, String goal, java.util.Map<String, Integer> inventory,
+            String preferredLog) {
+        if (goal.equalsIgnoreCase(ProgressPlanner.PLACE_DOOR) && home != null && client.level != null
+                && !WorldProbe.strayDoors(client.level, home).isEmpty()) {
+            return java.util.List.of(ProgressPlanner.PLACE_DOOR);
+        }
+        return ProgressPlanner.stepsForGoal(goal, inventory, tableAccess(client), preferredLog);
+    }
+
+    private boolean breakForDoor(Minecraft client, BlockPos pos, String why) {
+        stopBaritone(client);
+        BlockBreaker.Start start = BlockBreaker.start(client, pos.getX(), pos.getY(), pos.getZ(), clientTick);
+        if (start.breaker() == null) {
+            lastResult = start.result();
+            reportBlockResult(client);
+            ticksUntilPlan = 5;
+            return true;
+        }
+        pendingBreak = start.breaker();
+        lastResult = why + ": breaking " + pendingBreak.describe();
+        ActionableLog.LOGGER.info("[Actionable] door_fix {}", ActionableLog.text(lastResult));
+        tell(client, lastResult);
+        return true;
+    }
+
+    /** Problems left before the house door is right: stray doors and blocks in the doorway. */
+    private int doorProblems(Minecraft client) {
+        var level = java.util.Objects.requireNonNull(client.level);
+        int problems = WorldProbe.strayDoors(level, home).size();
+        BlockPos lower = homeCell(HouseDesign.DOOR_CELL);
+        for (BlockPos cell : java.util.List.of(lower, lower.above())) {
+            var state = level.getBlockState(cell);
+            if (!(state.getBlock() instanceof net.minecraft.world.level.block.DoorBlock)) {
+                problems++;
+            }
+        }
+        return problems;
+    }
+
     /** How far along a code-run step is: items held, house blocks placed, or closeness to its spot. */
     private int directProgress(Minecraft client, String step) {
         var player = java.util.Objects.requireNonNull(client.player);
@@ -1271,7 +1439,18 @@ public final class ActionableClient implements ClientModInitializer {
             }
             return -remaining;
         }
-        int[] stand = step.equalsIgnoreCase(ProgressPlanner.PLACE_DOOR) ? HouseDesign.DOOR_STAND : HouseDesign.BED_STAND;
+        if (step.startsWith("dig house mine for ")) {
+            String[] words = step.split(" ");
+            return words.length == 6 ? TechTree.held(WorldProbe.inventory(player), words[5]) : 0;
+        }
+        if (step.equalsIgnoreCase(ProgressPlanner.GATHER_FOOD)) {
+            return FoodPlan.stock(WorldProbe.inventory(player));
+        }
+        int[] stand = step.equalsIgnoreCase(ProgressPlanner.PLACE_BED) ? HouseDesign.BED_STAND : HouseDesign.DOOR_STAND;
+        if (step.equalsIgnoreCase(ProgressPlanner.PLACE_DOOR)) {
+            // Each stray door taken back or doorway block cleared counts as progress.
+            return -doorProblems(client) * 10 - (int) Math.round(Math.sqrt(player.blockPosition().distSqr(homeCell(stand))));
+        }
         return -(int) Math.round(Math.sqrt(player.blockPosition().distSqr(homeCell(stand))));
     }
 
@@ -1291,10 +1470,9 @@ public final class ActionableClient implements ClientModInitializer {
     private boolean replanFromInventory(Minecraft client, String failure) {
         var inventory = WorldProbe.inventory(java.util.Objects.requireNonNull(client.player));
         String log = WorldProbe.preferredLog(inventory, "");
-        java.util.List<String> steps = ProgressPlanner.stepsForGoal(activeTask, inventory, tableAccess(client), log);
+        java.util.List<String> steps = planFor(client, activeTask, inventory, log);
         if (steps.isEmpty()) {
-            java.util.List<String> fix = ProgressPlanner.stepsForGoal(taskSteps.get(currentStep), inventory,
-                    tableAccess(client), log);
+            java.util.List<String> fix = planFor(client, taskSteps.get(currentStep), inventory, log);
             if (fix.isEmpty()) {
                 return false;
             }
@@ -1326,8 +1504,16 @@ public final class ActionableClient implements ClientModInitializer {
      * requested one is out of reach, occupied, or inside the player.
      */
     private String placeWithFallback(Minecraft client, ActionPlanner.PlannedAction action) {
+        if (TechTree.isDoor(action.block()) && client.level != null
+                && !DoorRule.fits(WorldProbe.doorProbe(client.level), action.x(), action.y(), action.z())) {
+            return "DOOR_FAILED_BAD_SPOT: " + DoorRule.RULE + "."
+                    + (home == null ? "" : " Use the step \"place door in house\" for the house doorway at "
+                    + homeCell(HouseDesign.DOOR_CELL).toShortString() + ".");
+        }
         String result = placeBlock(client, action);
-        if (!Recovery.badPlacementSpot(result) || client.player == null || client.level == null) {
+        // Doors and beds go exactly where intended or nowhere; a nearby free cell is never right for them.
+        boolean exact = TechTree.isDoor(action.block()) || action.block().endsWith("_bed");
+        if (exact || !Recovery.badPlacementSpot(result) || client.player == null || client.level == null) {
             return result;
         }
         BlockPos requested = new BlockPos(action.x(), action.y(), action.z());
@@ -1359,9 +1545,9 @@ public final class ActionableClient implements ClientModInitializer {
             return command;
         }
         if (command.equals("explore")) {
-            int[] target = HomeRange.wanderTarget(anchor, wanderAttempts++);
+            int[] target = HomeRange.searchTarget(anchor, wanderAttempts++, HomeRange.RADIUS);
             tell(client, "Exploring near home instead of wandering off.");
-            return "goto " + target[0] + " " + target[1] + " " + target[2];
+            return HomeRange.surfaceGoto(target);
         }
         String[] parts = command.split("\\s+");
         if (parts[0].equals("goto") && parts.length == 4
@@ -1453,7 +1639,7 @@ public final class ActionableClient implements ClientModInitializer {
     }
 
     private void tickBreak(Minecraft client) {
-        if (pendingBreak == null || defending) {
+        if (pendingBreak == null || defending || eatPhase != 0) {
             return;
         }
         var connection = client.getConnection();
@@ -1531,7 +1717,7 @@ public final class ActionableClient implements ClientModInitializer {
     }
 
     private void tickHunt(Minecraft client) {
-        if (pendingHunt == null || defending) {
+        if (pendingHunt == null || defending || eatPhase != 0) {
             return;
         }
         var connection = client.getConnection();
@@ -1539,8 +1725,8 @@ public final class ActionableClient implements ClientModInitializer {
             pendingHunt = null;
             return;
         }
-        String hunt = "hunt " + pendingHunt.item();
-        String result = pendingHunt.tick(client, clientTick, anchor(), geared(client),
+        String hunt = pendingHunt.item() == null ? ProgressPlanner.GATHER_FOOD : "hunt " + pendingHunt.item();
+        String result = pendingHunt.tick(client, clientTick, anchor(),
                 command -> executeBaritone(client, connection, command), () -> stopBaritone(client));
         if (result == null) {
             return;
@@ -1551,14 +1737,7 @@ public final class ActionableClient implements ClientModInitializer {
         reportBlockResult(client);
         remember(lastAction, lastResult);
         ticksUntilPlan = 1;
-        int[] anchor = anchor();
-        if (result.startsWith("HUNT_FAILED_NO_SHEEP") && anchor != null) {
-            // No sheep in sight: walk to another spot near home; the step restarts the hunt on arrival.
-            int[] target = HomeRange.wanderTarget(anchor, wanderAttempts++);
-            executeBaritone(client, connection, "goto " + target[0] + " " + target[1] + " " + target[2]);
-            lastResult = "No sheep in sight; looking near home at " + target[0] + "," + target[2];
-            ticksUntilPlan = 200;
-        }
+        ActionableLog.LOGGER.info("[Actionable] hunt_result {}", ActionableLog.text(result));
     }
 
     /** Holds jump while idle in water so the player floats instead of sinking. */
@@ -1609,8 +1788,16 @@ public final class ActionableClient implements ClientModInitializer {
             return;
         }
         if (!level.isDarkOutside()) {
-            if (nightRoutine) {
+            if (nightRoutine && !morningPending) {
                 nightRoutine = false;
+                nightJob = false;
+                cancelSmelt(client);
+                if (pendingStairs != null) {
+                    // Climb out of the mine before the day's work starts.
+                    pendingStairs.abort();
+                    morningPending = true;
+                    return;
+                }
                 activeTask = null;
                 taskSteps = java.util.List.of();
                 currentGoal = "Idle";
@@ -1620,7 +1807,7 @@ public final class ActionableClient implements ClientModInitializer {
             }
             return;
         }
-        if (escaping || retreating || defending || player.isSleeping()) {
+        if (escaping || retreating || defending || player.isSleeping() || morningPending) {
             return;
         }
         BlockPos center = home != null ? new BlockPos(home[0] + 2, home[1], home[2] + 2) : player.blockPosition();
@@ -1628,34 +1815,322 @@ public final class ActionableClient implements ClientModInitializer {
         if (bed == null && home == null) {
             return;
         }
-        BlockPos stand = home != null ? new BlockPos(home[0] + HouseDesign.BED_STAND[0],
-                home[1] + HouseDesign.BED_STAND[1], home[2] + HouseDesign.BED_STAND[2]) : bed;
+        BlockPos stand = home != null ? homeCell(HouseDesign.DOOR_STAND) : bed;
         if (!nightRoutine) {
             nightRoutine = true;
+            nightJob = false;
             cancelCraft(client);
             cancelBreak(client);
             pendingHunt = null;
             returningHome = false;
             stopBaritone(client);
-            startGoal(client, "sleep through the night", java.util.List.of(
-                    "goto " + stand.getX() + " " + stand.getY() + " " + stand.getZ()));
-            goalReason = bed != null ? "night: sleep in the bed to skip it safely"
-                    : "night: wait inside the house until morning";
+            activeTask = null;
+            taskSteps = java.util.List.of();
             ActionableLog.LOGGER.info("[Actionable] night_routine bed={}", bed != null);
+        }
+        if (bed != null) {
+            if (nightJob && pendingStairs == null && pendingSmelt == null) {
+                // A bed exists now (perhaps just placed): stop working and sleep.
+                nightJob = false;
+                activeTask = null;
+                taskSteps = java.util.List.of();
+            }
+            if (nightJob) {
+                return;
+            }
+            goalReason = "night: sleep in the bed to skip it safely";
+            currentGoal = "Sleeping through the night";
+            if (clientTick - lastSleepAttempt < 100) {
+                return;
+            }
+            lastSleepAttempt = clientTick;
+            if (player.getEyePosition().distanceToSqr(Vec3.atCenterOf(bed)) <= 20.25) {
+                stopBaritone(client);
+                lastAction = "sleep";
+                lastResult = MenuActions.useBlock(client, bed.getX(), bed.getY(), bed.getZ());
+                tell(client, "Trying to sleep.");
+            } else if (!baritoneBusy(client)) {
+                executeBaritone(client, connection(client), "goto " + stand.getX() + " " + stand.getY() + " " + stand.getZ());
+            }
             return;
         }
-        if (clientTick - lastSleepAttempt < 100) {
+        if (activeTask != null) {
             return;
         }
-        lastSleepAttempt = clientTick;
-        if (bed != null && player.getEyePosition().distanceToSqr(Vec3.atCenterOf(bed)) <= 20.25) {
+        // No bed, so no sleep: pick the most useful job that can be done at home.
+        var inventory = WorldProbe.inventory(player);
+        ProgressPlanner.Facts facts = facts(client);
+        java.util.Optional<NeedsPlanner.Task> job = NeedsPlanner.homeTask(inventory, situation(client, facts));
+        if (job.isPresent()) {
+            nightJob = true;
+            activeTask = job.get().goal();
+            goalReason = "night, no bed: " + job.get().why();
+            ActionableLog.LOGGER.info("[Actionable] night_job goal={} why={} situation={}",
+                    ActionableLog.text(activeTask), ActionableLog.text(job.get().why()),
+                    ActionableLog.text(NeedsPlanner.report(inventory, situation(client, facts))));
+            tell(client, "Night job: " + activeTask + " (" + job.get().why() + ")");
+            beginTask(client, activeTask);
+            return;
+        }
+        goalReason = "night, no bed, nothing useful to do at home: waiting inside";
+        currentGoal = "Waiting inside until morning";
+        if (clientTick - lastSleepAttempt >= 100) {
+            lastSleepAttempt = clientTick;
+            if (!baritoneBusy(client) && player.blockPosition().distSqr(stand) > 2) {
+                executeBaritone(client, connection(client), "goto " + stand.getX() + " " + stand.getY() + " " + stand.getZ());
+            }
+        }
+    }
+
+    private NeedsPlanner.Situation situation(Minecraft client, ProgressPlanner.Facts facts) {
+        boolean night = client.level != null && client.level.isDarkOutside();
+        boolean furnaceWaiting = furnaceReadyAt > 0 && clientTick >= furnaceReadyAt;
+        boolean strays = home != null && client.level != null && !WorldProbe.strayDoors(client.level, home).isEmpty();
+        return new NeedsPlanner.Situation(facts, night, furnaceWaiting, clientTick >= mineRestUntil, strays);
+    }
+
+    /** Walks to the furnace if needed, then opens it to collect and load. True when something started. */
+    private boolean startSmelt(Minecraft client, net.minecraft.client.multiplayer.ClientPacketListener connection) {
+        var player = java.util.Objects.requireNonNull(client.player);
+        BlockPos stand = homeCell(HouseDesign.DOOR_STAND);
+        lastAction = NeedsPlanner.SMELT;
+        if (player.blockPosition().distSqr(stand) > 1) {
+            executeBaritone(client, connection, "goto " + stand.getX() + " " + stand.getY() + " " + stand.getZ());
+            lastAction = NeedsPlanner.SMELT;
+            lastResult = "Walking to the house furnace";
+            ticksUntilPlan = 200;
+            return true;
+        }
+        stopBaritone(client);
+        Smelter.Start start = Smelter.start(client, homeCell(HouseDesign.FURNACE_CELL), clientTick);
+        if (start.smelter() == null) {
+            lastResult = start.result();
+            reportBlockResult(client);
+            ticksUntilPlan = 20;
+            return true;
+        }
+        pendingSmelt = start.smelter();
+        lastResult = "Using the house furnace";
+        return true;
+    }
+
+    /**
+     * Eats when hungry, or when hurt and not full: health only regenerates on a high hunger bar. Stops
+     * Baritone, waits a moment for it to release the keys (it held them and cancelled every bite
+     * before), then holds use until the hunger bar actually rises. A failed attempt waits ten seconds.
+     */
+    private void tickEat(Minecraft client) {
+        var player = client.player;
+        if (player == null || client.gameMode == null) {
+            return;
+        }
+        if (eatPhase == 1) {
+            if (clientTick - eatStartedAt < 6) {
+                return;
+            }
+            // Food lives in its own hotbar slot; put it there and hold it.
+            moveToHotbar(client, eatItem, InventoryLayout.FOOD_SLOT);
+            player.getInventory().setSelectedSlot(InventoryLayout.FOOD_SLOT);
+            eatPhase = 2;
+            eatStartedAt = clientTick;
+            return;
+        }
+        if (eatPhase == 2) {
+            String held = BuiltInRegistries.ITEM.getKey(player.getMainHandItem().getItem()).toString();
+            if (!held.equals(eatItem)) {
+                if (clientTick - eatStartedAt > 10) {
+                    ActionableLog.LOGGER.info("[Actionable] eat_problem wanted={} in_hand={} slot={}",
+                            ActionableLog.text(eatItem), ActionableLog.text(held), player.getInventory().getSelectedSlot());
+                    endEat(client, false);
+                }
+                player.getInventory().setSelectedSlot(InventoryLayout.FOOD_SLOT);
+                return;
+            }
+            // Press and hold the real use key, exactly like a player, so the game runs the eating.
+            com.mojang.blaze3d.platform.InputConstants.Key use =
+                    com.mojang.blaze3d.platform.InputConstants.getKey(client.options.keyUse.saveString());
+            KeyMapping.set(use, true);
+            if (!player.isUsingItem()) {
+                long waited = clientTick - eatStartedAt;
+                if (waited % 10 == 0) {
+                    KeyMapping.click(use);
+                }
+                if (waited % 10 == 5) {
+                    client.gameMode.useItem(player, InteractionHand.MAIN_HAND);
+                }
+            }
+            if (player.getFoodData().getFoodLevel() > eatFoodBefore) {
+                endEat(client, true);
+            } else if (clientTick - eatStartedAt > 80) {
+                ActionableLog.LOGGER.info("[Actionable] eat_problem wanted={} in_hand={} using={} remaining_ticks={}",
+                        ActionableLog.text(eatItem), ActionableLog.text(held), player.isUsingItem(),
+                        player.getUseItemRemainingTicks());
+                endEat(client, false);
+            }
+            return;
+        }
+        if (!enabled || clientTick % 20 != 0 || clientTick < eatBackoffUntil || defending || pendingCraft != null
+                || pendingSmelt != null || pendingBreak != null || player.containerMenu != player.inventoryMenu
+                || !FoodPlan.shouldEat(player.getFoodData().getFoodLevel(), player.getHealth(), player.getMaxHealth())) {
+            return;
+        }
+        java.util.Optional<String> food = FoodPlan.pick(WorldProbe.inventory(player), player.getFoodData().getFoodLevel());
+        if (food.isEmpty()) {
+            return;
+        }
+        eatResume = baritoneCommandRunning ? currentBaritoneCommand : null;
+        String pending = pendingMine;
+        stopBaritone(client);
+        pendingMine = pending;
+        eatItem = food.get();
+        eatFoodBefore = player.getFoodData().getFoodLevel();
+        eatPhase = 1;
+        eatStartedAt = clientTick;
+        tell(client, "Eating " + eatItem);
+    }
+
+    private void endEat(Minecraft client, boolean ate) {
+        KeyMapping.set(com.mojang.blaze3d.platform.InputConstants.getKey(client.options.keyUse.saveString()), false);
+        client.options.keyUse.setDown(false);
+        eatPhase = 0;
+        int food = client.player == null ? 0 : client.player.getFoodData().getFoodLevel();
+        ActionableLog.LOGGER.info("[Actionable] eat item={} ok={} food={}->{}", ActionableLog.text(eatItem), ate,
+                eatFoodBefore, food);
+        if (!ate) {
+            eatBackoffUntil = clientTick + 200;
+        }
+        if (eatResume != null && client.getConnection() != null) {
+            executeBaritone(client, client.getConnection(), eatResume);
+        }
+        eatResume = null;
+    }
+
+    /**
+     * Keeps the hotbar laid out: best pickaxe, axe and shovel first (Baritone only uses hotbar tools),
+     * food in slot 7 and the best weapon in slot 8, swapping each in from wherever it is.
+     */
+    private void arrangeHotbar(Minecraft client) {
+        var player = client.player;
+        if (player == null || client.gameMode == null || player.containerMenu != player.inventoryMenu) {
+            return;
+        }
+        for (var entry : InventoryLayout.plan(WorldProbe.inventory(player)).entrySet()) {
+            moveToHotbar(client, entry.getValue(), entry.getKey());
+        }
+    }
+
+    /** Swaps an item into a hotbar slot unless it is already there. False when the item is not held. */
+    private boolean moveToHotbar(Minecraft client, String item, int hotbarSlot) {
+        var player = java.util.Objects.requireNonNull(client.player);
+        if (itemId(player.getInventory().getItem(hotbarSlot)).equals(item)) {
+            return true;
+        }
+        for (int slot = 0; slot < InventoryMenu.INV_SLOT_END; slot++) {
+            if (slot == hotbarSlot || !itemId(player.getInventory().getItem(slot)).equals(item)) {
+                continue;
+            }
+            // Inventory indexes 9-35 are the same slot numbers in the inventory menu; hotbar 0-8 are 36-44.
+            int menuSlot = slot < 9 ? InventoryMenu.USE_ROW_SLOT_START + slot : slot;
+            java.util.Objects.requireNonNull(client.gameMode).handleContainerInput(player.inventoryMenu.containerId,
+                    menuSlot, hotbarSlot, ContainerInput.SWAP, player);
+            return true;
+        }
+        return false;
+    }
+
+    private static String itemId(ItemStack stack) {
+        return stack.isEmpty() ? "" : BuiltInRegistries.ITEM.getKey(stack.getItem()).toString();
+    }
+
+    private void tickSmelt(Minecraft client) {
+        if (pendingSmelt == null || defending) {
+            return;
+        }
+        if (!enabled) {
+            cancelSmelt(client);
+            return;
+        }
+        long[] loaded = {0};
+        String result = pendingSmelt.tick(client, clientTick, count -> loaded[0] = count);
+        if (result == null) {
+            return;
+        }
+        pendingSmelt = null;
+        lastAction = NeedsPlanner.SMELT;
+        lastResult = result;
+        reportBlockResult(client);
+        remember(lastAction, lastResult);
+        ActionableLog.LOGGER.info("[Actionable] smelt {}", ActionableLog.text(result));
+        furnaceReadyAt = 0;
+        if (!result.startsWith("SMELTED")) {
+            // No fuel or the furnace would not open: do something else for a while.
+            smeltCooldownUntil = clientTick + 2400;
+        }
+        if (!taskSteps.isEmpty() && taskSteps.get(currentStep).equalsIgnoreCase(NeedsPlanner.SMELT)) {
+            advanceStep(client, NeedsPlanner.SMELT);
+            return;
+        }
+        ticksUntilPlan = 1;
+    }
+
+    private void tickStairs(Minecraft client) {
+        if (pendingStairs == null || defending || eatPhase != 0) {
+            return;
+        }
+        var connection = client.getConnection();
+        if (!enabled || connection == null) {
+            cancelHomeWork(client);
+            return;
+        }
+        String result = pendingStairs.tick(client, clientTick,
+                command -> executeBaritone(client, connection, command), () -> stopBaritone(client));
+        if (result == null) {
+            return;
+        }
+        pendingStairs = null;
+        lastAction = "dig house mine";
+        lastResult = result;
+        reportBlockResult(client);
+        remember(lastAction, lastResult);
+        ActionableLog.LOGGER.info("[Actionable] house_mine {}", ActionableLog.text(result));
+        if (morningPending) {
+            morningPending = false;
+            activeTask = null;
+            taskSteps = java.util.List.of();
+            currentGoal = "Idle";
+            tell(client, "Morning: out of the mine, back to work.");
+            ticksUntilGoal = 20;
+            return;
+        }
+        if (result.startsWith("MINE_STOPPED_HEALTH") || result.startsWith("MINE_STOPPED_INVENTORY_FULL")
+                || result.startsWith("MINE_STOPPED_TIMEOUT")) {
+            // Rest from the mine for two minutes; other home jobs (or waiting) come first.
+            mineRestUntil = clientTick + 2400;
+            activeTask = null;
+            taskSteps = java.util.List.of();
+            nightJob = false;
+            return;
+        }
+        ticksUntilPlan = 1;
+    }
+
+    private void cancelSmelt(Minecraft client) {
+        if (pendingSmelt != null) {
+            pendingSmelt = null;
+            if (client.player != null && client.player.containerMenu != client.player.inventoryMenu) {
+                client.player.closeContainer();
+            }
+        }
+    }
+
+    /** Stops furnace and house-mine work immediately (pause, defense of the task, abandon). */
+    private void cancelHomeWork(Minecraft client) {
+        cancelSmelt(client);
+        if (pendingStairs != null) {
+            pendingStairs = null;
             stopBaritone(client);
-            lastAction = "sleep";
-            lastResult = MenuActions.useBlock(client, bed.getX(), bed.getY(), bed.getZ());
-            tell(client, "Trying to sleep.");
-        } else if (!baritoneCommandRunning && player.blockPosition().distSqr(stand) > 2) {
-            executeBaritone(client, connection(client), "goto " + stand.getX() + " " + stand.getY() + " " + stand.getZ());
         }
+        morningPending = false;
     }
 
     private static net.minecraft.client.multiplayer.ClientPacketListener connection(Minecraft client) {
@@ -1685,7 +2160,10 @@ public final class ActionableClient implements ClientModInitializer {
             }
             return;
         }
-        if (escaping || retreating || nightRoutine || defending
+        // Hunting may travel as far as it takes to find sheep and food; anything else stays near home.
+        boolean hunting = pendingHunt != null || (!taskSteps.isEmpty() && (taskSteps.get(currentStep).startsWith("hunt ")
+                || taskSteps.get(currentStep).equalsIgnoreCase(ProgressPlanner.GATHER_FOOD)));
+        if (escaping || retreating || nightRoutine || defending || hunting
                 || !HomeRange.outside(anchor, geared, player.getBlockX(), player.getBlockZ(), HomeRange.LEASH_SLACK)) {
             return;
         }
@@ -1720,7 +2198,8 @@ public final class ActionableClient implements ClientModInitializer {
         }
         boolean working = pendingMine != null || baritoneBusy(client);
         // Finding sheep can take several walks around home, so hunting gets more restarts.
-        int limit = step.startsWith("hunt ") ? Recovery.DIRECT_RESENDS + 3 : Recovery.DIRECT_RESENDS;
+        boolean hunt = step.startsWith("hunt ") || step.equalsIgnoreCase(ProgressPlanner.GATHER_FOOD);
+        int limit = hunt ? Recovery.HUNT_RESENDS : Recovery.DIRECT_RESENDS;
         // Walking and placing should get closer within 30 seconds; gathering can take longer between items.
         int stall = ProgressPlanner.parse(step).isPresent() ? Recovery.DIRECT_STALL_TICKS : Recovery.WALK_STALL_TICKS;
         Recovery.DirectMine decision = Recovery.directMine(working, clientTick - directProgressAt, directResends, limit,
@@ -1844,8 +2323,8 @@ public final class ActionableClient implements ClientModInitializer {
         sites.removeIf(site -> HomeRange.outside(anchor, geared, site.x(), site.z(), 0));
         if (sites.isEmpty() && anchor != null && !geared) {
             // Baritone's mine would roam unbounded to find more; look around near home instead.
-            int[] target = HomeRange.wanderTarget(anchor, wanderAttempts++);
-            executeBaritone(client, connection, "goto " + target[0] + " " + target[1] + " " + target[2]);
+            int[] target = HomeRange.searchTarget(anchor, wanderAttempts++, HomeRange.RADIUS);
+            executeBaritone(client, connection, HomeRange.surfaceGoto(target));
             pendingMine = mine;
             pendingMineSince = clientTick;
             lastAction = mine;
@@ -1970,7 +2449,8 @@ public final class ActionableClient implements ClientModInitializer {
             }
             return;
         }
-        if (!safety.retreat() || escaping || defending || HouseDesign.nearHouse(home, x, y, z)) {
+        if (!safety.retreat() || escaping || defending || HouseDesign.nearHouse(home, x, y, z)
+                || (home != null && StairMine.onStairs(x - home[0], y - home[1], z - home[2]))) {
             return;
         }
         avoidAreas.addLast(new int[] {x, y, z});
@@ -2005,7 +2485,9 @@ public final class ActionableClient implements ClientModInitializer {
                 || step.equalsIgnoreCase(ProgressPlanner.PLACE_TABLE_IN_HOUSE)
                 || step.equalsIgnoreCase(ProgressPlanner.PLACE_DOOR)
                 || step.equalsIgnoreCase(ProgressPlanner.GO_HOME)
-                || step.equalsIgnoreCase(ProgressPlanner.LAY_FLOOR);
+                || step.equalsIgnoreCase(ProgressPlanner.LAY_FLOOR)
+                || step.equalsIgnoreCase(NeedsPlanner.PLACE_FURNACE)
+                || step.equalsIgnoreCase(ProgressPlanner.GATHER_FOOD);
         if ((ProgressPlanner.parse(step).isPresent() || worldStep) && ProgressPlanner.stepSatisfied(step,
                 WorldProbe.inventory(client.player), false, facts(client)).orElse(false)) {
             advanceStep(client, step);
@@ -2017,14 +2499,25 @@ public final class ActionableClient implements ClientModInitializer {
         if (!baritoneCommandRunning || !currentBaritoneCommand.startsWith("goto ") || client.player == null) {
             return -1;
         }
-        String[] parts = currentBaritoneCommand.split("\\s+");
-        if (parts.length != 4) {
+        return gotoRemaining(currentBaritoneCommand, client.player.blockPosition());
+    }
+
+    /** Distance left to a goto goal; a column-only goto ("goto x z") counts sideways distance only. */
+    private static double gotoRemaining(String command, BlockPos current) {
+        String[] parts = command.split("\\s+");
+        try {
+            if (parts.length == 3) {
+                return Math.hypot(Integer.parseInt(parts[1]) - current.getX(), Integer.parseInt(parts[2]) - current.getZ());
+            }
+            if (parts.length == 4) {
+                return Math.sqrt(Math.pow(Integer.parseInt(parts[1]) - current.getX(), 2)
+                        + Math.pow(Integer.parseInt(parts[2]) - current.getY(), 2)
+                        + Math.pow(Integer.parseInt(parts[3]) - current.getZ(), 2));
+            }
+        } catch (NumberFormatException ignored) {
             return -1;
         }
-        BlockPos current = client.player.blockPosition();
-        return Math.sqrt(Math.pow(Integer.parseInt(parts[1]) - current.getX(), 2)
-                + Math.pow(Integer.parseInt(parts[2]) - current.getY(), 2)
-                + Math.pow(Integer.parseInt(parts[3]) - current.getZ(), 2));
+        return -1;
     }
 
     private void toggle(Minecraft client) {
@@ -2036,6 +2529,7 @@ public final class ActionableClient implements ClientModInitializer {
         planning = false;
         cancelCraft(client);
         cancelBreak(client);
+        cancelHomeWork(client);
         tell(client, "Actionable " + (enabled ? "enabled." : "disabled."));
         var connection = client.getConnection();
         if (!enabled && client.player != null && connection != null
@@ -2144,19 +2638,9 @@ public final class ActionableClient implements ClientModInitializer {
                 .append(",distance_moved_blocks=").append(String.format(java.util.Locale.ROOT, "%.1f", moved))
                 .append(",seconds_since_movement=").append(idleTicks / 20);
         if (currentBaritoneCommand.startsWith("goto ") && current != null) {
-            String[] parts = currentBaritoneCommand.split("\\s+");
-            if (parts.length == 4) {
-                try {
-                    double distance = Math.sqrt(
-                            Math.pow(Integer.parseInt(parts[1]) - current.getX(), 2)
-                                    + Math.pow(Integer.parseInt(parts[2]) - current.getY(), 2)
-                                    + Math.pow(Integer.parseInt(parts[3]) - current.getZ(), 2));
-                    progress.append(",distance_to_goto_goal=")
-                            .append(String.format(java.util.Locale.ROOT, "%.1f", distance));
-                } catch (NumberFormatException ignored) {
-                    progress.append(",distance_to_goto_goal=unknown");
-                }
-            }
+            double distance = gotoRemaining(currentBaritoneCommand, current);
+            progress.append(",distance_to_goto_goal=").append(distance < 0 ? "unknown"
+                    : String.format(java.util.Locale.ROOT, "%.1f", distance));
         }
         return progress.append('}').toString();
     }
@@ -2328,8 +2812,9 @@ public final class ActionableClient implements ClientModInitializer {
                     ItemStack stack = player.getInventory().getItem(inventorySlot);
                     if (!stack.isEmpty() && stack.is(blockItem)) {
                         int selectedSlot = player.getInventory().getSelectedSlot();
-                        gameMode.handleContainerInput(inventorySlot, selectedSlot,
-                                player.inventoryMenu.containerId, ContainerInput.SWAP, player);
+                        // Arguments are (container, slot, button); they were swapped, so the swap never happened.
+                        gameMode.handleContainerInput(player.inventoryMenu.containerId, inventorySlot, selectedSlot,
+                                ContainerInput.SWAP, player);
                         hotbarSlot = selectedSlot;
                         break;
                     }

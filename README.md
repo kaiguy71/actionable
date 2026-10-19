@@ -83,6 +83,19 @@ The director and decomposer get a progression briefing built from a curated tech
 The milestones are: wooden pickaxe, stone pickaxe, stone sword, 16 torches, furnace, then 12 raw iron.
 Each is skipped once the inventory satisfies it.
 
+### Early game and nights
+
+The first goals are a fixed checklist run by code: 20 logs, a 5x5 house (Baritone builds it from a
+generated schematic), a solid dry floor, a crafting table and a door inside, a wooden sword and pickaxe,
+3 white wool from sheep, and a bed. The house corner is saved per world in `config/actionable-homes.json`.
+Until it holds a stone pickaxe and stone sword, the player stays within 64 blocks of home.
+
+At night, a player with a bed sleeps. Without one it works from home, picking the most useful job it can
+do without leaving: hang the door, place the table, craft tools, build and use a furnace, or dig the
+staircase mine that starts inside the house (cobblestone first, then iron, down to y=16). The mine stops
+and the player climbs out on a cave, water, lava, low health or food, or a full inventory. The briefing
+includes a Situation line with what the player has, needs and can do now.
+
 Several decisions are made in code rather than by the model, because `gemma3:4b` was measured failing them:
 
 - **Survival.** Healthy players automatically defend against hostile mobs already within melee reach,

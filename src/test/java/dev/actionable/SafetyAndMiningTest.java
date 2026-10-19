@@ -23,7 +23,7 @@ class SafetyAndMiningTest {
         SafetyAssessment.Result result = assess(0, false, 20, false, Map.of());
         assertEquals(SafetyAssessment.Level.DANGER, result.level());
         assertTrue(result.retreat());
-        assertEquals(List.of("pickaxe", "weapon", "4+ torches"), result.missingForCaves());
+        assertEquals(List.of("pickaxe", "weapon"), result.missingForCaves());
         assertTrue(result.describe().contains("level=danger"));
         assertTrue(result.describe().contains("cave_ready=false"));
     }
@@ -156,5 +156,16 @@ class SafetyAndMiningTest {
         SafetyAssessment.Result home = assess(0, false, 0, true, Map.of());
         assertFalse(home.retreat());
         assertFalse(home.underground());
+    }
+
+    @Test
+    void coalCanBeMinedWithAPickaxeAndWeaponBeforeHavingTorches() {
+        // The old rule wanted 4 torches for caves, and torches need coal from caves: a loop with no way out.
+        Map<String, Integer> kit = Map.of("minecraft:stone_pickaxe", 1, "minecraft:stone_sword", 1);
+        SafetyAssessment.Result cave = assess(0, false, 12, false, kit);
+        assertTrue(cave.caveReady());
+        assertFalse(cave.retreat());
+        assertTrue(cave.reasons().stream().anyMatch(reason -> reason.contains("torches would help")));
+        assertTrue(MiningPolicy.safe(site(0, 50, 0, 0, false, 12, 5), cave.caveReady()));
     }
 }

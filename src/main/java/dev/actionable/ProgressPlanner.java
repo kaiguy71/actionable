@@ -22,6 +22,8 @@ final class ProgressPlanner {
     static final String PLACE_DOOR = "place door in house";
     static final String GO_HOME = "go to house";
     static final String LAY_FLOOR = "lay house floor";
+    static final String GATHER_FOOD = "gather food";
+    private static final Pattern HOUSE_MINE = Pattern.compile("^dig house mine for (\\d{1,4}) ([a-z0-9_.-]+:[a-z0-9_./-]+)$");
     /** Planks kept for filling holes and water in the floor; the floor has 11 cells. */
     static final int FLOOR_PLANKS = 12;
     /** The house needs this many planks, plus a few spare for the bed and a crafting table. */
@@ -33,8 +35,8 @@ final class ProgressPlanner {
 
     /** Progress that lives in the world rather than the inventory. */
     record Facts(boolean houseBuilt, boolean bedPlaced, boolean tableInHouse, boolean doorPlaced, boolean atHome,
-            boolean floorReady) {
-        static final Facts NONE = new Facts(false, false, false, false, false, false);
+            boolean floorReady, boolean furnaceInHouse, boolean mineFinished) {
+        static final Facts NONE = new Facts(false, false, false, false, false, false, false, false);
 
         Facts(boolean houseBuilt, boolean bedPlaced) {
             this(houseBuilt, bedPlaced, false, false, false, houseBuilt);
@@ -44,10 +46,15 @@ final class ProgressPlanner {
         Facts(boolean houseBuilt, boolean bedPlaced, boolean tableInHouse, boolean doorPlaced, boolean atHome) {
             this(houseBuilt, bedPlaced, tableInHouse, doorPlaced, atHome, houseBuilt);
         }
+
+        Facts(boolean houseBuilt, boolean bedPlaced, boolean tableInHouse, boolean doorPlaced, boolean atHome,
+                boolean floorReady) {
+            this(houseBuilt, bedPlaced, tableInHouse, doorPlaced, atHome, floorReady, false, false);
+        }
     }
 
     /** HOLD milestones are inventory targets; the others are checked in the world. */
-    enum Kind { HOLD, HOUSE, FLOOR, TABLE, DOOR, BED }
+    enum Kind { HOLD, HOUSE, FLOOR, TABLE, DOOR, BED, FOOD, FURNACE }
 
     record Milestone(String item, int count, String why, Kind kind) {
         Milestone(String item, int count, String why) {
@@ -62,6 +69,8 @@ final class ProgressPlanner {
                 case TABLE -> PLACE_TABLE_IN_HOUSE;
                 case DOOR -> PLACE_DOOR;
                 case BED -> PLACE_BED;
+                case FOOD -> GATHER_FOOD;
+                case FURNACE -> NeedsPlanner.PLACE_FURNACE;
                 case HOLD -> TechTree.recipeFor(item).isPresent() ? "craft " + count + " " + item
                         : TechTree.huntedFrom(item).isPresent() ? "hunt " + count + " " + item
                         : "mine " + count + " " + TechTree.blockToMine(item);
@@ -70,12 +79,12 @@ final class ProgressPlanner {
     }
 
     /**
-     * Early milestones are chosen in code, in order, without asking the director. It is a checklist:
+     * Early milestones are chosen in code, in order, without asking the director (see isFoundation). It is a checklist:
      * wood, house, crafting table in the house, door, wooden sword, wooden pickaxe, then sheep for wool
      * and a bed. The model kept racing to cobblestone and coal before it had any shelter, and went after
      * sheep bare-handed.
      */
-    static final int FOUNDATION_MILESTONES = 9;
+    static final int FOUNDATION_MILESTONES = 10;
 
     static final List<Milestone> MILESTONES = List.of(
             new Milestone("minecraft:oak_log", 20,
@@ -96,6 +105,7 @@ final class ProgressPlanner {
                     "a sword before hunting: sheep die faster and you can defend yourself"),
             new Milestone("minecraft:wooden_pickaxe", 1,
                     "stone, coal and every ore drop nothing without a pickaxe; this unlocks cobblestone and coal"),
+            new Milestone("minecraft:wooden_axe", 1, "chops trees faster and is a second weapon"),
             new Milestone(TechTree.WHITE_WOOL, 3,
                     "kill white sheep: 3 white wool + 3 planks make a bed, and sheep drop mutton for food"),
             new Milestone(TechTree.WHITE_BED, 1,
@@ -104,10 +114,13 @@ final class ProgressPlanner {
                     "needed to mine iron ore, and mines stone faster"),
             new Milestone("minecraft:stone_sword", 1,
                     "a weapon makes nights and caves survivable"),
+            new Milestone("food", FoodPlan.STOCK_WANTED,
+                    "health only regenerates when fed; carry food before heading out to mine", Kind.FOOD),
+            new Milestone("furnace", 1,
+                    "a furnace in the house cooks meat and smelts ore; coal is only useful once there is one",
+                    Kind.FURNACE),
             new Milestone("minecraft:torch", 16,
-                    "torches light caves; without them going underground is unsafe"),
-            new Milestone("minecraft:furnace", 1,
-                    "a furnace is required to turn raw iron into ingots"),
+                    "coal for torches and furnace fuel, now that there is a furnace and food", Kind.HOLD),
             new Milestone("minecraft:raw_iron", 12,
                     "iron tools and armor need iron; stockpile raw iron for smelting"));
 
@@ -131,6 +144,12 @@ final class ProgressPlanner {
             }
             case BED -> {
                 return facts.bedPlaced();
+            }
+            case FOOD -> {
+                return FoodPlan.stock(inventory) >= milestone.count();
+            }
+            case FURNACE -> {
+                return facts.furnaceInHouse();
             }
             default -> {
             }
@@ -162,11 +181,55 @@ final class ProgressPlanner {
     }
 
     static Optional<Milestone> nextMilestone(Map<String, Integer> inventory, Facts facts) {
-        return MILESTONES.stream().filter(milestone -> !satisfied(milestone, inventory, facts)).findFirst();
+        return ordered(inventory).stream().filter(milestone -> !satisfied(milestone, inventory, facts)).findFirst();
     }
 
+    /**
+     * The milestone order for this inventory. Coal normally waits until there is food and a furnace;
+     * holding raw ore that needs smelting moves it up, right after the stone tools.
+     */
+    static List<Milestone> ordered(Map<String, Integer> inventory) {
+        if (!holdsRawOre(inventory)) {
+            return MILESTONES;
+        }
+        List<Milestone> order = new ArrayList<>(MILESTONES);
+        Milestone coal = order.stream().filter(m -> m.item().equals("minecraft:torch")).findFirst().orElseThrow();
+        order.remove(coal);
+        int food = order.indexOf(order.stream().filter(m -> m.kind() == Kind.FOOD).findFirst().orElseThrow());
+        order.add(food, coal);
+        return List.copyOf(order);
+    }
+
+    static boolean holdsRawOre(Map<String, Integer> inventory) {
+        return inventory.getOrDefault("minecraft:raw_iron", 0) > 0 || inventory.getOrDefault("minecraft:raw_gold", 0) > 0
+                || inventory.getOrDefault("minecraft:raw_copper", 0) > 0;
+    }
+
+    /**
+     * Why a coal or torch goal is premature, or empty when it is fine: coal is for smelting and
+     * torches, so it waits until there is a furnace and food, unless raw ore is waiting to be smelted.
+     */
+    static Optional<String> coalTooEarly(String goal, Map<String, Integer> inventory, Facts facts) {
+        String text = goal.toLowerCase(Locale.ROOT);
+        boolean coal = text.contains("coal") || text.contains("torch");
+        if (!coal || holdsRawOre(inventory)) {
+            return Optional.empty();
+        }
+        List<String> missing = new ArrayList<>();
+        if (!facts.furnaceInHouse()) {
+            missing.add("a furnace in the house");
+        }
+        if (FoodPlan.stock(inventory) < FoodPlan.STOCK_WANTED) {
+            missing.add("food (" + FoodPlan.stock(inventory) + "/" + FoodPlan.STOCK_WANTED + " hunger points)");
+        }
+        return missing.isEmpty() ? Optional.empty()
+                : Optional.of("coal waits until there is " + String.join(" and ", missing)
+                + ", unless raw ore needs smelting");
+    }
+
+    /** Every milestone up to coal is run by code, in order; the director takes over after that. */
     static boolean isFoundation(Milestone milestone) {
-        return MILESTONES.indexOf(milestone) < FOUNDATION_MILESTONES;
+        return !milestone.item().equals("minecraft:raw_iron");
     }
 
     private static final Pattern LOOSE_STEP = Pattern.compile(
@@ -284,6 +347,21 @@ final class ProgressPlanner {
         if (facts != null && text.equalsIgnoreCase(LAY_FLOOR)) {
             return Optional.of(facts.floorReady());
         }
+        if (text.equalsIgnoreCase(GATHER_FOOD)) {
+            return Optional.of(FoodPlan.stock(inventory) >= FoodPlan.STOCK_WANTED);
+        }
+        if (facts != null && text.equalsIgnoreCase(NeedsPlanner.PLACE_FURNACE)) {
+            return Optional.of(facts.furnaceInHouse());
+        }
+        if (text.equalsIgnoreCase(NeedsPlanner.SMELT)) {
+            // Finished by the smelter itself when the furnace is loaded and emptied.
+            return Optional.of(false);
+        }
+        Matcher mine = HOUSE_MINE.matcher(text.toLowerCase(Locale.ROOT));
+        if (mine.matches()) {
+            return Optional.of((facts != null && facts.mineFinished())
+                    || TechTree.held(inventory, mine.group(2)) >= Integer.parseInt(mine.group(1)));
+        }
         if (PLACE_TABLE.matcher(text.toLowerCase(Locale.ROOT)).matches() && !text.endsWith("in house")) {
             return Optional.of(tableNearby);
         }
@@ -384,6 +462,21 @@ final class ProgressPlanner {
             steps.add(BUILD_HOUSE);
             return List.copyOf(steps);
         }
+        if (goal.strip().equalsIgnoreCase(GATHER_FOOD)) {
+            List<String> steps = new ArrayList<>(hasWeapon(inventory) ? List.of()
+                    : stepsFor("minecraft:wooden_sword", 1, inventory, table, log));
+            steps.add(GATHER_FOOD);
+            return List.copyOf(steps);
+        }
+        if (goal.strip().equalsIgnoreCase(NeedsPlanner.PLACE_FURNACE)) {
+            List<String> steps = new ArrayList<>(inventory.getOrDefault("minecraft:furnace", 0) > 0 ? List.of()
+                    : stepsFor("minecraft:furnace", 1, inventory, table, log));
+            steps.add(NeedsPlanner.PLACE_FURNACE);
+            return List.copyOf(steps);
+        }
+        if (goal.strip().equalsIgnoreCase(NeedsPlanner.SMELT) || HOUSE_MINE.matcher(goal.strip()).matches()) {
+            return List.of(goal.strip());
+        }
         if (goal.strip().equalsIgnoreCase(LAY_FLOOR)) {
             List<String> steps = new ArrayList<>(TechTree.count(inventory, TechTree.PLANKS) >= FLOOR_PLANKS ? List.of()
                     : stepsFor(TechTree.planksFor(log), FLOOR_PLANKS, inventory, table, log));
@@ -415,7 +508,14 @@ final class ProgressPlanner {
             steps.add(PLACE_BED);
             return List.copyOf(steps);
         }
-        return parse(goal)
+        Optional<QuantifiedStep> quantified = parse(goal);
+        if (quantified.isPresent() && quantified.get().verb().equals("hunt") && !hasWeapon(inventory)) {
+            // Never hunt bare-handed: make a wooden sword first.
+            List<String> steps = new ArrayList<>(stepsFor("minecraft:wooden_sword", 1, inventory, table, log));
+            steps.addAll(stepsFor(quantified.get().item(), quantified.get().count(), inventory, table, log));
+            return List.copyOf(steps);
+        }
+        return quantified
                 .map(parsed -> stepsFor(parsed.verb().equals("mine") ? TechTree.dropOf(TechTree.blockToMine(parsed.item()))
                         : parsed.item(), parsed.count(), inventory, table, preferredLog))
                 .orElse(List.of());
@@ -480,6 +580,10 @@ final class ProgressPlanner {
             text.append("\nGame progression (earliest unfinished stage first):\n").append(progression);
         }
         return text.toString();
+    }
+
+    static boolean hasWeapon(Map<String, Integer> inventory) {
+        return inventory.entrySet().stream().anyMatch(entry -> entry.getValue() > 0 && TechTree.isWeapon(entry.getKey()));
     }
 
     /** Tells the model where its crafting table is and that it is reused, never crafted twice. */

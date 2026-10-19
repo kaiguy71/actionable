@@ -56,7 +56,9 @@ final class WorldProbe {
         }
         // Dimensions without sky light (the Nether) have a bedrock roof, so depth below it means nothing.
         // Inside the house the roof hides the sky; that is shelter, not being underground.
-        int depth = level.dimensionType().hasSkyLight() && !HouseDesign.nearHouse(home, feet.getX(), feet.getY(), feet.getZ())
+        boolean sheltered = HouseDesign.nearHouse(home, feet.getX(), feet.getY(), feet.getZ()) || (home != null
+                && StairMine.onStairs(feet.getX() - home[0], feet.getY() - home[1], feet.getZ() - home[2]));
+        int depth = level.dimensionType().hasSkyLight() && !sheltered
                 ? Math.max(0, surfaceY(level, feet.getX(), feet.getZ()) - feet.getY()) : 0;
         return SafetyAssessment.assess(new SafetyAssessment.Inputs(light, level.canSeeSky(feet.above()),
                 depth, level.isDarkOutside(),
@@ -252,6 +254,41 @@ final class WorldProbe {
             }
         }
         return null;
+    }
+
+    static DoorRule.Probe doorProbe(ClientLevel level) {
+        return (x, y, z) -> {
+            BlockPos pos = new BlockPos(x, y, z);
+            var state = level.getBlockState(pos);
+            if (state.isAir()) {
+                return DoorRule.Cell.AIR;
+            }
+            if (state.getBlock() instanceof net.minecraft.world.level.block.DoorBlock) {
+                return DoorRule.Cell.DOOR;
+            }
+            return state.isCollisionShapeFullBlock(level, pos) ? DoorRule.Cell.SOLID : DoorRule.Cell.OTHER;
+        };
+    }
+
+    /**
+     * Doors in or around the house other than the one in the doorway, lower halves only. These were
+     * placed by mistake and are taken back.
+     */
+    static List<BlockPos> strayDoors(ClientLevel level, int[] home) {
+        List<BlockPos> doors = new ArrayList<>();
+        BlockPos doorway = new BlockPos(home[0] + HouseDesign.DOOR_CELL[0], home[1] + HouseDesign.DOOR_CELL[1],
+                home[2] + HouseDesign.DOOR_CELL[2]);
+        for (BlockPos pos : BlockPos.betweenClosed(new BlockPos(home[0] - 2, home[1] - 1, home[2] - 3),
+                new BlockPos(home[0] + HouseDesign.WIDTH + 1, home[1] + HouseDesign.HEIGHT, home[2] + HouseDesign.LENGTH + 1))) {
+            var state = level.getBlockState(pos);
+            if (state.getBlock() instanceof net.minecraft.world.level.block.DoorBlock
+                    && state.getValue(net.minecraft.world.level.block.DoorBlock.HALF)
+                            == net.minecraft.world.level.block.state.properties.DoubleBlockHalf.LOWER
+                    && !pos.equals(doorway)) {
+                doors.add(pos.immutable());
+            }
+        }
+        return doors;
     }
 
     /** True when any interior cell of the house holds a block matching {@code test}. */

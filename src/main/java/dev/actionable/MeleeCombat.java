@@ -106,6 +106,39 @@ final class MeleeCombat {
         return "ATTACK_SENT entity_id=" + entityId + "; observe target health before claiming damage or a kill";
     }
 
+    /**
+     * Moves the best sword or axe into the last hotbar slot when a better one is only in the main
+     * inventory. Attacks only look at the hotbar, so a crafted sword left in the inventory was never used.
+     */
+    static void ensureWeaponInHotbar(Minecraft client) {
+        var player = client.player;
+        if (player == null || client.gameMode == null || player.containerMenu != player.inventoryMenu) {
+            return;
+        }
+        int hotbarBest = 0;
+        for (int slot = 0; slot < 9; slot++) {
+            hotbarBest = Math.max(hotbarBest, weaponScore(id(player.getInventory().getItem(slot))));
+        }
+        int bestSlot = -1;
+        int bestScore = hotbarBest;
+        for (int slot = net.minecraft.world.inventory.InventoryMenu.INV_SLOT_START;
+                slot < net.minecraft.world.inventory.InventoryMenu.INV_SLOT_END; slot++) {
+            int score = weaponScore(id(player.getInventory().getItem(slot)));
+            if (score > bestScore) {
+                bestScore = score;
+                bestSlot = slot;
+            }
+        }
+        if (bestSlot >= 0) {
+            client.gameMode.handleContainerInput(player.inventoryMenu.containerId, bestSlot, 8,
+                    net.minecraft.world.inventory.ContainerInput.SWAP, player);
+        }
+    }
+
+    private static String id(net.minecraft.world.item.ItemStack stack) {
+        return BuiltInRegistries.ITEM.getKey(stack.getItem()).toString();
+    }
+
     static int weaponScore(String id) {
         if (!id.startsWith("minecraft:") || (!id.endsWith("_sword") && !id.endsWith("_axe"))) {
             return 0;

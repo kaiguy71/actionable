@@ -17,20 +17,25 @@ final class HouseDesign {
     static final int LENGTH = 5;
     static final String SCHEMATIC_FILE = "actionable_house.schem";
     /*
-     * Interior layout (x 1-3, z 1-3; doorway at x=2 in the north wall z=0):
-     *   z=1:  .  entry  .        z=2: bed-head bed-foot stand        z=3:  .  .  table
-     * The entry cell and stand cell stay free so the player can walk in and reach everything.
+     * Interior layout, looking down (x 1-3, z 1-3; doorway at x=2 in the north wall z=0):
+     *            x=1         x=2       x=3
+     *   z=1   bed stand    entry     stair top
+     *   z=2   bed foot     furnace   stair
+     *   z=3   bed head     table     stair
+     * The entry is where the player stands to use the table, furnace and bed; the east column is the
+     * staircase mine, which runs south under the wall and down.
      */
-    /** Interior cell where the player stands to place and use the bed and the crafting table. */
-    static final int[] BED_STAND = {3, 0, 2};
-    /** Bed foot cell; placed facing west from {@link #BED_STAND}, so the head lands at x=1. */
-    static final int[] BED_FOOT = {2, 0, 2};
-    /** The house's crafting table, reachable from {@link #BED_STAND}. */
-    static final int[] TABLE_CELL = {3, 0, 3};
+    /** Where the player stands to place the bed, which then faces south so its head is at z=3. */
+    static final int[] BED_STAND = {1, 0, 1};
+    static final int[] BED_FOOT = {1, 0, 2};
     /** Lower half of the door, in the doorway. */
     static final int[] DOOR_CELL = {2, 0, 0};
-    /** Just inside the doorway; the door is placed from here, facing out. */
+    /** Just inside the doorway: the door is placed from here, and the table, furnace and bed are used from here. */
     static final int[] DOOR_STAND = {2, 0, 1};
+    static final int[] TABLE_CELL = {2, 0, 3};
+    static final int[] FURNACE_CELL = {2, 0, 2};
+    /** Top of the staircase mine, at floor level. */
+    static final int[] STAIR_TOP = {3, 0, 1};
     /** A built house this complete counts as done; Baritone may leave a block or two to terrain. */
     static final double COMPLETE = 0.85;
 
@@ -47,7 +52,10 @@ final class HouseDesign {
         cells.add(new int[] {DOOR_CELL[0], -1, DOOR_CELL[2]});
         for (int z = 1; z < LENGTH - 1; z++) {
             for (int x = 1; x < WIDTH - 1; x++) {
-                cells.add(new int[] {x, -1, z});
+                // The staircase digs through the floor of its own column; those holes are meant to be there.
+                if (!StairMine.isStairCell(x, -1, z)) {
+                    cells.add(new int[] {x, -1, z});
+                }
             }
         }
         return cells;

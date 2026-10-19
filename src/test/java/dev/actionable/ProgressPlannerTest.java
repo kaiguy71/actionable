@@ -15,7 +15,7 @@ class ProgressPlannerTest {
 
     private static final ProgressPlanner.Facts SETTLED = new ProgressPlanner.Facts(true, true, true, true, false);
     private static final Map<String, Integer> BASIC_TOOLS = Map.of("minecraft:wooden_sword", 1,
-            "minecraft:wooden_pickaxe", 1);
+            "minecraft:wooden_pickaxe", 1, "minecraft:wooden_axe", 1);
 
     @Test
     void emptyInventoryStartsWithWood() {
@@ -40,6 +40,8 @@ class ProgressPlannerTest {
         assertEquals("craft 1 minecraft:wooden_sword", ProgressPlanner.nextMilestone(Map.of(), door).orElseThrow().goal());
         assertEquals("craft 1 minecraft:wooden_pickaxe",
                 ProgressPlanner.nextMilestone(Map.of("minecraft:wooden_sword", 1), door).orElseThrow().goal());
+        assertEquals("craft 1 minecraft:wooden_axe", ProgressPlanner.nextMilestone(
+                Map.of("minecraft:wooden_sword", 1, "minecraft:wooden_pickaxe", 1), door).orElseThrow().goal());
         assertEquals("hunt 3 minecraft:white_wool", ProgressPlanner.nextMilestone(BASIC_TOOLS, door).orElseThrow().goal(),
                 "sheep are hunted only once a sword is in hand");
         Map<String, Integer> wool = new java.util.HashMap<>(BASIC_TOOLS);
@@ -47,7 +49,7 @@ class ProgressPlannerTest {
         assertEquals("place minecraft:white_bed in house", ProgressPlanner.nextMilestone(wool, door).orElseThrow().goal());
         ProgressPlanner.Milestone next = ProgressPlanner.nextMilestone(BASIC_TOOLS, SETTLED).orElseThrow();
         assertEquals("craft 1 minecraft:stone_pickaxe", next.goal());
-        assertFalse(ProgressPlanner.isFoundation(next), "stone tools are chosen by the director, not forced");
+        assertTrue(ProgressPlanner.isFoundation(next), "stone tools, food, furnace and coal are run by code too");
     }
 
     @Test
@@ -115,14 +117,19 @@ class ProgressPlannerTest {
         assertEquals("minecraft:stone_pickaxe",
                 ProgressPlanner.nextMilestone(BASIC_TOOLS, SETTLED).orElseThrow().item());
         assertEquals("minecraft:stone_sword", ProgressPlanner.nextMilestone(
-                Map.of("minecraft:stone_pickaxe", 1, "minecraft:wooden_sword", 1), SETTLED).orElseThrow().item());
-        assertEquals("minecraft:torch", ProgressPlanner.nextMilestone(
-                Map.of("minecraft:stone_pickaxe", 1, "minecraft:stone_sword", 1), SETTLED).orElseThrow().item());
+                Map.of("minecraft:stone_pickaxe", 1, "minecraft:wooden_sword", 1, "minecraft:wooden_axe", 1), SETTLED)
+                .orElseThrow().item());
+        assertEquals("gather food", ProgressPlanner.nextMilestone(
+                Map.of("minecraft:stone_pickaxe", 1, "minecraft:stone_sword", 1, "minecraft:wooden_axe", 1), SETTLED)
+                .orElseThrow().goal(), "food comes before coal");
+        ProgressPlanner.Facts furnace = new ProgressPlanner.Facts(true, true, true, true, false, true, true, false);
         ProgressPlanner.Milestone iron = ProgressPlanner.nextMilestone(Map.of("minecraft:iron_pickaxe", 1,
-                "minecraft:iron_sword", 1, "minecraft:torch", 20, "minecraft:furnace", 1), SETTLED).orElseThrow();
+                "minecraft:iron_sword", 1, "minecraft:torch", 20, "minecraft:cooked_beef", 3, "minecraft:wooden_axe", 1),
+                furnace).orElseThrow();
         assertEquals("mine 12 minecraft:iron_ore", iron.goal());
         assertTrue(ProgressPlanner.nextMilestone(Map.of("minecraft:iron_pickaxe", 1, "minecraft:iron_sword", 1,
-                "minecraft:torch", 20, "minecraft:furnace", 1, "minecraft:raw_iron", 12), SETTLED).isEmpty());
+                "minecraft:torch", 20, "minecraft:cooked_beef", 3, "minecraft:raw_iron", 12, "minecraft:wooden_axe", 1),
+                furnace).isEmpty());
     }
 
     @Test
@@ -386,5 +393,65 @@ class ProgressPlannerTest {
         assertEquals(Optional.of(true), ProgressPlanner.stepSatisfied("lay house floor", Map.of(), false, dry));
         assertEquals("place minecraft:crafting_table in house",
                 ProgressPlanner.nextMilestone(Map.of(), dry).orElseThrow().goal());
+    }
+
+    @Test
+    void aHuntWithoutAWeaponCraftsASwordFirst() {
+        List<String> steps = ProgressPlanner.stepsForGoal("hunt 3 minecraft:white_wool",
+                Map.of("minecraft:oak_planks", 10), ProgressPlanner.TableAccess.HOME_NEARBY, OAK);
+        assertEquals(List.of("craft 4 minecraft:stick", "craft 1 minecraft:wooden_sword", "hunt 3 minecraft:white_wool"),
+                steps);
+        assertEquals(List.of("hunt 3 minecraft:white_wool"), ProgressPlanner.stepsForGoal("hunt 3 minecraft:white_wool",
+                Map.of("minecraft:wooden_axe", 1), ProgressPlanner.TableAccess.HOME_NEARBY, OAK), "an axe is a weapon too");
+    }
+
+    private static final Map<String, Integer> STONE_KIT = Map.of("minecraft:stone_pickaxe", 1,
+            "minecraft:stone_sword", 1, "minecraft:wooden_axe", 1);
+
+    private static ProgressPlanner.Facts house(boolean furnace) {
+        return new ProgressPlanner.Facts(true, true, true, true, false, true, furnace, false);
+    }
+
+    @Test
+    void afterTheBedItIsStoneToolsThenFoodThenFurnaceThenCoal() {
+        assertEquals("gather food", ProgressPlanner.nextMilestone(STONE_KIT, house(false)).orElseThrow().goal());
+        Map<String, Integer> fed = new java.util.HashMap<>(STONE_KIT);
+        fed.put("minecraft:cooked_porkchop", 3);
+        assertEquals("place minecraft:furnace in house", ProgressPlanner.nextMilestone(fed, house(false)).orElseThrow().goal());
+        assertEquals("craft 16 minecraft:torch", ProgressPlanner.nextMilestone(fed, house(true)).orElseThrow().goal(),
+                "furnace and food: now coal");
+    }
+
+    @Test
+    void rawOreWaitingToBeSmeltedMovesCoalUp() {
+        Map<String, Integer> ore = new java.util.HashMap<>(STONE_KIT);
+        ore.put("minecraft:raw_iron", 4);
+        assertEquals("craft 16 minecraft:torch", ProgressPlanner.nextMilestone(ore, house(false)).orElseThrow().goal());
+        assertTrue(ProgressPlanner.coalTooEarly("mine 4 minecraft:coal_ore", ore, house(false)).isEmpty());
+    }
+
+    @Test
+    void coalGoalsBeforeFoodAndAFurnaceAreRejected() {
+        String reason = ProgressPlanner.coalTooEarly("mine 4 minecraft:coal_ore", STONE_KIT, house(false)).orElseThrow();
+        assertTrue(reason.contains("a furnace in the house") && reason.contains("food (0/24"), reason);
+        assertTrue(ProgressPlanner.coalTooEarly("craft 16 minecraft:torch", STONE_KIT, house(true)).isPresent(),
+                "a furnace alone is not enough; food first");
+        Map<String, Integer> fed = new java.util.HashMap<>(STONE_KIT);
+        fed.put("minecraft:cooked_beef", 3);
+        assertTrue(ProgressPlanner.coalTooEarly("mine 4 minecraft:coal_ore", fed, house(true)).isEmpty());
+        assertTrue(ProgressPlanner.coalTooEarly("mine 8 minecraft:stone", STONE_KIT, house(false)).isEmpty(),
+                "other goals are untouched");
+    }
+
+    @Test
+    void gatheringFoodHuntsUntilTheStockIsFull() {
+        assertEquals(List.of("gather food"), ProgressPlanner.stepsForGoal("gather food", STONE_KIT, false, OAK));
+        assertEquals(Optional.of(false), ProgressPlanner.stepSatisfied("gather food",
+                Map.of("minecraft:porkchop", 4), false));
+        assertEquals(Optional.of(true), ProgressPlanner.stepSatisfied("gather food",
+                Map.of("minecraft:porkchop", 8), false));
+        assertEquals(List.of("craft 4 minecraft:stick", "craft 1 minecraft:wooden_sword", "gather food"),
+                ProgressPlanner.stepsForGoal("gather food", Map.of("minecraft:oak_planks", 6),
+                        ProgressPlanner.TableAccess.HOME_NEARBY, OAK), "never hunt bare-handed");
     }
 }

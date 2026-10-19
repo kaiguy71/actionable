@@ -56,6 +56,23 @@ final class ActionPlanner {
             only when placing into the player's current feet cell. jump_place jumps one block and places at the
             original feet cell after clearing replaceable flowers/plants. It cannot create schematic files.
 
+            Furnace: a furnace turns raw items into useful ones: raw iron/gold/copper into ingots, raw
+            beef/porkchop/mutton/chicken/rabbit/fish into cooked food (much more filling), sand into glass.
+            It needs an input in the top slot and fuel in the bottom slot (coal or charcoal smelt 8 items,
+            logs and planks 1.5 each), then about 10 seconds per item, then the results are collected.
+            Use the goal "smelt in house furnace": code walks to the house furnace, loads every valid input
+            with enough fuel (keeping 10 planks for a bed and door), waits, collects, and repeats until
+            nothing is left. Do not try to work the furnace slot by slot yourself.
+
+            Food: health only regenerates when the hunger bar is high. Code eats automatically when
+            hungry or hurt. Pigs, cows, chickens and sheep are food; while hunting sheep, food animals met
+            on the way are killed too when food is low.
+
+            Doors: a door needs a 1-wide, 2-tall opening with solid blocks on both sides at both heights
+            and solid ground below. Never place a door in open space or inside a room. For the house use
+            the step "place door in house": it takes back misplaced doors, breaks the two blocks filling
+            the doorway if needed, and hangs the door. One door is enough; do not craft more.
+
             Crafting: {"type":"craft","item":"minecraft:stick","count":4} crafts the items in
             craftable_catalog. count is the total to HOLD afterwards, like mine's quantity. 2x2 recipes
             (planks, sticks, crafting table, torches) work anywhere; 3x3 recipes (pickaxes, axes, swords,
@@ -209,9 +226,16 @@ final class ActionPlanner {
             Early game is a fixed checklist run by code: 20 logs; build the house; put a crafting table
             inside the house (it stays there for good); craft and hang a door; craft a wooden sword; craft
             a wooden pickaxe (gather more wood first if short); kill sheep for 3 white wool; craft the bed
-            and place it inside the house; sleep at night. Only after that come the pickaxe,
+            and place it inside the house; sleep at night. Then: stone pickaxe, stone sword, food (24 hunger
+            points carried), a furnace in the house, and only then coal for torches. Coal waits until there is
+            a furnace and food, unless you hold raw ore that needs smelting; a coal goal before that is
+            rejected. Only after that come the pickaxe,
             stone tools, food, torches and iron; never race to cobblestone, coal or iron before the house
             and bed exist. Stay within 64 blocks of home until you have a stone pickaxe and a stone sword.
+            The briefing ends with a Situation line: what you have, what you still need and why, and the
+            best job you can do right now. Use it. With a bed in the house you sleep at night. Without one,
+            code works from home at night: it finishes the house, crafts tools, smelts in the house furnace,
+            and digs the house staircase mine for cobblestone and then iron, down to y=16, stopping at caves.
             After that, follow the game progression list in the briefing: pick one concrete goal from the
             earliest stage that is not finished (judge by inventory and goals already achieved). Commit to
             it: do not switch to a different stage or invent a new project halfway.

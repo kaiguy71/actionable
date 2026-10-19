@@ -57,9 +57,8 @@ final class SafetyAssessment {
         if (inventory.entrySet().stream().noneMatch(entry -> entry.getValue() > 0 && TechTree.isWeapon(entry.getKey()))) {
             missing.add("weapon");
         }
-        if (inventory.getOrDefault("minecraft:torch", 0) < CAVE_TORCHES) {
-            missing.add(CAVE_TORCHES + "+ torches");
-        }
+        // Torches are not required: the coal for torches is mostly underground, so requiring them first
+        // made coal impossible to get (the player retreated from every coal cave).
         return missing;
     }
 
@@ -102,7 +101,9 @@ final class SafetyAssessment {
             reasons.add("underground without cave gear: stay near light and do not go deeper");
             level = max(level, Level.CAUTION);
         } else if (dark && underground) {
-            reasons.add("dark underground: place torches and watch for mobs");
+            reasons.add(in.inventory().getOrDefault("minecraft:torch", 0) >= CAVE_TORCHES
+                    ? "dark underground: place torches and watch for mobs"
+                    : "dark underground: torches would help (coal + stick); watch for mobs and leave at low health");
             level = max(level, Level.CAUTION);
         }
         if (in.night()) {

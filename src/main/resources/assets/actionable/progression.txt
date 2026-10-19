@@ -10,8 +10,8 @@
 7 | Mine cobblestone near home with the wooden pickaxe (exposed stone, not caves) | stone tools need it
 8 | Stone pickaxe and stone sword (then stone axe, shovel); stay within 64 blocks of home until both are made | iron needs a stone pickaxe; a weapon for night
 9 | Collect food: kill cows/pigs/chickens or pick sweet berries | health only regenerates when fed
-10 | Torches: coal + sticks (8-16), mine coal on exposed surface ore | light for caves and for night
-11 | Furnace; smelt raw iron; cook meat | iron and cooked food
+10 | Furnace in the house; cook meat, smelt raw iron | iron and cooked food
+11 | Coal only now (furnace and food first, unless raw ore needs smelting): torches from coal + sticks (8-16), mine coal on exposed surface ore | light for caves and for night
 12 | Storage room: 2-4 chests (or barrels) next to the house, sort by type | keeps the inventory usable
 13 | Iron gear: iron pickaxe, sword, axe, shovel, helmet/chestplate/leggings/boots, shield, bucket | survive and mine diamonds
 14 | Reliable food: wheat/carrot/potato farm with water, plus a cow/sheep/chicken pen to breed and slaughter | no more hunting trips

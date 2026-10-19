@@ -10,8 +10,6 @@ final class HomeRange {
     static final int RADIUS = 64;
     /** Extra distance allowed before the player is walked back, so chasing a sheep is not cut short. */
     static final int LEASH_SLACK = 16;
-    /** Wandering targets sit this far from home, inside the radius. */
-    static final int WANDER_DISTANCE = 40;
 
     private HomeRange() {
     }
@@ -35,14 +33,32 @@ final class HomeRange {
         return home != null && !geared && distance(home, x, z) > RADIUS + slack;
     }
 
+    /** How far from home sheep and food animals may be chased without gear. */
+    static final int HUNT_RANGE = 96;
+    private static final int[] SEARCH_RINGS = {32, 56, 80};
+
     /**
-     * A point to walk to instead of Baritone's unbounded explore: a different compass bearing each
-     * attempt, {@link #WANDER_DISTANCE} blocks from home.
+     * A point to look around from: walks a ring around home through neighbouring compass points, then
+     * the next ring out. Consecutive spots are next to each other, so the search sweeps instead of
+     * criss-crossing back over home (the old random bearings went 60 blocks back and forth).
      */
-    static int[] wanderTarget(int[] home, int attempt) {
-        double angle = Math.toRadians(attempt * 137.5);
-        return new int[] {home[0] + (int) Math.round(Math.cos(angle) * WANDER_DISTANCE), home[1],
-                home[2] + (int) Math.round(Math.sin(angle) * WANDER_DISTANCE)};
+    static int[] searchTarget(int[] home, int attempt, int maxRadius) {
+        int rings = 0;
+        while (rings < SEARCH_RINGS.length && SEARCH_RINGS[rings] <= maxRadius) {
+            rings++;
+        }
+        int ring = SEARCH_RINGS[(attempt / 8) % Math.max(1, rings)];
+        double angle = Math.toRadians((attempt % 8) * 45);
+        return new int[] {home[0] + (int) Math.round(Math.sin(angle) * ring), home[1],
+                home[2] - (int) Math.round(Math.cos(angle) * ring)};
+    }
+
+    /**
+     * Baritone goto for a search spot that names only the column. A fixed height (home's floor level)
+     * was buried under any hill, and Baritone tunnelled underground to reach it.
+     */
+    static String surfaceGoto(int[] target) {
+        return "goto " + target[0] + " " + target[2];
     }
 
     static String describe(int[] home, boolean geared, boolean houseBuilt) {

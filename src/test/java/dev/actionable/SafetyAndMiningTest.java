@@ -131,4 +131,30 @@ class SafetyAndMiningTest {
         assertTrue(MiningPolicy.strayed(start, 0, 30, 0));
         assertFalse(MiningPolicy.strayed(null, 999, 0, 999));
     }
+
+    @Test
+    void treesAtNightAreStillMinable() {
+        // Trunk side under a dark canopy at night: no sky, low light, but at surface level.
+        assertTrue(MiningPolicy.safe(site(0, 70, 0, 3, false, 0, 6), false));
+        assertTrue(MiningPolicy.safe(site(0, 70, 0, 3, false, 1, 6), false));
+        assertFalse(MiningPolicy.safe(site(0, 60, 0, 3, false, 5, 6), false), "a dark pit is still unsafe");
+    }
+
+    @Test
+    void reachMatchesSurvivalReach() {
+        // Standing next to a trunk reaches its lowest four or five logs, not the canopy top.
+        assertTrue(MiningPolicy.inReach(0, 64, 0, 1, 64, 0));
+        assertTrue(MiningPolicy.inReach(0, 64, 0, 1, 68, 0));
+        assertFalse(MiningPolicy.inReach(0, 64, 0, 1, 70, 0));
+        assertFalse(MiningPolicy.inReach(0, 64, 0, 6, 64, 0));
+        assertTrue(MiningPolicy.inReach(0, 64, 0, 3, 63, 2));
+    }
+
+    @Test
+    void shelterUnderARoofAtNightIsNotARetreat() {
+        // What the client now feeds in at home: depth 0, so the dark roofed house is not "underground".
+        SafetyAssessment.Result home = assess(0, false, 0, true, Map.of());
+        assertFalse(home.retreat());
+        assertFalse(home.underground());
+    }
 }

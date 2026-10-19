@@ -59,6 +59,28 @@ final class MeleeCombat {
         if (!reachable(client, target)) {
             return "ATTACK_FAILED_OUT_OF_REACH_OR_OBSTRUCTED";
         }
+        return strike(client, target);
+    }
+
+    /**
+     * Hits a passive animal for food or wool. Only used by the hunter, never by automatic defense,
+     * and only for adult animals within normal reach and sight.
+     */
+    static String hitAnimal(Minecraft client, Entity target) {
+        if (client.player == null || client.gameMode == null || !client.player.isAlive()) {
+            return "ATTACK_FAILED_UNAVAILABLE";
+        }
+        if (!(target instanceof net.minecraft.world.entity.animal.Animal animal) || !animal.isAlive() || animal.isBaby()) {
+            return "ATTACK_FAILED_INVALID_TARGET";
+        }
+        if (!client.player.isWithinEntityInteractionRange(target, 0) || !client.player.hasLineOfSight(target)) {
+            return "ATTACK_FAILED_OUT_OF_REACH_OR_OBSTRUCTED";
+        }
+        return strike(client, target);
+    }
+
+    private static String strike(Minecraft client, Entity target) {
+        int entityId = target.getId();
         // Prefer a sword already in the hotbar; do not rearrange inventory during a fight.
         int bestSlot = -1;
         int bestScore = 0;

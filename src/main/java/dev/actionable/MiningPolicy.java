@@ -39,7 +39,9 @@ final class MiningPolicy {
         if (caveReady) {
             return true;
         }
-        return (site.skyVisible() || site.light() >= SAFE_LIGHT) && site.depthBelowSurface() <= MAX_SAFE_DEPTH;
+        // Surface-level sites are fine even when dark: a tree trunk under its canopy at night is not a cave.
+        boolean surface = site.depthBelowSurface() <= 1;
+        return (surface || site.skyVisible() || site.light() >= SAFE_LIGHT) && site.depthBelowSurface() <= MAX_SAFE_DEPTH;
     }
 
     static boolean nearAvoided(Site site, List<int[]> avoid) {
@@ -59,6 +61,14 @@ final class MiningPolicy {
         return sites.stream()
                 .filter(site -> safe(site, caveReady) && !nearAvoided(site, avoid))
                 .min(Comparator.comparingDouble(site -> site.distance() + (site.skyVisible() ? 0 : 6)));
+    }
+
+    /** Survival reach: a block is minable when its center is within 4.5 blocks of the player's eyes. */
+    static boolean inReach(int feetX, int feetY, int feetZ, int blockX, int blockY, int blockZ) {
+        double dx = (blockX + 0.5) - (feetX + 0.5);
+        double dy = (blockY + 0.5) - (feetY + 1.62);
+        double dz = (blockZ + 0.5) - (feetZ + 0.5);
+        return dx * dx + dy * dy + dz * dz <= 4.5 * 4.5;
     }
 
     static boolean strayed(int[] start, int x, int y, int z) {

@@ -66,6 +66,15 @@ final class Crafter {
         if (held >= target) {
             return new Start(null, "CRAFTED: already holding " + held + " " + item);
         }
+        if (item.equals(TechTree.CRAFTING_TABLE)) {
+            // Tables are reused: the model kept crafting new ones instead of picking up the old one.
+            BlockPos placed = WorldProbe.nearestCraftingTable(client.level, player.blockPosition());
+            if (placed != null) {
+                return new Start(null, "CRAFT_FAILED_TABLE_EXISTS: a crafting table is already placed at "
+                        + placed.getX() + "," + placed.getY() + "," + placed.getZ() + ". Reuse it: craft there,"
+                        + " or mine 1 minecraft:crafting_table to pick it up and place it where you need it.");
+            }
+        }
         for (Map.Entry<String, Integer> input : recipe.get().inputs().entrySet()) {
             if (TechTree.count(inventory, input.getKey()) < input.getValue()) {
                 return new Start(null, "CRAFT_FAILED_MISSING_INGREDIENTS: one " + item + " needs "
@@ -85,7 +94,8 @@ final class Crafter {
             if (!WorldProbe.tableInReach(player, table)) {
                 return new Start(null, "CRAFT_FAILED_TABLE_OUT_OF_REACH: crafting table at " + table.getX() + ","
                         + table.getY() + "," + table.getZ() + "; goto " + table.getX() + " " + (table.getY() + 1)
-                        + " " + table.getZ() + " first, or place a new table nearby");
+                        + " " + table.getZ() + " first, or mine 1 minecraft:crafting_table to pick it up"
+                        + " and place it nearby");
             }
         }
         int crafts = (target - held + recipe.get().yield() - 1) / recipe.get().yield();

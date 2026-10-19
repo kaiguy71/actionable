@@ -83,4 +83,14 @@ class ActionPlannerTest {
         JsonObject director = JsonParser.parseString(PlannerSchema.forStage("director")).getAsJsonObject();
         assertTrue(director.get("required").toString().contains("\"why\""), "the director must explain itself");
     }
+
+    @Test
+    void breakBlockCarriesItsTarget() {
+        ActionPlanner.PlannedAction action = action("{\"type\":\"break_block\",\"x\":4,\"y\":65,\"z\":-9}");
+        assertEquals("break_block", action.type());
+        assertEquals(4, action.x());
+        assertEquals(65, action.y());
+        assertEquals(-9, action.z());
+        assertTrue(PlannerSchema.forStage("action").contains("\"break_block\""));
+    }
 }

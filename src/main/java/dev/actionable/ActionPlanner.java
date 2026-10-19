@@ -60,7 +60,10 @@ final class ActionPlanner {
             craftable_catalog. count is the total to HOLD afterwards, like mine's quantity. 2x2 recipes
             (planks, sticks, crafting table, torches) work anywhere; 3x3 recipes (pickaxes, axes, swords,
             shovels, furnace, chest) need a placed crafting table within 4 blocks: place one, or goto the
-            nearest_crafting_table first. Plan steps map directly to actions: "craft N X" ->
+            nearest_crafting_table first. A crafting table is reusable: mining a placed table (by hand
+            is fine) puts it back in your inventory. After crafting, mine it to take it along, and when a
+            table is in your inventory or nearest_crafting_table shows one, reuse it; never craft a second
+            table. Plan steps map directly to actions: "craft N X" ->
             {"type":"craft","item":X,"count":N}; "mine N X" -> Baritone "mine N X"; "place
             minecraft:crafting_table nearby" -> place_block at a nearby_placement_candidates position.
 
@@ -87,6 +90,11 @@ final class ActionPlanner {
             are different items: spruce logs never count toward birch.
 
             Opening and using things:
+            - {"type":"break_block","x":..,"y":..,"z":..} breaks one block (vines, leaves, dirt, a plank in
+              the way). It walks to a dry spot within reach first and picks the best hotbar tool, so you
+              never need to be close already. Baritone itself digs through leaves, vines and soft blocks
+              in its path, so a blocked route is not a reason to stop; use break_block only for one
+              specific block.
             - {"type":"use_block","x":..,"y":..,"z":..} right-clicks a block within 4 blocks (opens a crafting
               table, furnace, chest, barrel; also doors, beds, buttons).
             - {"type":"menu","op":"read"} lists the open menu's slots (or your inventory if nothing is open)
@@ -102,7 +110,12 @@ final class ActionPlanner {
             on the surface in the dark, so before dusk gather a sword, torches/lantern/campfire and a bed
             (3 wool + 3 planks) when affordable. At night you may sleep in a bed, stay near light, keep
             working at a lit site, or mine underground once you hold torches. Do not abandon a task only
-            because light is low; act on actual hostile mobs and low health.
+            because light is low; act on actual hostile mobs and low health. Once a house or bed exists,
+            code takes you home at night and sleeps; you are not asked while that runs.
+
+            Home range: until you hold a stone pickaxe and a stone sword, stay within 64 blocks of home
+            (see home= in the briefing). A goto farther away is refused and explore becomes a walk to a
+            spot near home. Never plan while sinking in water: get onto land first; code swims you out.
 
             Return only JSON:
             {"summary":"short status","goal":"current subgoal","complete":false,
@@ -150,8 +163,14 @@ final class ActionPlanner {
             coal and ores drop nothing without the right pickaxe), and cobblestone is obtained by mining
             minecraft:stone. Do not plan to go underground when cave_ready=false.
             Write steps in these forms so they can be checked: "mine 3 minecraft:oak_log",
-            "craft 12 minecraft:oak_planks", "place minecraft:crafting_table nearby". Quantities are totals
-            to hold when the step finishes. 3x3 recipes need a placed crafting table.
+            "craft 12 minecraft:oak_planks", "place minecraft:crafting_table nearby", "build house",
+            "hunt 3 minecraft:white_wool" (kill white sheep), "place minecraft:white_bed in house",
+            "place minecraft:crafting_table in house", "place door in house", "go to house" (to craft at
+            the house table). The house crafting table is never picked up. Quantities are totals
+            to hold when the step finishes. 3x3 recipes need a placed crafting table. Reuse the crafting
+            table: if one is in inventory, place it; if one is placed elsewhere, "mine 1
+            minecraft:crafting_table" picks it up. Never plan to craft a second table. End a plan that
+            used a table with "mine 1 minecraft:crafting_table" to take it along.
             Use the fewest steps that actually accomplish the task, at most 8.
             Each (verb, item) pair appears at most once: "mine 18 minecraft:birch_log" already collects all
             18 logs. Never split one quantity into repeated steps. Use the exact wood/stone type the task
@@ -179,21 +198,30 @@ final class ActionPlanner {
             Tools gate mining: stone, coal ore and every ore drop nothing without a pickaxe, and iron ore
             needs a stone pickaxe. Never choose to mine a block in cannot_mine_yet; craft the tool instead.
             Cobblestone comes from mining minecraft:stone; never go looking for placed cobblestone.
+            A crafting table is reusable (mine it to pick it up); never choose to craft a second one while
+            crafting_table shows one in inventory or placed nearby.
             Safety comes first. Darkness alone is only caution: at night keep working, or prepare (weapon,
             torches, lantern/campfire, bed) and sleep. If safety level=danger because of low health or
             hostile mobs, choose to reach light or the surface. Do not choose
             goals that take you underground or into dark caves while cave_ready=false; prefer exposed
             blocks on the surface, cliffs and hillsides near you. Escape at health 6 or lower and avoid
             creepers. Fight only mobs marked melee_reachable=true.
-            Follow the game progression list in the briefing: pick one concrete goal from the earliest stage
-            that is not finished (judge by inventory and goals already achieved), including house, storage,
-            farm and ranch stages when reached. Commit to it: do not switch to a different stage or invent
-            a new project halfway. Before dusk, prepare per night_prep_missing.
+            Early game is a fixed checklist run by code: 20 logs; build the house; put a crafting table
+            inside the house (it stays there for good); craft and hang a door; craft a wooden sword; craft
+            a wooden pickaxe (gather more wood first if short); kill sheep for 3 white wool; craft the bed
+            and place it inside the house; sleep at night. Only after that come the pickaxe,
+            stone tools, food, torches and iron; never race to cobblestone, coal or iron before the house
+            and bed exist. Stay within 64 blocks of home until you have a stone pickaxe and a stone sword.
+            After that, follow the game progression list in the briefing: pick one concrete goal from the
+            earliest stage that is not finished (judge by inventory and goals already achieved). Commit to
+            it: do not switch to a different stage or invent a new project halfway.
             next_milestone is normally the right goal; choose something else only when safety or the
             world state gives a clear reason, and say what it is.
             Never repeat a goal listed as already achieved, and do not repeat a recently attempted goal
             unless the state shows it clearly failed and is still worth doing.
-            Goal forms: "craft 1 minecraft:wooden_pickaxe", "mine 8 minecraft:oak_log", "explore".
+            Goal forms: "craft 1 minecraft:wooden_pickaxe", "mine 8 minecraft:oak_log", "build house",
+            "hunt 3 minecraft:white_wool", "place minecraft:crafting_table in house", "place door in house",
+            "place minecraft:white_bed in house", "explore".
             Return only JSON: {"goal":"craft 1 minecraft:wooden_pickaxe",
              "why":"stone and coal drop nothing without a pickaxe; it unlocks cobblestone for stone tools"}
             """;
@@ -362,6 +390,8 @@ final class ActionPlanner {
         if (!provider.equalsIgnoreCase("ollama")) {
             throw new IllegalStateException("Unknown actionable.model.provider: " + provider);
         }
+        // Keep the model loaded between calls; reloading it cost about 10 seconds after any pause.
+        body.addProperty("keep_alive", System.getProperty("actionable.ollama.keepAlive", "30m"));
         HttpRequest request = HttpRequest.newBuilder(URI.create(endpoint))
                 .timeout(Duration.ofSeconds(180))
                 .header("Content-Type", "application/json")
@@ -466,6 +496,10 @@ final class ActionPlanner {
         }
         if (type.equals("screenshot")) {
             return Optional.of(new PlannedAction("screenshot", "", "", 0, 0, 0, ""));
+        }
+        if (type.equals("break_block") && action.has("x") && action.has("y") && action.has("z")) {
+            return Optional.of(new PlannedAction("break_block", "", "",
+                    action.get("x").getAsInt(), action.get("y").getAsInt(), action.get("z").getAsInt(), ""));
         }
         if (type.equals("use_block") && action.has("x") && action.has("y") && action.has("z")) {
             return Optional.of(new PlannedAction("use_block", "", "",

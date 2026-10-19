@@ -126,6 +126,29 @@ class TechTreeTest {
     }
 
     @Test
+    void placedWorkstationsDropThemselves() {
+        assertTrue(TechTree.isReclaimable("minecraft:crafting_table"));
+        assertFalse(TechTree.isReclaimable("minecraft:stick"));
+        assertEquals("minecraft:crafting_table", TechTree.blockToMine("minecraft:crafting_table"));
+        assertEquals("minecraft:crafting_table", TechTree.dropOf("minecraft:crafting_table"));
+        assertEquals(TechTree.Tier.NONE, TechTree.toolFor("minecraft:crafting_table"));
+        assertTrue(TechTree.useOf("minecraft:crafting_table").orElseThrow().contains("reusable"));
+        assertFalse(TechTree.cannotMineYet(Map.of()).stream().anyMatch(entry -> entry.contains("furnace")));
+    }
+
+    @Test
+    void doorsAreSixPlanksOfOneWoodForThree() {
+        TechTree.Recipe door = TechTree.recipeFor("minecraft:spruce_door").orElseThrow();
+        assertEquals(3, door.yield());
+        assertEquals(Map.of("minecraft:spruce_planks", 6), door.inputs());
+        assertTrue(door.needsTable());
+        assertEquals("minecraft:oak_door", TechTree.doorFor("minecraft:oak_planks"));
+        assertFalse(TechTree.isDoor("minecraft:iron_door"));
+        assertFalse(TechTree.isDoor("minecraft:oak_trapdoor"));
+        assertTrue(TechTree.useOf("minecraft:oak_door").orElseThrow().contains("doorway"));
+    }
+
+    @Test
     void weaponsAreRecognised() {
         assertTrue(TechTree.isWeapon("minecraft:stone_sword"));
         assertTrue(TechTree.isWeapon("minecraft:wooden_axe"));

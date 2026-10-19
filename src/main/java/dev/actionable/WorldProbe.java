@@ -40,6 +40,9 @@ final class WorldProbe {
         return level.getHeight(Heightmap.Types.MOTION_BLOCKING_NO_LEAVES, x, z);
     }
 
+    /** The house corner, set by the client, so safety and synopses know home is not a cave. */
+    static volatile int[] home;
+
     static SafetyAssessment.Result safety(Minecraft client) {
         LocalPlayer player = java.util.Objects.requireNonNull(client.player);
         ClientLevel level = java.util.Objects.requireNonNull(client.level);
@@ -52,7 +55,8 @@ final class WorldProbe {
             }
         }
         // Dimensions without sky light (the Nether) have a bedrock roof, so depth below it means nothing.
-        int depth = level.dimensionType().hasSkyLight()
+        // Inside the house the roof hides the sky; that is shelter, not being underground.
+        int depth = level.dimensionType().hasSkyLight() && !HouseDesign.nearHouse(home, feet.getX(), feet.getY(), feet.getZ())
                 ? Math.max(0, surfaceY(level, feet.getX(), feet.getZ()) - feet.getY()) : 0;
         return SafetyAssessment.assess(new SafetyAssessment.Inputs(light, level.canSeeSky(feet.above()),
                 depth, level.isDarkOutside(),
@@ -60,12 +64,17 @@ final class WorldProbe {
                 hostiles, inventory(player)));
     }
 
+    /** Candidates checked for a dry standing spot; enough for site choice without scanning every block. */
+    private static final int MAX_SITE_CHECKS = 400;
+    private static final int MAX_SITES = 64;
+
     /**
-     * Loaded blocks of the given type with at least one face open to air, nearest first. Light, sky and
-     * depth are measured at the open neighbour, where the player would stand to mine it.
+     * Loaded blocks of the given type with a face open to air that can be reached from dry land, nearest
+     * first. Light, sky and depth are measured at the open face; the stand cell is a dry spot within
+     * reach, so the player never mines from water (it bobbed in a lake trying to reach a shoreline log).
      */
     static List<MiningPolicy.Site> exposedSites(ClientLevel level, BlockPos origin, Block block, int radius) {
-        List<MiningPolicy.Site> sites = new ArrayList<>();
+        List<BlockPos> candidates = new ArrayList<>();
         BlockPos.MutableBlockPos cursor = new BlockPos.MutableBlockPos();
         for (int dx = -radius; dx <= radius; dx++) {
             for (int dz = -radius; dz <= radius; dz++) {
@@ -74,23 +83,77 @@ final class WorldProbe {
                 }
                 for (int dy = -radius / 2; dy <= radius / 2; dy++) {
                     cursor.set(origin.getX() + dx, origin.getY() + dy, origin.getZ() + dz);
-                    if (!level.getBlockState(cursor).is(block)) {
-                        continue;
+                    if (level.getBlockState(cursor).is(block)) {
+                        candidates.add(cursor.immutable());
                     }
-                    BlockPos open = openNeighbour(level, cursor.immutable());
-                    if (open == null) {
-                        continue;
-                    }
-                    int surface = surfaceY(level, open.getX(), open.getZ());
-                    sites.add(new MiningPolicy.Site(cursor.getX(), cursor.getY(), cursor.getZ(),
-                            open.getX(), open.getY(), open.getZ(), level.getMaxLocalRawBrightness(open),
-                            level.canSeeSky(open), Math.max(0, surface - open.getY()),
-                            Math.sqrt((double) dx * dx + (double) dy * dy + (double) dz * dz)));
                 }
             }
         }
-        sites.sort(java.util.Comparator.comparingDouble(MiningPolicy.Site::distance));
+        candidates.sort(java.util.Comparator.comparingDouble(pos -> pos.distSqr(origin)));
+        List<MiningPolicy.Site> sites = new ArrayList<>();
+        int checked = 0;
+        for (BlockPos pos : candidates) {
+            if (sites.size() >= MAX_SITES || checked++ >= MAX_SITE_CHECKS) {
+                break;
+            }
+            BlockPos open = openNeighbour(level, pos);
+            BlockPos stand = open == null ? null : dryStandNear(level, pos);
+            if (stand == null) {
+                continue;
+            }
+            int surface = surfaceY(level, open.getX(), open.getZ());
+            sites.add(new MiningPolicy.Site(pos.getX(), pos.getY(), pos.getZ(),
+                    stand.getX(), stand.getY(), stand.getZ(), level.getMaxLocalRawBrightness(open),
+                    level.canSeeSky(open), Math.max(0, surface - open.getY()), Math.sqrt(pos.distSqr(origin))));
+        }
         return sites;
+    }
+
+    /**
+     * The snag holding the player in place: a vine or similar in the player's own cells first (that is
+     * what makes them bob), then one beside the feet or head. Null when there is none.
+     */
+    static BlockPos snagNear(ClientLevel level, BlockPos feet) {
+        List<BlockPos> cells = new ArrayList<>(List.of(feet, feet.above(), feet.above(2)));
+        for (Direction side : new Direction[] {Direction.NORTH, Direction.SOUTH, Direction.EAST, Direction.WEST}) {
+            cells.add(feet.relative(side));
+            cells.add(feet.above().relative(side));
+        }
+        for (BlockPos cell : cells) {
+            String id = BuiltInRegistries.BLOCK.getKey(level.getBlockState(cell).getBlock()).toString();
+            if (Recovery.isSnag(id)) {
+                return cell;
+            }
+        }
+        return null;
+    }
+
+    /** True when a player can stand in this cell on dry, solid ground with nothing in the way. */
+    static boolean dryStandable(ClientLevel level, BlockPos feet) {
+        BlockPos ground = feet.below();
+        var groundState = level.getBlockState(ground);
+        var feetState = level.getBlockState(feet);
+        var headState = level.getBlockState(feet.above());
+        return groundState.getFluidState().isEmpty() && groundState.isFaceSturdy(level, ground, Direction.UP)
+                && feetState.isAir() && headState.isAir();
+    }
+
+    /** Nearest dry standing cell from which {@code target} is within reach, or null if only water reaches it. */
+    static BlockPos dryStandNear(ClientLevel level, BlockPos target) {
+        BlockPos best = null;
+        double bestDistance = Double.MAX_VALUE;
+        for (BlockPos feet : BlockPos.betweenClosed(target.offset(-3, -5, -3), target.offset(3, 1, 3))) {
+            if (!MiningPolicy.inReach(feet.getX(), feet.getY(), feet.getZ(), target.getX(), target.getY(), target.getZ())
+                    || !dryStandable(level, feet)) {
+                continue;
+            }
+            double distance = feet.distSqr(target);
+            if (distance < bestDistance) {
+                bestDistance = distance;
+                best = feet.immutable();
+            }
+        }
+        return best;
     }
 
     private static BlockPos openNeighbour(ClientLevel level, BlockPos pos) {
@@ -127,12 +190,110 @@ final class WorldProbe {
         return candidates;
     }
 
+    /** Nearest bed block within {@code radius}, or null. */
+    static BlockPos nearestBed(ClientLevel level, BlockPos origin, int radius) {
+        BlockPos nearest = null;
+        double best = Double.MAX_VALUE;
+        for (BlockPos pos : BlockPos.betweenClosed(origin.offset(-radius, -8, -radius), origin.offset(radius, 8, radius))) {
+            if (level.getBlockState(pos).getBlock() instanceof net.minecraft.world.level.block.BedBlock) {
+                double distance = pos.distSqr(origin);
+                if (distance < best) {
+                    best = distance;
+                    nearest = pos.immutable();
+                }
+            }
+        }
+        return nearest;
+    }
+
+    /**
+     * Nearest dry cell to stand on: solid, non-fluid ground with two free, water-free cells above.
+     * Used to get out of water before the model thinks, because the player sank while waiting.
+     */
+    static BlockPos nearestLand(ClientLevel level, BlockPos origin, int radius) {
+        BlockPos nearest = null;
+        double best = Double.MAX_VALUE;
+        for (BlockPos pos : BlockPos.betweenClosed(origin.offset(-radius, -4, -radius), origin.offset(radius, 4, radius))) {
+            BlockPos ground = pos.below();
+            var groundState = level.getBlockState(ground);
+            if (!groundState.getFluidState().isEmpty() || !groundState.isFaceSturdy(level, ground, Direction.UP)) {
+                continue;
+            }
+            var feet = level.getBlockState(pos);
+            var head = level.getBlockState(pos.above());
+            if (!feet.isAir() || !head.isAir()) {
+                continue;
+            }
+            double distance = pos.distSqr(origin);
+            if (distance < best) {
+                best = distance;
+                nearest = pos.immutable();
+            }
+        }
+        return nearest;
+    }
+
+    /**
+     * The next house cell needing a plank: a floor cell that is a hole or water, then a walkable cell
+     * holding water. Null when the floor is sound and dry.
+     */
+    static BlockPos houseFloorProblem(ClientLevel level, int[] origin) {
+        for (int[] cell : HouseDesign.floorCells()) {
+            BlockPos pos = new BlockPos(origin[0] + cell[0], origin[1] + cell[1], origin[2] + cell[2]);
+            var state = level.getBlockState(pos);
+            if (!state.getFluidState().isEmpty() || !state.isFaceSturdy(level, pos, Direction.UP)) {
+                return pos;
+            }
+        }
+        for (int[] cell : HouseDesign.dryCells()) {
+            BlockPos pos = new BlockPos(origin[0] + cell[0], origin[1] + cell[1], origin[2] + cell[2]);
+            if (!level.getBlockState(pos).getFluidState().isEmpty()) {
+                return pos;
+            }
+        }
+        return null;
+    }
+
+    /** True when any interior cell of the house holds a block matching {@code test}. */
+    static boolean houseHas(ClientLevel level, int[] origin,
+            java.util.function.Predicate<net.minecraft.world.level.block.state.BlockState> test) {
+        for (int y = 0; y < HouseDesign.HEIGHT - 1; y++) {
+            for (int z = 1; z < HouseDesign.LENGTH - 1; z++) {
+                for (int x = 1; x < HouseDesign.WIDTH - 1; x++) {
+                    if (test.test(level.getBlockState(new BlockPos(origin[0] + x, origin[1] + y, origin[2] + z)))) {
+                        return true;
+                    }
+                }
+            }
+        }
+        return false;
+    }
+
+    /** How much of the starter house at {@code origin} is built, from 0 to 1. */
+    static double houseCompletion(ClientLevel level, int[] origin) {
+        if (!level.hasChunk(origin[0] >> 4, origin[2] >> 4)) {
+            return 0;
+        }
+        return HouseDesign.completion((x, y, z) -> {
+            var state = level.getBlockState(new BlockPos(origin[0] + x, origin[1] + y, origin[2] + z));
+            return !state.isAir() && state.getFluidState().isEmpty();
+        });
+    }
+
+    /** The planks type the player holds most of, or the planks of the preferred log. */
+    static String mostHeldPlanks(Map<String, Integer> inventory, String preferredLog) {
+        return inventory.entrySet().stream().filter(entry -> TechTree.matches(TechTree.PLANKS, entry.getKey()))
+                .max(Map.Entry.comparingByValue()).map(Map.Entry::getKey)
+                .orElse(TechTree.planksFor(preferredLog));
+    }
+
     static BlockPos nearestCraftingTable(ClientLevel level, BlockPos origin) {
         BlockPos nearest = null;
         double best = Double.MAX_VALUE;
         Block table = BuiltInRegistries.BLOCK.getValue(net.minecraft.resources.Identifier.parse(TechTree.CRAFTING_TABLE));
-        for (BlockPos pos : BlockPos.betweenClosed(origin.offset(-TABLE_SEARCH_RADIUS, -8, -TABLE_SEARCH_RADIUS),
-                origin.offset(TABLE_SEARCH_RADIUS, 8, TABLE_SEARCH_RADIUS))) {
+        // Tall vertical range: Baritone often drops the player well below a table placed earlier.
+        for (BlockPos pos : BlockPos.betweenClosed(origin.offset(-TABLE_SEARCH_RADIUS, -16, -TABLE_SEARCH_RADIUS),
+                origin.offset(TABLE_SEARCH_RADIUS, 16, TABLE_SEARCH_RADIUS))) {
             if (level.getBlockState(pos).is(table)) {
                 double distance = pos.distSqr(origin);
                 if (distance < best) {

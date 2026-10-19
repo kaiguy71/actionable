@@ -17,6 +17,8 @@ final class TechTree {
     static final String STONE_MATERIAL = "#stone_crafting";
     static final String COALS = "#coals";
     static final String CRAFTING_TABLE = "minecraft:crafting_table";
+    static final String WHITE_WOOL = "minecraft:white_wool";
+    static final String WHITE_BED = "minecraft:white_bed";
 
     private TechTree() {
     }
@@ -90,7 +92,11 @@ final class TechTree {
             new Source("minecraft:dirt", "minecraft:dirt", Tier.NONE),
             new Source("minecraft:dirt", "minecraft:grass_block", Tier.NONE),
             new Source("minecraft:sand", "minecraft:sand", Tier.NONE),
-            new Source("minecraft:gravel", "minecraft:gravel", Tier.NONE));
+            new Source("minecraft:gravel", "minecraft:gravel", Tier.NONE),
+            // Placed workstations drop themselves, so mining one picks it back up.
+            new Source(CRAFTING_TABLE, CRAFTING_TABLE, Tier.NONE),
+            new Source("minecraft:chest", "minecraft:chest", Tier.NONE),
+            new Source("minecraft:furnace", "minecraft:furnace", Tier.WOOD));
     private static final Map<String, String> USES = new LinkedHashMap<>();
 
     static {
@@ -107,11 +113,14 @@ final class TechTree {
         recipe("minecraft:torch", 4, List.of("C", "S"), 'C', COALS, 'S', "minecraft:stick");
         recipe("minecraft:furnace", 1, List.of("CCC", "C C", "CCC"), 'C', STONE_MATERIAL);
         recipe("minecraft:chest", 1, List.of("PPP", "P P", "PPP"), 'P', PLANKS);
+        // A bed needs three wool of one colour; white is by far the most common sheep.
+        recipe(WHITE_BED, 1, List.of("WWW", "PPP"), 'W', WHITE_WOOL, 'P', PLANKS);
 
         USES.put(LOGS, "craft into planks (1 log -> 4 planks); every wooden item starts here");
         USES.put(PLANKS, "crafting table (4), sticks (2 -> 4), wooden tools (3 per pickaxe), chest (8)");
         USES.put("minecraft:stick", "handles for every tool, and torches");
-        USES.put(CRAFTING_TABLE, "place it to unlock 3x3 recipes: pickaxes, axes, swords, furnace, chest");
+        USES.put(CRAFTING_TABLE, "place it to unlock 3x3 recipes: pickaxes, axes, swords, furnace, chest;"
+                + " reusable: mine the placed table (by hand is fine) to carry it, and never craft a second one");
         USES.put("minecraft:wooden_pickaxe", "mines stone (drops cobblestone) and coal ore");
         USES.put("minecraft:stone_pickaxe", "mines iron, copper and lapis ore, and stone faster");
         USES.put("minecraft:wooden_sword", "melee weapon for nights and caves");
@@ -126,6 +135,9 @@ final class TechTree {
         USES.put("minecraft:chest", "stores spare items");
         USES.put("minecraft:raw_iron", "smelt into iron ingots for iron tools and armor (smelting not automated yet)");
         USES.put("minecraft:dirt", "cheap filler block for pillaring up or blocking holes");
+        USES.put(WHITE_WOOL, "3 white wool + 3 planks make a bed (from killing white sheep)");
+        USES.put(WHITE_BED, "place it inside the house and sleep at night to skip the night and set respawn");
+        USES.put("minecraft:mutton", "food; eat it to keep health regenerating");
     }
 
     private static void recipe(String result, int yield, List<String> pattern, Object... keys) {
@@ -134,6 +146,14 @@ final class TechTree {
             keyMap.put((Character) keys[index], (String) keys[index + 1]);
         }
         RECIPES.put(result, new Recipe(result, yield, List.copyOf(pattern), Map.copyOf(keyMap)));
+    }
+
+    /**
+     * Crafted blocks that drop themselves when mined, so a placed one can be picked up and reused
+     * instead of crafting another.
+     */
+    static boolean isReclaimable(String item) {
+        return item.equals(CRAFTING_TABLE) || item.equals("minecraft:chest") || item.equals("minecraft:furnace");
     }
 
     /** True when {@code item} satisfies an ingredient key, which is an item ID or a #group. */
@@ -178,6 +198,10 @@ final class TechTree {
         if (matches(PLANKS, item)) {
             return Optional.of(new Recipe(item, 4, List.of("L"), Map.of('L', LOGS)));
         }
+        if (isDoor(item)) {
+            // A wooden door needs six planks of its own wood type and yields three doors.
+            return Optional.of(new Recipe(item, 3, List.of("PP", "PP", "PP"), Map.of('P', item.replace("_door", "_planks"))));
+        }
         return Optional.ofNullable(RECIPES.get(item));
     }
 
@@ -185,8 +209,15 @@ final class TechTree {
     static List<String> craftableItems() {
         List<String> items = new ArrayList<>();
         items.add("minecraft:oak_planks (any *_planks)");
+        items.add("minecraft:oak_door (any wooden *_door, from 6 planks of that wood)");
         items.addAll(RECIPES.keySet());
         return items;
+    }
+
+    /** The mob killed to obtain an item, for items that come from hunting rather than mining. */
+    static Optional<String> huntedFrom(String item) {
+        return item.equals(WHITE_WOOL) || item.equals("minecraft:mutton")
+                ? Optional.of("minecraft:sheep") : Optional.empty();
     }
 
     /** The block to mine for an item: cobblestone comes from stone, coal from coal ore, and so on. */
@@ -263,6 +294,14 @@ final class TechTree {
         return path.endsWith("_sword") || path.endsWith("_axe") || path.equals("mace") || path.equals("trident");
     }
 
+    static boolean isDoor(String item) {
+        return item.endsWith("_door") && !item.equals("minecraft:iron_door") && !item.contains("copper");
+    }
+
+    static String doorFor(String planks) {
+        return planks.replace("_planks", "_door");
+    }
+
     static String logFor(String planks) {
         String wood = planks.replace("_planks", "");
         return wood.endsWith("crimson") || wood.endsWith("warped") ? wood + "_stem" : wood + "_log";
@@ -280,6 +319,9 @@ final class TechTree {
         }
         if (use == null && matches(COALS, item)) {
             use = USES.get(COALS);
+        }
+        if (use == null && isDoor(item)) {
+            use = "hang it in the house doorway to keep mobs out";
         }
         return Optional.ofNullable(use);
     }
@@ -310,7 +352,8 @@ final class TechTree {
         Tier tier = pickaxeTier(inventory);
         Map<String, String> blocked = new LinkedHashMap<>();
         for (Source source : SOURCES) {
-            if (source.tool().compareTo(tier) > 0 && !source.block().contains("deepslate")) {
+            if (source.tool().compareTo(tier) > 0 && !source.block().contains("deepslate")
+                    && !isReclaimable(source.block())) {
                 blocked.putIfAbsent(source.block(), source.block() + " (needs " + pickaxeFor(source.tool()) + ")");
             }
         }

@@ -101,7 +101,7 @@ final class InventoryAccess {
                 return "EQUIP_FAILED_NOT_IN_INVENTORY: " + itemId
                         + " is not in the inventory; it cannot be crafted, so gather or find it first";
             }
-            gameMode.handleContainerInput(source, selected, player.inventoryMenu.containerId,
+            gameMode.handleContainerInput(player.inventoryMenu.containerId, source, selected,
                     ContainerInput.SWAP, player);
             hotbarSlot = selected;
         }
@@ -113,7 +113,7 @@ final class InventoryAccess {
         int menuSlot = wearSlot == EquipRules.OFFHAND
                 ? InventoryMenu.SHIELD_SLOT
                 : InventoryMenu.ARMOR_SLOT_START + wearSlot;
-        gameMode.handleContainerInput(menuSlot, hotbarSlot, player.inventoryMenu.containerId,
+        gameMode.handleContainerInput(player.inventoryMenu.containerId, menuSlot, hotbarSlot,
                 ContainerInput.SWAP, player);
         return "EQUIP_SENT: wearing " + itemId + " on the " + EquipRules.slotName(wearSlot);
     }

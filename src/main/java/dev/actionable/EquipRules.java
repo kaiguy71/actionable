@@ -37,6 +37,42 @@ final class EquipRules {
         return NOT_ARMOR;
     }
 
+    /** Selects wearable upgrades; preserves worn gold in the Nether and never replaces an elytra. */
+    static java.util.List<String> upgrades(java.util.Map<String, Integer> inventory,
+            java.util.Map<Integer, String> worn, boolean inNether) {
+        var upgrades = new java.util.ArrayList<String>();
+        boolean wearingGold = worn.values().stream().anyMatch(item -> item.startsWith("minecraft:golden_"));
+        for (int slot = HEAD; slot <= FEET; slot++) {
+            String current = worn.getOrDefault(slot, "");
+            if (current.equals("minecraft:elytra") || inNether && current.startsWith("minecraft:golden_")) continue;
+            if (inNether && !wearingGold && slot == FEET && inventory.getOrDefault("minecraft:golden_boots", 0) > 0) {
+                upgrades.add("minecraft:golden_boots");
+                continue;
+            }
+            final int targetSlot = slot;
+            inventory.entrySet().stream().filter(e -> e.getValue() > 0 && armorSlot(e.getKey()) == targetSlot
+                    && armorRank(e.getKey()) > armorRank(current))
+                    .max(java.util.Comparator.comparingInt(e -> armorRank(e.getKey())))
+                    .ifPresent(e -> upgrades.add(e.getKey()));
+        }
+        if (worn.getOrDefault(OFFHAND, "").isEmpty() && inventory.getOrDefault("minecraft:shield", 0) > 0)
+            upgrades.add("minecraft:shield");
+        return java.util.List.copyOf(upgrades);
+    }
+
+    private static int armorRank(String item) {
+        if (!item.startsWith("minecraft:")) return 0;
+        return switch (item.substring("minecraft:".length()).split("_", 2)[0]) {
+            case "netherite" -> 6;
+            case "diamond" -> 5;
+            case "iron" -> 4;
+            case "chainmail", "turtle" -> 3;
+            case "golden" -> 2;
+            case "leather" -> 1;
+            default -> 0;
+        };
+    }
+
     static String slotName(int armorSlot) {
         return switch (armorSlot) {
             case HEAD -> "head";

@@ -44,10 +44,18 @@ final class WorldSynopsis {
                 .append("; block_below_player=").append(blockId(level.getBlockState(playerPos.below()).getBlock()))
                 .append("; nearby_placement_candidates=").append(placementSurface(level, playerPos))
                 .append("; nearby_resource_hints=").append(nearbyResources(level, playerPos))
+                .append("; nearby_fluid_sources=").append(fluidSources(level, playerPos))
                 .append("; health=").append(Math.round(player.getHealth()))
-                .append("; hotbar=").append(hotbar(player))
+                .append("; food=").append(player.getFoodData().getFoodLevel())
+                .append("; air=").append(player.getAirSupply()).append('/').append(player.getMaxAirSupply())
+                .append("; submerged=").append(player.isUnderWater())
+                .append("; armor=").append(player.getArmorValue())
+                .append("; ").append(WorldProbe.safety(client).describe())
+                .append("; nearest_crafting_table=").append(nearestTable(level, playerPos))
+                .append("; house_structure=").append(WorldProbe.describeHouse(level))
                 .append("; ").append(InventoryAccess.describe(player))
-                .append("; inventory=").append(inventory(player));
+                .append("; inventory=").append(inventorySlots(player))
+                .append("; totals=").append(topEntries(WorldProbe.inventory(player), 24));
 
         Map<String, Integer> nearbyBlocks = new TreeMap<>();
         BlockPos origin = playerPos;
@@ -65,8 +73,8 @@ final class WorldSynopsis {
         StringBuilder threats = new StringBuilder();
         int threatCount = 0;
         for (Entity entity : level.entitiesForRendering()) {
-            if (entity instanceof Monster monster && monster.isAlive()
-                    && monster.distanceToSqr(player) <= 144 && threatCount < 6) {
+            if (entity instanceof net.minecraft.world.entity.LivingEntity monster && ThreatProbe.hostile(client, entity)
+                    && monster.distanceToSqr(player) <= 256 && threatCount < 6) {
                 if (threatCount++ > 0) {
                     threats.append(',');
                 }
@@ -78,7 +86,7 @@ final class WorldSynopsis {
                         .append("(d=").append(Math.round(monster.distanceTo(player)))
                         .append(",health=").append(Math.round(monster.getHealth()))
                         .append(",melee_reachable=").append(MeleeCombat.reachable(client, monster))
-                        .append(monster.getTarget() == player ? ",targeting_player" : "").append(')');
+                        .append(ThreatProbe.targeting(client, monster) ? ",targeting_player" : "").append(')');
             }
         }
         synopsis.append("; nearby_hostile_mobs=").append(threatCount == 0 ? "none" : threats);
@@ -136,37 +144,24 @@ final class WorldSynopsis {
 
     private static String placementSurface(ClientLevel level, BlockPos origin) {
         StringBuilder candidates = new StringBuilder("[");
-        int count = 0;
-        for (int radius = 1; radius <= 2; radius++) {
-            for (int dx = -radius; dx <= radius; dx++) {
-                for (int dz = -radius; dz <= radius; dz++) {
-                    if (Math.max(Math.abs(dx), Math.abs(dz)) != radius) {
-                        continue;
-                    }
-                    BlockPos target = origin.offset(dx, 0, dz);
-                    BlockPos ground = target.below();
-                    var targetState = level.getBlockState(target);
-                    var headState = level.getBlockState(target.above());
-                    var groundState = level.getBlockState(ground);
-                    boolean sturdy = groundState.isFaceSturdy(level, ground, net.minecraft.core.Direction.UP);
-                    if (!sturdy || !targetState.canBeReplaced() || !headState.canBeReplaced()) {
-                        continue;
-                    }
-                    if (count++ >= 8) {
-                        return candidates.append(']').toString();
-                    }
-                    if (candidates.length() > 1) {
-                        candidates.append(',');
-                    }
-                    candidates.append(target.getX()).append(',').append(target.getY()).append(',').append(target.getZ())
-                            .append("{target=").append(blockId(targetState.getBlock()))
-                            .append(targetState.canBeReplaced() ? ",replaceable" : "")
-                            .append(";above=").append(blockId(headState.getBlock()))
-                            .append(";ground=").append(blockId(groundState.getBlock())).append('}');
-                }
+        for (BlockPos target : WorldProbe.placementCandidates(level, origin).stream().limit(8).toList()) {
+            var targetState = level.getBlockState(target);
+            if (candidates.length() > 1) {
+                candidates.append(',');
             }
+            candidates.append(target.getX()).append(',').append(target.getY()).append(',').append(target.getZ())
+                    .append("{target=").append(blockId(targetState.getBlock()))
+                    .append(targetState.canBeReplaced() ? ",replaceable" : "")
+                    .append(";above=").append(blockId(level.getBlockState(target.above()).getBlock()))
+                    .append(";ground=").append(blockId(level.getBlockState(target.below()).getBlock())).append('}');
         }
         return candidates.append(']').toString();
+    }
+
+    private static String nearestTable(ClientLevel level, BlockPos origin) {
+        BlockPos table = WorldProbe.nearestCraftingTable(level, origin);
+        return table == null ? "none" : table.getX() + "," + table.getY() + "," + table.getZ()
+                + "(d=" + Math.round(Math.sqrt(table.distSqr(origin))) + ")";
     }
 
     private static String blockId(net.minecraft.world.level.block.Block block) {
@@ -184,7 +179,9 @@ final class WorldSynopsis {
                         continue;
                     }
                     String id = blockId(level.getBlockState(sample).getBlock());
-                    if (!id.endsWith("_log") && !id.endsWith("_ore")) {
+                    if (!id.endsWith("_log") && !id.endsWith("_ore") && !java.util.Set.of(
+                            "minecraft:gravel", "minecraft:obsidian", "minecraft:water", "minecraft:lava",
+                            "minecraft:nether_portal").contains(id)) {
                         continue;
                     }
                     double distance = Math.sqrt((double) dx * dx + (double) dy * dy + (double) dz * dz);
@@ -213,6 +210,22 @@ final class WorldSynopsis {
                 .toString();
     }
 
+    private static String fluidSources(ClientLevel level, BlockPos origin) {
+        var water = new java.util.ArrayList<BlockPos>();
+        var lava = new java.util.ArrayList<BlockPos>();
+        for (BlockPos pos : BlockPos.betweenClosed(origin.offset(-8, -4, -8), origin.offset(8, 4, 8))) {
+            if (!level.hasChunk(pos.getX() >> 4, pos.getZ() >> 4)) continue;
+            var fluid = level.getFluidState(pos);
+            if (!fluid.isSource()) continue;
+            if (fluid.getType() == net.minecraft.world.level.material.Fluids.WATER) water.add(pos.immutable());
+            if (fluid.getType() == net.minecraft.world.level.material.Fluids.LAVA) lava.add(pos.immutable());
+        }
+        java.util.function.Function<java.util.List<BlockPos>, String> describe = positions -> positions.stream()
+                .sorted(java.util.Comparator.comparingDouble(pos -> pos.distSqr(origin))).limit(6)
+                .map(pos -> pos.getX() + "," + pos.getY() + "," + pos.getZ()).toList().toString();
+        return "{water=" + describe.apply(water) + ",lava=" + describe.apply(lava) + "}";
+    }
+
     private static double wrapDegrees(double degrees) {
         double wrapped = degrees % 360.0;
         if (wrapped >= 180.0) {
@@ -224,32 +237,56 @@ final class WorldSynopsis {
         return wrapped;
     }
 
-    private static String inventory(net.minecraft.world.entity.player.Player player) {
-        Map<String, Integer> items = new TreeMap<>();
-        for (ItemStack stack : player.getInventory().getNonEquipmentItems()) {
+    /** Lists only what is held: slot numbers are 1-based, stacks show count, tools show durability. */
+    static String inventorySlots(net.minecraft.world.entity.player.Player player) {
+        var inv = player.getInventory();
+        StringBuilder out = new StringBuilder("{");
+        appendArea(out, "hotbar", inv, 0, 9);
+        appendArea(out, "main", inv, 9, 36);
+        StringBuilder worn = new StringBuilder();
+        String[] names = {"feet", "legs", "chest", "head"};
+        for (int i = 0; i < 4; i++) {
+            ItemStack stack = inv.getItem(36 + i);
             if (!stack.isEmpty()) {
-                String item = java.util.Objects.requireNonNull(
-                        BuiltInRegistries.ITEM.getKey(stack.getItem())).toString();
-                items.put(item, items.getOrDefault(item, 0) + stack.getCount());
+                worn.append(worn.length() > 0 ? "," : "").append(names[i]).append(':').append(describe(stack));
             }
         }
-        return topEntries(items, 24);
+        if (worn.length() > 0) {
+            out.append(out.length() > 1 ? "," : "").append("\"worn\":\"").append(worn).append('"');
+        }
+        ItemStack offhand = inv.getItem(40);
+        if (!offhand.isEmpty()) {
+            out.append(out.length() > 1 ? "," : "").append("\"offhand\":\"").append(describe(offhand)).append('"');
+        }
+        out.append("}");
+        return out.length() == 2 ? "empty" : out.toString();
     }
 
-    private static String hotbar(net.minecraft.world.entity.player.Player player) {
-        StringBuilder items = new StringBuilder("[");
-        for (int slot = 0; slot < 9; slot++) {
-            ItemStack stack = player.getInventory().getItem(slot);
-            if (stack.isEmpty()) {
-                continue;
+    private static void appendArea(StringBuilder out, String area, net.minecraft.world.entity.player.Inventory inv,
+            int from, int to) {
+        StringBuilder items = new StringBuilder();
+        for (int slot = from; slot < to; slot++) {
+            ItemStack stack = inv.getItem(slot);
+            if (!stack.isEmpty()) {
+                items.append(items.length() > 0 ? "," : "").append('"').append(slot - from + 1).append("\":\"")
+                        .append(describe(stack)).append('"');
             }
-            if (items.length() > 1) {
-                items.append(',');
-            }
-            items.append(slot).append('=').append(BuiltInRegistries.ITEM.getKey(stack.getItem()))
-                    .append(':').append(stack.getCount());
         }
-        return items.append(']').toString();
+        if (items.length() > 0) {
+            out.append(out.length() > 1 ? "," : "").append('"').append(area).append("\":{").append(items).append('}');
+        }
+    }
+
+    private static String describe(ItemStack stack) {
+        StringBuilder text = new StringBuilder(BuiltInRegistries.ITEM.getKey(stack.getItem()).getPath());
+        if (stack.getCount() > 1) {
+            text.append(" x").append(stack.getCount());
+        }
+        if (stack.isDamageableItem()) {
+            text.append(" dur=").append(stack.getMaxDamage() - stack.getDamageValue()).append('/')
+                    .append(stack.getMaxDamage());
+        }
+        return text.toString();
     }
 
     private static String topEntries(Map<String, Integer> entries, int limit) {

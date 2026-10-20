@@ -24,6 +24,26 @@ class EquipRulesTest {
     }
 
     @Test
+    void upgradesArmorAndEmptyOffhandWithoutDowngradingGear() {
+        assertEquals(java.util.List.of("minecraft:iron_chestplate", "minecraft:shield"), EquipRules.upgrades(
+                java.util.Map.of("minecraft:iron_chestplate", 1, "minecraft:leather_helmet", 1, "minecraft:shield", 1),
+                java.util.Map.of(EquipRules.HEAD, "minecraft:diamond_helmet"), false));
+        assertEquals(java.util.List.of(), EquipRules.upgrades(
+                java.util.Map.of("minecraft:iron_chestplate", 1, "minecraft:shield", 1),
+                java.util.Map.of(EquipRules.CHEST, "minecraft:elytra", EquipRules.OFFHAND, "minecraft:torch"), false));
+    }
+
+    @Test
+    void keepsOrEquipsGoldBootsForNetherWithoutReplacingThemWithIron() {
+        assertEquals(java.util.List.of("minecraft:golden_boots"), EquipRules.upgrades(
+                java.util.Map.of("minecraft:golden_boots", 1), java.util.Map.of(EquipRules.FEET, "minecraft:iron_boots"), true));
+        assertEquals(java.util.List.of(), EquipRules.upgrades(java.util.Map.of("minecraft:iron_boots", 1),
+                java.util.Map.of(EquipRules.FEET, "minecraft:golden_boots"), true));
+        assertEquals(java.util.List.of("minecraft:iron_boots"), EquipRules.upgrades(java.util.Map.of("minecraft:iron_boots", 1),
+                java.util.Map.of(EquipRules.FEET, "minecraft:golden_boots"), false));
+    }
+
+    @Test
     void namesSlots() {
         assertEquals("chest", EquipRules.slotName(EquipRules.CHEST));
         assertEquals("offhand", EquipRules.slotName(EquipRules.OFFHAND));

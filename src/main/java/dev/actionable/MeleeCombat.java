@@ -5,21 +5,16 @@ import net.minecraft.commands.arguments.EntityAnchorArgument;
 import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.world.InteractionHand;
 import net.minecraft.world.entity.Entity;
-import net.minecraft.world.entity.monster.Monster;
 
 /** Close-range melee only: no pathfinding, player targets, or neutral-mob provocation. */
 final class MeleeCombat {
     private MeleeCombat() { }
 
     static boolean allowed(Entity entity) {
-        if (!(entity instanceof Monster monster) || !entity.isAlive()) {
-            return false;
-        }
-        String id = BuiltInRegistries.ENTITY_TYPE.getKey(entity.getType()).toString();
-        return !id.equals("minecraft:creeper") && !id.equals("minecraft:enderman")
-                && !id.equals("minecraft:zombified_piglin") && !id.equals("minecraft:piglin")
-                && ((!id.equals("minecraft:spider") && !id.equals("minecraft:cave_spider"))
-                    || (monster.getTarget() != null && monster.getTarget() == Minecraft.getInstance().player));
+        if (!(entity instanceof net.minecraft.world.entity.LivingEntity)
+                || entity instanceof net.minecraft.world.entity.player.Player || !entity.isAlive()) return false;
+        String kind = BuiltInRegistries.ENTITY_TYPE.getKey(entity.getType()).toString();
+        return ThreatProbe.hostile(Minecraft.getInstance(), entity) && !ThreatRules.avoidMelee(kind);
     }
 
     static boolean reachable(Minecraft client, Entity entity) {
@@ -44,9 +39,15 @@ final class MeleeCombat {
         return nearest;
     }
 
+    static boolean inputAvailable(Minecraft client) {
+        return InteractionPolicy.mayAttack(Boolean.getBoolean("actionable.background"),
+                client.isWindowActive(), client.mouseHandler.isMouseGrabbed(),
+                client.gui.screen() != null, client.isPaused());
+    }
+
     static String attack(Minecraft client, int entityId) {
         if (client.player == null || client.level == null || client.gameMode == null
-                || !client.player.isAlive() || !client.mouseHandler.isMouseGrabbed() || !client.isWindowActive()) {
+                || !client.player.isAlive() || !inputAvailable(client)) {
             return "ATTACK_FAILED_UNAVAILABLE";
         }
         if (client.player.getHealth() <= 6) {
@@ -59,6 +60,28 @@ final class MeleeCombat {
         if (!reachable(client, target)) {
             return "ATTACK_FAILED_OUT_OF_REACH_OR_OBSTRUCTED";
         }
+        return strike(client, target);
+    }
+
+    /**
+     * Hits a passive animal for food or wool. Only used by the hunter, never by automatic defense,
+     * and only for adult animals within normal reach and sight.
+     */
+    static String hitAnimal(Minecraft client, Entity target) {
+        if (client.player == null || client.gameMode == null || !client.player.isAlive()) {
+            return "ATTACK_FAILED_UNAVAILABLE";
+        }
+        if (!(target instanceof net.minecraft.world.entity.animal.Animal animal) || !animal.isAlive() || animal.isBaby()) {
+            return "ATTACK_FAILED_INVALID_TARGET";
+        }
+        if (!client.player.isWithinEntityInteractionRange(target, 0) || !client.player.hasLineOfSight(target)) {
+            return "ATTACK_FAILED_OUT_OF_REACH_OR_OBSTRUCTED";
+        }
+        return strike(client, target);
+    }
+
+    private static String strike(Minecraft client, Entity target) {
+        int entityId = target.getId();
         // Prefer a sword already in the hotbar; do not rearrange inventory during a fight.
         int bestSlot = -1;
         int bestScore = 0;
@@ -82,6 +105,39 @@ final class MeleeCombat {
         client.player.swingAndResetAttackStrength(InteractionHand.MAIN_HAND,
                 client.player.getMainHandItem().getAttackAnimation(), false);
         return "ATTACK_SENT entity_id=" + entityId + "; observe target health before claiming damage or a kill";
+    }
+
+    /**
+     * Moves the best sword or axe into the last hotbar slot when a better one is only in the main
+     * inventory. Attacks only look at the hotbar, so a crafted sword left in the inventory was never used.
+     */
+    static void ensureWeaponInHotbar(Minecraft client) {
+        var player = client.player;
+        if (player == null || client.gameMode == null || player.containerMenu != player.inventoryMenu) {
+            return;
+        }
+        int hotbarBest = 0;
+        for (int slot = 0; slot < 9; slot++) {
+            hotbarBest = Math.max(hotbarBest, weaponScore(id(player.getInventory().getItem(slot))));
+        }
+        int bestSlot = -1;
+        int bestScore = hotbarBest;
+        for (int slot = net.minecraft.world.inventory.InventoryMenu.INV_SLOT_START;
+                slot < net.minecraft.world.inventory.InventoryMenu.INV_SLOT_END; slot++) {
+            int score = weaponScore(id(player.getInventory().getItem(slot)));
+            if (score > bestScore) {
+                bestScore = score;
+                bestSlot = slot;
+            }
+        }
+        if (bestSlot >= 0) {
+            client.gameMode.handleContainerInput(player.inventoryMenu.containerId, bestSlot, 8,
+                    net.minecraft.world.inventory.ContainerInput.SWAP, player);
+        }
+    }
+
+    private static String id(net.minecraft.world.item.ItemStack stack) {
+        return BuiltInRegistries.ITEM.getKey(stack.getItem()).toString();
     }
 
     static int weaponScore(String id) {

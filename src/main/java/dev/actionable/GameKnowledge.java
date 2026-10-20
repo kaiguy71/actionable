@@ -70,7 +70,21 @@ final class GameKnowledge {
             }
         }
 
+        List<String> progression = new ArrayList<>();
+        for (String item : items) {
+            StringBuilder entry = new StringBuilder(item);
+            TechTree.useOf(item).ifPresent(use -> entry.append(" used for: ").append(use));
+            TechTree.recipeFor(item).ifPresent(recipe -> entry.append("; Actionable crafts it from ")
+                    .append(recipe.inputs()).append(recipe.needsTable() ? " at a crafting table" : " anywhere"));
+            TechTree.sourceFor(item).ifPresent(source -> entry.append("; obtained by mining ").append(source.block())
+                    .append(source.tool() == TechTree.Tier.NONE ? "" : " with a " + TechTree.pickaxeFor(source.tool())));
+            if (entry.length() > item.length()) {
+                progression.add(entry.toString());
+            }
+        }
+
         return "Local registry matches: blocks=" + blocks + "; items=" + items
+                + "; progression knowledge=" + progression
                 + "; player-known crafting recipes=" + recipes
                 + ". Recipe results only include recipes currently known to the player's recipe book. "
                 + "This lookup does not provide global biome or ore-generation ranges; use loaded-world observations.";

@@ -128,7 +128,7 @@ final class NeedsPlanner {
         int wool = TechTree.held(inventory, TechTree.WHITE_WOOL);
         if (situation.night()) {
             text.append(facts.bedPlaced() ? " night; a bed is placed, so sleep."
-                    : " night and no bed (" + wool + "/3 white wool), so you cannot sleep; stay home and do home jobs.");
+                    : " night and no bed (" + wool + "/3 white wool), so you cannot sleep; keep working: get 3 wool for a bed (or find a village bed) or mine coal for torches.");
         } else {
             text.append(" day.");
         }

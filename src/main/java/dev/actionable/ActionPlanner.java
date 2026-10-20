@@ -106,7 +106,13 @@ final class ActionPlanner {
             Basic melee combat is available: {"type":"attack","entity_id":123} sends one hit to a
             live hostile mob identified in nearby_hostile_mobs. Only attack targets marked melee_reachable=true.
             Attacks respect weapon cooldown and line of sight. No ranged attacks or combat pathfinding.
-            Never target players or neutral mobs. Escape creepers and flee when health is 6 or lower.
+            Skeletons and creepers are fought by code with specialised styles when you hold a weapon: skeletons are
+            rushed and killed with jump crits, creepers are crit once then backed away from while the attack
+            recharges, repeatedly; do not run from them at range with a weapon in hand.
+            Reflex building also runs in code: with 3+ melee mobs close and cheap blocks (cobblestone, dirt, planks)
+            held, the bot pillars up 4 blocks out of reach; with 2+ skeletons in sight and 9+ blocks it walls
+            itself in (4 sides, 2 high, plus a roof), then opens a gap once they are gone. Carry spare cobblestone.
+            Never target players or neutral mobs. Flee when health is 6 or lower.
             Observe target health/death before claiming damage or kills; repeat attack if still needed.
 
             Counting: every quantity is a TOTAL to hold, never an amount to add. "mine 18 minecraft:birch_log"
@@ -132,10 +138,17 @@ final class ActionPlanner {
               It is your best tool when confused, stuck, in a rough situation (trapped in a hole or
               water, surrounded, repeated failures, a result that makes no sense) and for checking what
               a build or the surroundings really look like. When in doubt, take one before guessing again.
+            - {"type":"respawn"} only while the synopsis says you are DEAD: respawns you at your bed or the
+              world spawn. Your session continues; the death note gives the cause, the death coordinates,
+              and the seconds left before your dropped items despawn (600). The mobs that killed you may
+              still be there, so at night or without a weapon and light source prepare first (or accept
+              the loss); your home location stays in the briefing. Go back with goto and pick the items up.
             - {"type":"white_flag","reason":"short"} gives up on this attempt when you truly cannot make
               progress (repeated failures after a screenshot and a fresh look). The session is thrown
               away and the original task restarts from scratch with a fresh mind.
 
+            At night without a bed your main jobs are: get a bed (3 wool + 3 planks, or find one in a village),
+            or mine coal for torches. Do not stop working or wait inside.
             Night and darkness: dark is a risk, never a reason to freeze. Night makes hostile mobs spawn
             on the surface in the dark, so before dusk gather a sword, torches/lantern/campfire and a bed
             (3 wool + 3 planks) when affordable. At night you may sleep in a bed, stay near light, keep
@@ -569,6 +582,9 @@ final class ActionPlanner {
         if (type.equals("white_flag")) {
             return Optional.of(new PlannedAction("white_flag", "", "", 0, 0, 0,
                     cleanText(action, "reason", "no reason given", 120)));
+        }
+        if (type.equals("respawn")) {
+            return Optional.of(new PlannedAction("respawn", "", "", 0, 0, 0, ""));
         }
         if (type.equals("screenshot")) {
             return Optional.of(new PlannedAction("screenshot", "", "", 0, 0, 0, ""));

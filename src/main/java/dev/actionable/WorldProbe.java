@@ -77,9 +77,15 @@ final class WorldProbe {
      */
     /** The log block id nearest to {@code origin} within the radius, whatever its wood type; null if none. */
     static String nearestLogType(ClientLevel level, BlockPos origin, int radius) {
+        BlockPos pos = nearestLog(level, origin, radius);
+        return pos == null ? null : BuiltInRegistries.BLOCK.getKey(level.getBlockState(pos).getBlock()).toString();
+    }
+
+    /** The nearest natural log of any wood type within the radius; null if none is loaded. */
+    static BlockPos nearestLog(ClientLevel level, BlockPos origin, int radius) {
         BlockPos.MutableBlockPos cursor = new BlockPos.MutableBlockPos();
         double best = Double.MAX_VALUE;
-        String found = null;
+        BlockPos found = null;
         for (int dx = -radius; dx <= radius; dx++) {
             for (int dz = -radius; dz <= radius; dz++) {
                 if (!level.hasChunk((origin.getX() + dx) >> 4, (origin.getZ() + dz) >> 4)) {
@@ -96,7 +102,7 @@ final class WorldProbe {
                         String id = BuiltInRegistries.BLOCK.getKey(state.getBlock()).toString();
                         if (!id.contains("stripped_")) {
                             best = distance;
-                            found = id;
+                            found = cursor.immutable();
                         }
                     }
                 }
@@ -375,16 +381,32 @@ final class WorldProbe {
      * placed by mistake and are taken back.
      */
     static List<BlockPos> strayDoors(ClientLevel level, int[] home) {
+        List<BlockPos> doors = new ArrayList<>(doorsAround(level, home));
+        doors.removeIf(pos -> isDoorway(home, pos));
+        return doors;
+    }
+
+    /** The doorway column, or any door in the north wall line, counts as the house door. */
+    static boolean isDoorway(int[] home, BlockPos pos) {
+        return pos.getY() == home[1] + HouseDesign.DOOR_CELL[1] && pos.getZ() == home[2] + HouseDesign.DOOR_CELL[2]
+                && pos.getX() >= home[0] + 1 && pos.getX() <= home[0] + HouseDesign.WIDTH - 2;
+    }
+
+    /** True when a door hangs in the house's doorway (or one cell either side of it in the north wall). */
+    static boolean houseDoorPlaced(ClientLevel level, int[] home) {
+        return doorsAround(level, home).stream().anyMatch(pos -> isDoorway(home, pos));
+    }
+
+    /** Lower halves of every door in or around the house. */
+    static List<BlockPos> doorsAround(ClientLevel level, int[] home) {
         List<BlockPos> doors = new ArrayList<>();
-        BlockPos doorway = new BlockPos(home[0] + HouseDesign.DOOR_CELL[0], home[1] + HouseDesign.DOOR_CELL[1],
-                home[2] + HouseDesign.DOOR_CELL[2]);
         for (BlockPos pos : BlockPos.betweenClosed(new BlockPos(home[0] - 2, home[1] - 1, home[2] - 3),
                 new BlockPos(home[0] + HouseDesign.WIDTH + 1, home[1] + HouseDesign.HEIGHT, home[2] + HouseDesign.LENGTH + 1))) {
             var state = level.getBlockState(pos);
             if (state.getBlock() instanceof net.minecraft.world.level.block.DoorBlock
                     && state.getValue(net.minecraft.world.level.block.DoorBlock.HALF)
                             == net.minecraft.world.level.block.state.properties.DoubleBlockHalf.LOWER
-                    && !pos.equals(doorway)) {
+                    ) {
                 doors.add(pos.immutable());
             }
         }

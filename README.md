@@ -1,4 +1,4 @@
-# Actionable version 0.1.4b
+# Actionable version 0.1.5
 Readme Date: 10/20/2026
 
 A client-side Fabric mod that plays Minecraft autonomously: an Ollama or Claude model chooses its own goals,
@@ -90,7 +90,20 @@ The first goals are a checklist run by code that mirrors `progression.txt`: 8 lo
 the current biome (see the wood table), wooden pickaxe and axe, stone pickaxe/axe/shovel/sword, 64 cobblestone,
 16 logs, then a 5x5 house (Baritone builds it from a generated schematic) wherever the wood was found, a solid
 dry floor, a crafting table and a door inside, a wooden sword, 3 white wool from sheep, and a bed. The house corner is saved per world in `config/actionable-homes.json`.
-Once a house exists, until the player holds a stone pickaxe and stone sword, it stays within 6 chunks (96 blocks) horizontally and 30 blocks vertically of home. Mining logs never lets Baritone dig down for trees: with no log in loaded chunks the bot walks the surface to
+Once a house exists, until the player holds a stone pickaxe and stone sword, it stays within 6 chunks (96 blocks) horizontally and 30 blocks vertically of home. Combat has per-mob styles (`MobFighter`), used in autonomous mode when a weapon is held and health is above 6:
+skeletons (also strays and bogged) are rushed, sprinting until near, and killed with jump-crit hits; creepers get one
+crit, then the bot sprints away while the attack recharges (and whenever the fuse swells) and steps back in for the
+next hit until it dies. Other hostiles keep the plain melee defense.
+
+Reflexive shelter building (`Shelter`, autonomous mode only): with 3+ melee mobs within 9 blocks the bot pillars
+up 4 blocks with cheap blocks (cobblestone, dirt, planks...); with 2+ skeletons in line of sight and 9+ blocks it walls
+itself in (4 sides, 2 high, roof). It opens a gap and resumes once the threat has been gone for ~4 s (or after 60 s).
+
+On death the LLM session is kept: the model is told the cause, the death coordinates and a 600 second window to
+recover its items (with a warning that the mobs may still be there, and the home location), and chooses
+`{"type":"respawn"}` itself. In autonomous mode with no active task the mod respawns after 3 seconds.
+
+Mining logs never lets Baritone dig down for trees: with no log in loaded chunks the bot walks the surface to
 look for trees, and a mine that descends more than 4 blocks is stopped. On first use each launch the mod also sets
 Baritone options: `blacklistClosestOnFailure false`, `useSwordToMine false`, all three parkour options,
 `allowVines true`, `legitMine false` and `smoothLook true`.

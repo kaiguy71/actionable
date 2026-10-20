@@ -82,6 +82,9 @@ public final class ActionableClient implements ClientModInitializer {
     private static final int AVOID_MEMORY = 4;
     private static final int SITE_SCAN_RADIUS = 24;
     private static final int SURFACE_SCAN_RADIUS = 48;
+    private static final int BARITONE_CANCEL_TICKS = 4;
+    private static final int WOOD_NEAR_HORIZONTAL = 10;
+    private static final int WOOD_NEAR_VERTICAL = 3;
     private static final int SURFACE_DROP_LIMIT = 4;
     private static final java.util.List<String> BARITONE_SETTINGS = java.util.List.of(
             "blacklistClosestOnFailure false", "useSwordToMine false", "allowParkour true",
@@ -145,6 +148,18 @@ public final class ActionableClient implements ClientModInitializer {
     private int[] lastSafePosition;
     private int[] mineStart;
     private String pendingMine;
+    /** A surface search spot, kept until reached so a retry never restarts Baritone's block breaking. */
+    private int[] surfaceTarget;
+    private String queuedBaritone;
+    private static final int DEATH_RECOVERY_TICKS = 12000;
+    private boolean awaitingRespawn;
+    private int[] deathPos;
+    private String deathDimension = "";
+    private String deathCause = "";
+    private long deathRecoveryUntil;
+    private long deathSeenAt;
+    private long queuedBaritoneAt;
+    private long lastCancelTick = -100;
     private long pendingMineSince;
     private String goalReason = "";
     private String safetyStatus = "unknown";
@@ -241,6 +256,10 @@ public final class ActionableClient implements ClientModInitializer {
 
         ClientTickEvents.END_CLIENT_TICK.register(client -> {
             clientTick++;
+            if (tickDeath(client)) {
+                return;
+            }
+            flushQueuedBaritone(client);
             updateBaritoneProgress(client);
             tickUnstick(client);
             tickJumpPlace(client);
@@ -264,6 +283,9 @@ public final class ActionableClient implements ClientModInitializer {
                 if (controlDown) {
                     toggle(client);
                 }
+            }
+            if (tickShelter(client)) {
+                return;
             }
             if (tickDefense(client)) {
                 return;
@@ -326,6 +348,9 @@ public final class ActionableClient implements ClientModInitializer {
         }
 
         // A new /action is a clean slate: nothing from earlier tasks may leak into this one.
+        if (!awaitingRespawn) {
+            deathPos = null;
+        }
         client.getConnection().sendChat("#stop");
         baritoneCommandRunning = false;
         currentBaritoneCommand = "";
@@ -397,8 +422,8 @@ public final class ActionableClient implements ClientModInitializer {
             beginTask(client, chosen);
             return;
         }
-        java.util.Optional<ProgressPlanner.Milestone> foundation = milestone(client)
-                .filter(ProgressPlanner::isFoundation);
+        java.util.Optional<ProgressPlanner.Milestone> foundation = nightMilestone(client, inventoryNow)
+                .or(() -> milestone(client)).filter(ProgressPlanner::isFoundation);
         if (foundation.isPresent() && dangerEscape(client) == null) {
             // Wood, house, wool and bed come first, in order, without a director call.
             String chosen = foundation.get().goal();
@@ -490,6 +515,28 @@ public final class ActionableClient implements ClientModInitializer {
      * The next tech-tree milestone, used when the director fails, repeats itself, or picks something
      * impossible. Inventory decides what is done; a milestone attempted twice recently is skipped.
      */
+    /**
+     * At night with no bed placed the work continues, aimed at the two things that help: a bed (placed when the
+     * wool is in hand) or coal for torches. Anything else follows the normal order.
+     */
+    private java.util.Optional<ProgressPlanner.Milestone> nightMilestone(Minecraft client,
+            java.util.Map<String, Integer> inventory) {
+        if (client.level == null || !client.level.isDarkOutside()) {
+            return java.util.Optional.empty();
+        }
+        ProgressPlanner.Facts facts = facts(client);
+        if (facts.bedPlaced()) {
+            return java.util.Optional.empty();
+        }
+        boolean bedReady = TechTree.held(inventory, TechTree.WHITE_WOOL) >= 3
+                || inventory.getOrDefault(TechTree.WHITE_BED, 0) > 0;
+        boolean wantTorches = TechTree.held(inventory, "minecraft:torch") < 8;
+        return ProgressPlanner.MILESTONES.stream().filter(m -> (bedReady && m.kind() == ProgressPlanner.Kind.BED)
+                || (!bedReady && wantTorches && m.item().equals("minecraft:torch")))
+                .filter(next -> facts.houseBuilt() || !next.item().equals(TechTree.WHITE_BED))
+                .filter(next -> !ProgressPlanner.satisfied(next, inventory, facts)).findFirst();
+    }
+
     private java.util.Optional<ProgressPlanner.Milestone> milestone(Minecraft client) {
         if (client.player == null) {
             return java.util.Optional.empty();
@@ -529,8 +576,7 @@ public final class ActionableClient implements ClientModInitializer {
             int maxStep = StairMine.maxStep(home[1]);
             int depth = StairMine.depth(probe, maxStep);
             mine = depth >= maxStep || (depth > 0 && StairMine.check(probe, depth) != StairMine.Check.OK);
-            door = client.level.getBlockState(homeCell(HouseDesign.DOOR_CELL)).getBlock()
-                    instanceof net.minecraft.world.level.block.DoorBlock
+            door = WorldProbe.houseDoorPlaced(client.level, home)
                     && WorldProbe.strayDoors(client.level, home).isEmpty();
             BlockPos feet = client.player.blockPosition();
             atHome = HouseDesign.inside(home, feet.getX(), feet.getY(), feet.getZ());
@@ -606,7 +652,8 @@ public final class ActionableClient implements ClientModInitializer {
         return ProgressPlanner.briefing(inventory, tableAccess(client), WorldProbe.preferredLog(inventory, synopsis),
                 facts, HomeRange.describe(anchor(), HomeRange.geared(inventory), facts.houseBuilt()))
                 + "\n" + woodLine(synopsis)
-                + "\n" + NeedsPlanner.report(inventory, situation(client, facts));
+                + "\n" + NeedsPlanner.report(inventory, situation(client, facts))
+                + (deathPos == null ? "" : "\n" + deathContext());
     }
 
     private static String woodLine(String synopsis) {
@@ -647,7 +694,8 @@ public final class ActionableClient implements ClientModInitializer {
         if (!hurt && nearestDistance > 64) {
             return null;
         }
-        if (!hurt && MeleeCombat.reachable(client, nearest)) {
+        if (!hurt && (MeleeCombat.reachable(client, nearest)
+                || (MobFighter.engageable(client, nearest) && hasWeapon(client)))) {
             return null;
         }
         BlockPos threat = nearest.blockPosition();
@@ -655,11 +703,69 @@ public final class ActionableClient implements ClientModInitializer {
     }
 
     /** Immediate defense does not wait for a model round trip or abandon the interrupted task. */
+    private final MobFighter mobFighter = new MobFighter();
+    private final Shelter shelter = new Shelter();
+
+    private boolean tickShelter(Minecraft client) {
+        boolean ready = enabled && autonomous && client.player != null && client.level != null
+                && client.player.isAlive() && client.mouseHandler.isMouseGrabbed() && client.isWindowActive();
+        if (!ready) {
+            if (shelter.active()) {
+                shelter.finish(client);
+            }
+            return false;
+        }
+        if (!shelter.active()) {
+            Shelter.Mode wanted = shelter.wanted(client);
+            if (wanted == Shelter.Mode.NONE) {
+                return false;
+            }
+            shelter.begin(client, wanted, clientTick);
+            generation++;
+            planning = false;
+            judging = false;
+            choosingGoal = false;
+            pendingJumpPlace = null;
+            cancelCraft(client);
+            cancelBreak(client);
+            stopBaritone(client);
+            mobFighter.release(client);
+            defending = true;
+            ActionableLog.LOGGER.info("[Actionable] shelter_started mode={}", wanted);
+            tell(client, "Reflex: " + wanted + " shelter against a group of hostile mobs");
+        }
+        String status = shelter.tick(client, clientTick, (cell, block) -> placeBlock(client,
+                new ActionPlanner.PlannedAction("place_block", "", block, cell.getX(), cell.getY(), cell.getZ(), "")));
+        if (status == null) {
+            defending = false;
+            stepJudged = false;
+            ticksUntilPlan = 0;
+            remember("shelter", "Shelter reflex ended; observe the world and resume the task");
+            return false;
+        }
+        lastAction = "shelter " + shelter.mode().name().toLowerCase(java.util.Locale.ROOT);
+        lastResult = status;
+        currentGoal = "Sheltering from a mob group";
+        return true;
+    }
+
+    private static boolean hasWeapon(Minecraft client) {
+        return client.player != null && WorldProbe.inventory(client.player).entrySet().stream()
+                .anyMatch(entry -> entry.getValue() > 0 && MeleeCombat.weaponScore(entry.getKey()) > 0);
+    }
+
     private boolean tickDefense(Minecraft client) {
-        net.minecraft.world.entity.Entity target = enabled && autonomous && !escaping
+        boolean ready = enabled && autonomous && !escaping
                 && client.player != null && client.player.isAlive() && client.player.getHealth() > DANGER_HEALTH
                 && client.mouseHandler.isMouseGrabbed() && client.isWindowActive()
-                && dangerEscape(client) == null ? MeleeCombat.nearest(client) : null;
+                && dangerEscape(client) == null;
+        // Skeletons and creepers get their own fighting style; everything else is plain close-range melee.
+        net.minecraft.world.entity.Entity special = ready && hasWeapon(client) ? MobFighter.nearest(client) : null;
+        net.minecraft.world.entity.Entity target = special != null ? special
+                : ready ? MeleeCombat.nearest(client) : null;
+        if (special == null) {
+            mobFighter.release(client);
+        }
         if (target == null) {
             if (defending) {
                 defending = false;
@@ -691,6 +797,15 @@ public final class ActionableClient implements ClientModInitializer {
             cancelCraft(client);
             cancelBreak(client);
             stopBaritone(client);
+        }
+        if (special != null) {
+            lastAction = "fight " + BuiltInRegistries.ENTITY_TYPE.getKey(target.getType()).getPath();
+            lastResult = mobFighter.tick(client, target);
+            if (lastResult.startsWith("FIGHT_HIT")) {
+                ActionableLog.LOGGER.info("[Actionable] combat {}", ActionableLog.text(lastResult));
+            }
+            currentGoal = "Fighting " + BuiltInRegistries.ENTITY_TYPE.getKey(target.getType());
+            return true;
         }
         lastAction = "attack entity_id=" + target.getId();
         lastResult = MeleeCombat.attack(client, target.getId());
@@ -859,6 +974,8 @@ public final class ActionableClient implements ClientModInitializer {
 
     private void resetToDefaults(Minecraft client) {
         ContextCapture.clear();
+        deathPos = null;
+        awaitingRespawn = false;
         planner.cancelPending();
         generation++;
         try {
@@ -891,6 +1008,8 @@ public final class ActionableClient implements ClientModInitializer {
         escaping = false;
         retreating = false;
         defending = false;
+        mobFighter.release(client);
+        shelter.finish(client);
         returningHome = false;
         nightRoutine = false;
         nightJob = false;
@@ -1188,8 +1307,8 @@ public final class ActionableClient implements ClientModInitializer {
             ticksUntilPlan = 20;
             return;
         }
-        boolean useSteps = !taskSteps.isEmpty() && !finalCheck;
-        if (leaveWater(client)) {
+        boolean useSteps = !taskSteps.isEmpty() && !finalCheck && !awaitingRespawn;
+        if (!awaitingRespawn && leaveWater(client)) {
             ticksUntilPlan = 60;
             return;
         }
@@ -1223,7 +1342,8 @@ public final class ActionableClient implements ClientModInitializer {
         }
         long requestGeneration = generation;
         planning = true;
-        String synopsis = WorldSynopsis.capture(client) + "; " + baritoneProgress(client);
+        String synopsis = WorldSynopsis.capture(client) + "; " + baritoneProgress(client)
+                + (deathPos == null ? "" : "; " + deathContext());
         String taskWithOrigin = activeTask + "\nTask prompt origin xyz: "
                 + (taskOrigin == null ? "unknown" : taskOrigin.getX() + "," + taskOrigin.getY() + "," + taskOrigin.getZ());
         planner.plan(taskWithOrigin, synopsis, lastAction, lastResult, planContext(), historyText())
@@ -1280,7 +1400,25 @@ public final class ActionableClient implements ClientModInitializer {
             }
 
             ActionPlanner.PlannedAction action = plan.action().orElseThrow();
+            if (awaitingRespawn && !action.type().equals("respawn") && !action.type().equals("wait")) {
+                lastAction = action.type();
+                lastResult = "PLAYER_DEAD: nothing works while dead; choose {\"type\":\"respawn\"}. " + deathContext();
+                remember(lastAction, lastResult);
+                ticksUntilPlan = 20;
+                return;
+            }
             switch (action.type()) {
+                case "respawn" -> {
+                    lastAction = "respawn";
+                    if (awaitingRespawn) {
+                        respawn(client);
+                        lastResult = "Respawn requested. " + deathContext();
+                    } else {
+                        lastResult = "You are alive; no respawn needed. " + deathContext();
+                    }
+                    tell(client, "Respawning.");
+                    ticksUntilPlan = 30;
+                }
                 case "attack" -> {
                     stopBaritone(client);
                     lastAction = "attack entity_id=" + action.command();
@@ -1558,13 +1696,16 @@ public final class ActionableClient implements ClientModInitializer {
         }
         BlockPos lower = homeCell(HouseDesign.DOOR_CELL);
         BlockPos upper = lower.above();
+        if (WorldProbe.houseDoorPlaced(level, home)) {
+            return false;
+        }
         for (BlockPos cell : java.util.List.of(upper, lower)) {
             var state = level.getBlockState(cell);
             if (!state.isAir() && !(state.getBlock() instanceof net.minecraft.world.level.block.DoorBlock)) {
                 return breakForDoor(client, cell, "Clearing the doorway for the door");
             }
         }
-        if (level.getBlockState(lower).getBlock() instanceof net.minecraft.world.level.block.DoorBlock) {
+        if (WorldProbe.houseDoorPlaced(level, home)) {
             return false;
         }
         String door = WorldProbe.inventory(player).keySet().stream().filter(TechTree::isDoor).findFirst()
@@ -2052,7 +2193,12 @@ public final class ActionableClient implements ClientModInitializer {
         }
         BlockPos center = home != null ? new BlockPos(home[0] + 2, home[1], home[2] + 2) : player.blockPosition();
         BlockPos bed = WorldProbe.nearestBed(level, center, home != null ? 6 : 24);
-        if (bed == null && home == null) {
+        if (bed == null) {
+            // No bed means no sleeping, but never stop working: night goals are steered toward a bed or coal.
+            if (nightRoutine) {
+                nightRoutine = false;
+                nightJob = false;
+            }
             return;
         }
         BlockPos stand = home != null ? homeCell(HouseDesign.DOOR_STAND) : bed;
@@ -2612,6 +2758,17 @@ public final class ActionableClient implements ClientModInitializer {
      * blocks the player cannot harvest, and walks to an exposed, lit deposit instead of letting Baritone
      * pick the nearest one, which may be deep in a dark cave.
      */
+    private static boolean nearLog(BlockPos player, BlockPos log) {
+        return Math.abs(player.getX() - log.getX()) <= WOOD_NEAR_HORIZONTAL
+                && Math.abs(player.getZ() - log.getZ()) <= WOOD_NEAR_HORIZONTAL
+                && Math.abs(player.getY() - log.getY()) <= WOOD_NEAR_VERTICAL + 4;
+    }
+
+    private boolean surfaceTargetReached(BlockPos player) {
+        return surfaceTarget != null && Math.abs(player.getX() - surfaceTarget[0]) <= 4
+                && Math.abs(player.getZ() - surfaceTarget[2]) <= 4;
+    }
+
     /** Blocks that only grow on the surface, where Baritone's mine must never be left to dig for them. */
     private static boolean isSurfaceBlock(String blockId) {
         return blockId.endsWith("_log") || blockId.endsWith("_wood");
@@ -2673,22 +2830,45 @@ public final class ActionableClient implements ClientModInitializer {
         int[] anchor = anchor();
         boolean geared = rangeExempt(client);
         sites.removeIf(site -> HomeRange.outside(anchor, geared, site.x(), site.y(), site.z(), 0));
-        if (sites.isEmpty() && surfaceOnly) {
-            // With no log in loaded chunks Baritone's mine digs down into caves to look for one; walk the
-            // surface to fresh ground instead and ask again from there.
-            int[] here = {player.getBlockX(), player.getBlockY(), player.getBlockZ()};
-            int[] target = HomeRange.searchTarget(here, wanderAttempts++, SURFACE_SCAN_RADIUS * 2);
-            if (!geared && anchor != null && HomeRange.outside(anchor, false, target[0], target[1], target[2], 0)) {
-                target = HomeRange.searchTarget(anchor, wanderAttempts, HomeRange.RADIUS);
+        if (surfaceOnly) {
+            BlockPos log = WorldProbe.nearestLog(level, player.blockPosition(), SURFACE_SCAN_RADIUS);
+            if (log != null && !nearLog(player.blockPosition(), log)) {
+                // Walk to the trees first, then mine once within reach; a destination is never swapped mid-walk.
+                surfaceTarget = new int[] {log.getX(), log.getY(), log.getZ()};
+                if (!(baritoneCommandRunning && currentBaritoneCommand.equals(HomeRange.surfaceGoto(surfaceTarget)))) {
+                    executeBaritone(client, connection, HomeRange.surfaceGoto(surfaceTarget));
+                }
+                pendingMine = mine;
+                pendingMineSince = clientTick;
+                lastAction = mine;
+                lastResult = "Walking to the trees at " + log.getX() + "," + log.getZ()
+                        + " first; mining starts within " + WOOD_NEAR_HORIZONTAL + " blocks of them";
+                return;
             }
-            executeBaritone(client, connection, HomeRange.surfaceGoto(target));
-            pendingMine = mine;
-            pendingMineSince = clientTick;
-            lastAction = mine;
-            lastResult = "No " + blockId + " in loaded chunks nearby; walking the surface to " + target[0] + ","
-                    + target[2] + " to look for trees (never digging down for them); mining starts on arrival."
-                    + " " + TreeBiomes.table().lines().findFirst().orElse("");
-            return;
+            if (log == null) {
+                // With no log in loaded chunks Baritone's mine digs down into caves to look for one; walk the
+                // surface to fresh ground instead and ask again from there.
+                if (surfaceTarget == null || surfaceTargetReached(player.blockPosition())) {
+                    int[] here = {player.getBlockX(), player.getBlockY(), player.getBlockZ()};
+                    surfaceTarget = HomeRange.searchTarget(here, wanderAttempts++, SURFACE_SCAN_RADIUS * 2);
+                    if (!geared && anchor != null && HomeRange.outside(anchor, false, surfaceTarget[0],
+                            surfaceTarget[1], surfaceTarget[2], 0)) {
+                        surfaceTarget = HomeRange.searchTarget(anchor, wanderAttempts, HomeRange.RADIUS);
+                    }
+                }
+                String walk = HomeRange.surfaceGoto(surfaceTarget);
+                if (!(baritoneCommandRunning && currentBaritoneCommand.equals(walk))) {
+                    executeBaritone(client, connection, walk);
+                }
+                pendingMine = mine;
+                pendingMineSince = clientTick;
+                lastAction = mine;
+                lastResult = "No " + blockId + " in loaded chunks nearby; walking the surface to "
+                        + surfaceTarget[0] + "," + surfaceTarget[2] + " to look for trees (never digging down for"
+                        + " them); mining starts on arrival. Let this walk finish.";
+                return;
+            }
+            surfaceTarget = null;
         }
         if (sites.isEmpty() && anchor != null && !geared && surfaceOnly) {
             // Baritone's mine would roam unbounded to find more; look around near home instead.
@@ -2741,13 +2921,28 @@ public final class ActionableClient implements ClientModInitializer {
             double remaining = gotoDistance(client);
             boolean arrived = remaining >= 0 && remaining <= 3;
             boolean stalled = clientTick - lastBaritoneMovementAt > 100 || clientTick - pendingMineSince > 1200;
+            String pendingTarget = pendingMine.split("\\s+")[2];
+            if (isSurfaceBlock(pendingTarget)) {
+                // Wood: only react once trees are close or the walk ended; never swap the destination mid-walk.
+                BlockPos log = WorldProbe.nearestLog(client.level, player.blockPosition(), SURFACE_SCAN_RADIUS);
+                boolean walkEnded = !baritoneCommandRunning;
+                if ((log != null && nearLog(player.blockPosition(), log)) || walkEnded || arrived
+                        || surfaceTargetReached(player.blockPosition())) {
+                    String mine = pendingMine;
+                    pendingMine = null;
+                    if (log != null && nearLog(player.blockPosition(), log)) {
+                        surfaceTarget = null;
+                        executeBaritone(client, connection, mine);
+                        mineStart = new int[] {player.getBlockX(), player.getBlockY(), player.getBlockZ()};
+                        remember(mine, lastResult);
+                    } else {
+                        startMine(client, connection, mine);
+                    }
+                }
+                return;
+            }
             if (arrived || stalled) {
                 String mine = pendingMine;
-                if (isSurfaceBlock(mine.split("\\s+")[2])) {
-                    // Re-check for trees from the new spot; this walks on if there still are none.
-                    startMine(client, connection, mine);
-                    return;
-                }
                 executeBaritone(client, connection, mine);
                 mineStart = new int[] {player.getBlockX(), player.getBlockY(), player.getBlockZ()};
                 remember(mine, lastResult);
@@ -2892,6 +3087,107 @@ public final class ActionableClient implements ClientModInitializer {
         }
     }
 
+    /** Handles death: the session continues, and the model chooses when to respawn. True while dead. */
+    private boolean tickDeath(Minecraft client) {
+        var player = client.player;
+        if (player == null || client.level == null) {
+            awaitingRespawn = false;
+            return false;
+        }
+        boolean dead = player.isDeadOrDying();
+        if (!dead) {
+            if (awaitingRespawn) {
+                awaitingRespawn = false;
+                lastAction = "respawn";
+                lastResult = "Respawned. " + deathContext();
+                errorCode = "none";
+                lastError = "none";
+                ticksUntilPlan = 20;
+            }
+            return false;
+        }
+        if (!awaitingRespawn) {
+            awaitingRespawn = true;
+            deathSeenAt = clientTick;
+            deathRecoveryUntil = clientTick + DEATH_RECOVERY_TICKS;
+            deathPos = new int[] {player.getBlockX(), player.getBlockY(), player.getBlockZ()};
+            deathDimension = String.valueOf(client.level.dimension().identifier());
+            String cause;
+            try {
+                cause = player.getCombatTracker().getDeathMessage().getString();
+            } catch (RuntimeException unknown) {
+                cause = "unknown";
+            }
+            deathCause = cause;
+            ContextCapture.event("player died", deathCause + " at " + position(deathPos));
+            ActionableLog.LOGGER.info("[Actionable] player_died cause={} at={}", ActionableLog.text(deathCause),
+                    position(deathPos));
+            cancelCraft(client);
+            cancelBreak(client);
+            pendingHunt = null;
+            pendingMine = null;
+            queuedBaritone = null;
+            baritoneCommandRunning = false;
+            currentBaritoneCommand = "";
+            errorCode = "PLAYER_DIED";
+            lastError = compact(deathCause, 140);
+            lastAction = "died";
+            lastResult = "You are DEAD. " + deathContext() + " Choose {\"type\":\"respawn\"}.";
+            ticksUntilPlan = 0;
+        }
+        if (!enabled || !working()) {
+            return true;
+        }
+        if (activeTask == null && autonomous && clientTick - deathSeenAt > 60) {
+            // No model session to ask: respawn and let goal selection pick the recovery up.
+            respawn(client);
+        } else if (activeTask != null && !planning && !decomposing && !judging && ticksUntilPlan-- <= 0) {
+            requestNextPlan(client);
+        }
+        return true;
+    }
+
+    private void respawn(Minecraft client) {
+        if (client.player != null) {
+            client.player.respawn();
+        }
+    }
+
+    private static String position(int[] pos) {
+        return pos[0] + "," + pos[1] + "," + pos[2];
+    }
+
+    /** What the model needs after a death: cause, where, how long the items last, and where home is. */
+    private String deathContext() {
+        if (deathPos == null) {
+            return "";
+        }
+        long remaining = Math.max(0, (deathRecoveryUntil - clientTick) / 20);
+        int[] anchor = anchor();
+        if (!awaitingRespawn && clientTick > deathRecoveryUntil) {
+            deathPos = null;
+            return "";
+        }
+        return "death_note={" + (awaitingRespawn ? "status=DEAD" : "status=respawned") + ",cause=" + compact(deathCause, 100)
+                + ",death_xyz=" + position(deathPos) + ",dimension=" + deathDimension
+                + ",seconds_left_to_recover_items=" + remaining
+                + ",warning=the mobs that killed you may still be there, especially at night or without a weapon"
+                + " and light source; take care before going back"
+                + ",home=" + (anchor == null ? "none" : position(anchor)) + "}";
+    }
+
+    private void flushQueuedBaritone(Minecraft client) {
+        if (queuedBaritone == null || clientTick < queuedBaritoneAt) {
+            return;
+        }
+        String command = queuedBaritone;
+        queuedBaritone = null;
+        var connection = client.getConnection();
+        if (connection != null && client.player != null && enabled) {
+            connection.sendChat(command);
+        }
+    }
+
     private void executeBaritone(Minecraft client,
                                  net.minecraft.client.multiplayer.ClientPacketListener connection,
                                  String command) {
@@ -2915,8 +3211,19 @@ public final class ActionableClient implements ClientModInitializer {
                 || BaritoneProbe.query().map(BaritoneProbe.State::active).orElse(false))) {
             // A running mine does not always yield to a new goto; cancel it explicitly first.
             connection.sendChat("#cancel");
+            lastCancelTick = clientTick;
+            if (!command.equals("cancel")) {
+                // Baritone drops a command sent in the same instant as #cancel; give it a few ticks.
+                queuedBaritone = "#" + command;
+                queuedBaritoneAt = clientTick + BARITONE_CANCEL_TICKS;
+            }
+        } else if (!command.equals("cancel") && clientTick - lastCancelTick < BARITONE_CANCEL_TICKS) {
+            queuedBaritone = "#" + command;
+            queuedBaritoneAt = lastCancelTick + BARITONE_CANCEL_TICKS;
+        } else {
+            queuedBaritone = null;
+            connection.sendChat("#" + command);
         }
-        connection.sendChat("#" + command);
         lastAction = command;
         travelDirection = null;
         pendingMine = null;
@@ -2966,12 +3273,14 @@ public final class ActionableClient implements ClientModInitializer {
     private void stopBaritone(Minecraft client) {
         pendingMine = null;
         mineStart = null;
+        queuedBaritone = null;
         if (!baritoneCommandRunning && !BaritoneProbe.query().map(BaritoneProbe.State::active).orElse(false)) {
             return;
         }
         var connection = client.getConnection();
         if (connection != null) {
             connection.sendChat("#cancel");
+            lastCancelTick = clientTick;
         }
         baritoneCommandRunning = false;
         currentBaritoneCommand = "";
@@ -3265,12 +3574,33 @@ public final class ActionableClient implements ClientModInitializer {
         if (debugDetailed || !errorCode.equals("none")) {
             rawLines.add(error);
         }
+        // Long messages wrap onto indented continuation lines instead of running off the panel.
         java.util.List<String> lines = new java.util.ArrayList<>(rawLines.size());
         for (String line : rawLines) {
-            String shortened = client.font.plainSubstrByWidth(java.util.Objects.requireNonNull(line), maxTextWidth);
-            lines.add(shortened == null ? "" : shortened);
+            String rest = java.util.Objects.requireNonNull(line);
+            boolean first = true;
+            while (!rest.isEmpty()) {
+                int width = first ? maxTextWidth : maxTextWidth - 6;
+                String part = java.util.Objects.requireNonNullElse(client.font.plainSubstrByWidth(rest, width), "");
+                if (part.isEmpty()) {
+                    break;
+                }
+                if (part.length() < rest.length()) {
+                    int space = part.lastIndexOf(' ');
+                    if (space > part.length() / 2) {
+                        part = part.substring(0, space);
+                    }
+                }
+                lines.add(first ? part : "  " + part.stripLeading());
+                rest = rest.substring(part.length()).stripLeading();
+                first = false;
+            }
         }
         int lineHeight = client.font.lineHeight + 1;
+        int maxLines = Math.max(4, (int) ((graphics.guiHeight() - 12) / DEBUG_PANEL_SCALE) / lineHeight - 1);
+        while (lines.size() > maxLines) {
+            lines.remove(lines.size() - 1);
+        }
         int panelHeight = lines.size() * lineHeight + 6;
         // Draw in unscaled panel coordinates, anchored to the top-right corner of the screen.
         graphics.pose().pushMatrix();

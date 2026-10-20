@@ -64,6 +64,7 @@ final class WorldSynopsis {
             }
         }
         synopsis.append("; sampled_blocks=").append(topEntries(nearbyBlocks, 10));
+        synopsis.append("; nearby_special_blocks=").append(specialBlocks(level, playerPos));
 
         StringBuilder threats = new StringBuilder();
         int threatCount = 0;
@@ -282,5 +283,30 @@ final class WorldSynopsis {
     }
 
     private record ResourceSample(int dx, int dy, int dz, double distance, int count) {
+    }
+
+    /** Doors, beds, tables, furnaces and chests within 8 blocks, with coordinates; too rare for the block counts. */
+    private static String specialBlocks(net.minecraft.client.multiplayer.ClientLevel level, BlockPos origin) {
+        StringBuilder found = new StringBuilder("[");
+        int count = 0;
+        for (BlockPos pos : BlockPos.betweenClosed(origin.offset(-8, -3, -8), origin.offset(8, 3, 8))) {
+            var state = level.getBlockState(pos);
+            var block = state.getBlock();
+            String id = BuiltInRegistries.BLOCK.getKey(block).getPath();
+            boolean door = block instanceof net.minecraft.world.level.block.DoorBlock;
+            if (door && state.getValue(net.minecraft.world.level.block.DoorBlock.HALF)
+                    != net.minecraft.world.level.block.state.properties.DoubleBlockHalf.LOWER) {
+                continue;
+            }
+            if (door || id.endsWith("_bed") || id.equals("crafting_table") || id.equals("furnace")
+                    || id.equals("chest") || id.equals("barrel")) {
+                if (count++ >= 12) {
+                    break;
+                }
+                found.append(count > 1 ? "," : "").append(id).append('@').append(pos.getX()).append(',')
+                        .append(pos.getY()).append(',').append(pos.getZ());
+            }
+        }
+        return found.append(']').toString();
     }
 }

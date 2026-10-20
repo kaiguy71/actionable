@@ -1724,7 +1724,16 @@ public final class ActionableClient implements ClientModInitializer {
                 && !WorldProbe.strayDoors(client.level, home).isEmpty()) {
             return java.util.List.of(ProgressPlanner.PLACE_DOOR);
         }
-        return ProgressPlanner.stepsForGoal(goal, inventory, tableAccess(client), preferredLog);
+        var access = tableAccess(client);
+        var batch = ProgressPlanner.craftBatch(goal, inventory);
+        if (!batch.isEmpty()) {
+            var combined = ProgressPlanner.stepsForAll(batch, inventory, access, preferredLog);
+            if (!combined.isEmpty()) {
+                return combined;
+            }
+        }
+        return ProgressPlanner.keepTableForNext(goal,
+                ProgressPlanner.stepsForGoal(goal, inventory, access, preferredLog), inventory, access, preferredLog);
     }
 
     private boolean breakForDoor(Minecraft client, BlockPos pos, String why) {

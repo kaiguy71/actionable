@@ -217,6 +217,73 @@ final class ProgressPlanner {
         return List.copyOf(order);
     }
 
+    /**
+     * Drops the trailing "pick the table back up" step when the next milestone is a craft that needs no
+     * mining, so back-to-back crafts share one table placement instead of breaking and re-placing it.
+     */
+    static List<String> keepTableForNext(String goal, List<String> steps, Map<String, Integer> inventory,
+            TableAccess table, String preferredLog) {
+        String pickup = "mine 1 " + TechTree.CRAFTING_TABLE;
+        if (steps.size() < 2 || !steps.get(steps.size() - 1).equalsIgnoreCase(pickup)) {
+            return steps;
+        }
+        boolean seen = false;
+        for (Milestone milestone : ordered(inventory)) {
+            if (milestone.goal().equalsIgnoreCase(goal.strip())
+                    || milestone.item().equalsIgnoreCase(goal.strip())) {
+                seen = true;
+                continue;
+            }
+            if (!seen || satisfied(milestone, inventory)) {
+                continue;
+            }
+            if (milestone.kind() != Kind.HOLD || TechTree.recipeFor(milestone.item()).isEmpty()) {
+                return steps;
+            }
+            List<String> next = stepsFor(milestone.item(), milestone.count(), inventory, TableAccess.NEARBY,
+                    preferredLog);
+            boolean craftsOnly = !next.isEmpty() && next.stream().allMatch(step -> step.startsWith("craft") || step.equalsIgnoreCase(pickup));
+            return craftsOnly ? List.copyOf(steps.subList(0, steps.size() - 1)) : steps;
+        }
+        return steps;
+    }
+
+    /**
+     * The craftable tool milestones that follow the goal's own in a row (e.g. wooden pickaxe + axe, or all four
+     * stone tools), so their materials are gathered together before any crafting. Empty when not applicable.
+     */
+    static List<Map.Entry<String, Integer>> craftBatch(String goal, Map<String, Integer> inventory) {
+        List<Map.Entry<String, Integer>> batch = new ArrayList<>();
+        boolean seen = false;
+        for (Milestone milestone : ordered(inventory)) {
+            boolean craft = milestone.kind() == Kind.HOLD && TechTree.recipeFor(milestone.item()).isPresent();
+            if (!seen) {
+                seen = milestone.goal().equalsIgnoreCase(goal.strip());
+                if (!seen) {
+                    continue;
+                }
+            } else if (!craft) {
+                break;
+            }
+            if (!craft) {
+                return List.of();
+            }
+            // A tier change (wooden to stone) needs mining between crafts, so it starts a new batch.
+            if (!batch.isEmpty() && !tier(batch.get(0).getKey()).equals(tier(milestone.item()))) {
+                break;
+            }
+            if (!satisfied(milestone, inventory)) {
+                batch.add(Map.entry(milestone.item(), milestone.count()));
+            }
+        }
+        return batch.size() > 1 ? batch : List.of();
+    }
+
+    private static String tier(String item) {
+        String name = item.substring(item.indexOf(':') + 1);
+        return name.substring(0, Math.max(0, name.indexOf('_')));
+    }
+
     static boolean holdsRawOre(Map<String, Integer> inventory) {
         return inventory.getOrDefault("minecraft:raw_iron", 0) > 0 || inventory.getOrDefault("minecraft:raw_gold", 0) > 0
                 || inventory.getOrDefault("minecraft:raw_copper", 0) > 0;
@@ -441,13 +508,21 @@ final class ProgressPlanner {
      */
     static List<String> stepsFor(String item, int count, Map<String, Integer> inventory, TableAccess table,
             String preferredLog) {
-        if (TechTree.matches(TechTree.LOGS, item)) {
+        return stepsForAll(List.of(Map.entry(item, count)), inventory, table, preferredLog);
+    }
+
+    /** One plan for several items: all materials are gathered first, then everything is crafted at one table. */
+    static List<String> stepsForAll(List<Map.Entry<String, Integer>> wanted, Map<String, Integer> inventory,
+            TableAccess table, String preferredLog) {
+        List<Map.Entry<String, Integer>> needs = new ArrayList<>();
+        for (Map.Entry<String, Integer> entry : wanted) {
             // Any wood counts toward a log goal; the plan names the log type found nearby.
-            item = TechTree.LOGS;
+            needs.add(Map.entry(TechTree.matches(TechTree.LOGS, entry.getKey()) ? TechTree.LOGS : entry.getKey(),
+                    entry.getValue()));
         }
         try {
             Expansion first = new Expansion(inventory, table, preferredLog, List.of());
-            first.need(item, count);
+            needs.forEach(need -> first.need(need.getKey(), need.getValue()));
             first.pickUpTable();
             // Mining that needs no new tool is hoisted to the front; otherwise held materials get used up
             // by early crafts and the remainder is mined mid-plan, adding steps.
@@ -457,7 +532,7 @@ final class ProgressPlanner {
                 return first.steps(inventory);
             }
             Expansion second = new Expansion(inventory, table, preferredLog, hoisted);
-            second.need(item, count);
+            needs.forEach(need -> second.need(need.getKey(), need.getValue()));
             second.pickUpTable();
             return second.steps(inventory);
         } catch (IllegalArgumentException unknown) {

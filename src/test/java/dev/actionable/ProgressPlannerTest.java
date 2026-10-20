@@ -460,4 +460,26 @@ class ProgressPlannerTest {
                 ProgressPlanner.stepsForGoal("gather food", Map.of("minecraft:oak_planks", 6),
                         ProgressPlanner.TableAccess.HOME_NEARBY, OAK), "never hunt bare-handed");
     }
+
+    @Test
+    void backToBackCraftsKeepTheTable() {
+        Map<String, Integer> inventory = Map.of("minecraft:oak_log", 8);
+        String goal = "craft 1 minecraft:wooden_pickaxe";
+        var access = ProgressPlanner.TableAccess.NONE;
+        var steps = ProgressPlanner.stepsForGoal(goal, inventory, access, "minecraft:oak_log");
+        assertEquals("mine 1 minecraft:crafting_table", steps.get(steps.size() - 1));
+        var kept = ProgressPlanner.keepTableForNext(goal, steps, inventory, access, "minecraft:oak_log");
+        assertEquals(steps.size() - 1, kept.size());
+    }
+
+    @Test
+    void consecutiveToolsAreBatched() {
+        Map<String, Integer> inventory = Map.of("minecraft:oak_log", 8);
+        var batch = ProgressPlanner.craftBatch("craft 1 minecraft:wooden_pickaxe", inventory);
+        assertEquals(2, batch.size());
+        var steps = ProgressPlanner.stepsForAll(batch, inventory, ProgressPlanner.TableAccess.NONE,
+                "minecraft:oak_log");
+        assertEquals(1, steps.stream().filter(step -> step.startsWith("place minecraft:crafting_table")).count());
+        assertEquals(true, steps.contains("craft 1 minecraft:wooden_axe"));
+    }
 }

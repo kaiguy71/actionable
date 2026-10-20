@@ -128,11 +128,14 @@ class HouseAndHomeTest {
     @Test
     void ungearedPlayersStayNearHome() {
         int[] home = {0, 64, 0};
-        assertFalse(HomeRange.outside(home, false, 60, 0, 0));
-        assertTrue(HomeRange.outside(home, false, 70, 0, 0));
-        assertFalse(HomeRange.outside(home, false, 70, 0, HomeRange.LEASH_SLACK), "slack for chasing sheep");
-        assertFalse(HomeRange.outside(home, true, 500, 500, 0), "geared players roam freely");
-        assertFalse(HomeRange.outside(null, false, 500, 500, 0), "no home yet, no range");
+        assertFalse(HomeRange.outside(home, false, 90, 64, 0, 0));
+        assertTrue(HomeRange.outside(home, false, 100, 64, 0, 0));
+        assertFalse(HomeRange.outside(home, false, 100, 64, 0, HomeRange.LEASH_SLACK), "slack for chasing sheep");
+        assertFalse(HomeRange.outside(home, false, 0, 94, 0, 0));
+        assertTrue(HomeRange.outside(home, false, 0, 95, 0, 0), "more than 30 blocks above");
+        assertTrue(HomeRange.outside(home, false, 0, 33, 0, 0), "more than 30 blocks below");
+        assertFalse(HomeRange.outside(home, true, 500, 500, 500, 0), "geared players roam freely");
+        assertFalse(HomeRange.outside(null, false, 500, 500, 500, 0), "no home yet, no range");
     }
 
     @Test
@@ -149,7 +152,7 @@ class HouseAndHomeTest {
                 HomeRange.searchTarget(home, 8, 96)[2]), 1.0, "then the next ring out");
         for (int attempt = 0; attempt < 40; attempt++) {
             int[] near = HomeRange.searchTarget(home, attempt, HomeRange.RADIUS);
-            assertFalse(HomeRange.outside(home, false, near[0], near[2], 0), "log and explore searches stay in range");
+            assertFalse(HomeRange.outside(home, false, near[0], 64, near[2], 0), "log and explore searches stay in range");
             int[] far = HomeRange.searchTarget(home, attempt, HomeRange.HUNT_RANGE);
             assertTrue(HomeRange.distance(home, far[0], far[2]) <= HomeRange.HUNT_RANGE);
             assertEquals(home[1], far[1]);
@@ -166,7 +169,7 @@ class HouseAndHomeTest {
     @Test
     void describeTellsTheModelTheRule() {
         assertTrue(HomeRange.describe(new int[] {1, 2, 3}, false, true)
-                .contains("stay within 64 blocks of home until you have a stone pickaxe and a stone sword"));
+                .contains("96 blocks (6 chunks) horizontally and 30 blocks above or below home"));
         assertTrue(HomeRange.describe(null, false, false).contains("none yet"));
     }
 

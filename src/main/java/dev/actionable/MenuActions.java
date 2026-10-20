@@ -34,7 +34,8 @@ final class MenuActions {
         }
         Vec3 target = Vec3.atCenterOf(pos);
         if (player.getEyePosition().distanceToSqr(target) > REACH_SQUARED) {
-            return "USE_FAILED_TOO_FAR: " + x + "," + y + "," + z + " is out of reach (4.5 blocks); goto next to it first";
+            return "USE_FAILED_TOO_FAR: " + x + "," + y + "," + z + " is out of reach (4.5 blocks); run "
+                    + WorldProbe.gotoBeside(client.level, pos) + " (a free cell beside it; never goto the block's own coordinates) and try again";
         }
         player.lookAt(EntityAnchorArgument.Anchor.EYES, target);
         Direction face = Direction.getApproximateNearest(player.getEyePosition().subtract(target));

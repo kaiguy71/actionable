@@ -310,11 +310,11 @@ class ProgressPlannerTest {
     }
 
     @Test
-    void everyMilestonePlanFitsTheStepLimit() {
+    void everyMilestoneHasAPlan() {
         Map<String, Integer> inventory = new HashMap<>();
         for (ProgressPlanner.Milestone milestone : ProgressPlanner.MILESTONES) {
             List<String> steps = ProgressPlanner.stepsForGoal(milestone.goal(), inventory, false, OAK);
-            assertTrue(!steps.isEmpty() && steps.size() <= ActionPlanner.MAX_STEPS,
+            assertTrue(!steps.isEmpty(),
                     milestone.goal() + " -> " + steps);
             inventory.put(milestone.item(), milestone.count());
         }
@@ -355,7 +355,7 @@ class ProgressPlannerTest {
         assertTrue(briefing.contains("next_milestone=mine 20 minecraft:oak_log (why:"));
         assertTrue(briefing.contains("milestone_plan=[mine 20 minecraft:oak_log]"));
         assertTrue(briefing.contains("house_built=false, bed_placed=false"));
-        assertTrue(briefing.contains("home=0,64,0 (start area); stay within 64 blocks"));
+        assertTrue(briefing.contains("home=0,64,0 (start area); until you have a stone pickaxe and a stone sword stay within 96 blocks"));
         assertTrue(briefing.contains("minecraft:stone (needs minecraft:wooden_pickaxe)"));
         assertTrue(briefing.contains("minecraft:oak_log x2: craft into planks"));
         assertTrue(briefing.contains("craftable_now=[minecraft:oak_planks]"));

@@ -10,8 +10,8 @@ import java.util.List;
  * relative to the house corner.
  */
 final class StairMine {
-    /** The mine stops here; iron is common from here up, and deeper is lava country. */
-    static final int BOTTOM_Y = 16;
+    /** Just above bedrock; the mine otherwise stops only at caves, lava and other hazards. */
+    static final int BOTTOM_Y = -58;
 
     private StairMine() {
     }

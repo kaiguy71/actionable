@@ -87,8 +87,7 @@ final class NeedsPlanner {
                         + " tools and a furnace, and the house mine is safe"));
             } else if (tier.compareTo(TechTree.Tier.STONE) >= 0
                     && TechTree.held(inventory, "minecraft:raw_iron") < IRON_WANTED) {
-                candidates.add(new Task(MINE_IRON, "enough cobblestone; dig deeper toward iron, down to y="
-                        + StairMine.BOTTOM_Y));
+                candidates.add(new Task(MINE_IRON, "enough cobblestone; dig deeper toward iron"));
             }
         }
         for (Task task : candidates) {

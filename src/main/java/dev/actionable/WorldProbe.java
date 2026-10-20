@@ -158,6 +158,15 @@ final class WorldProbe {
         return best;
     }
 
+    /** A goto command to a free standing cell within reach of the target, never the target block itself. */
+    static String gotoBeside(ClientLevel level, BlockPos target) {
+        BlockPos stand = dryStandNear(level, target);
+        if (stand == null) {
+            stand = target.above();
+        }
+        return "goto " + stand.getX() + " " + stand.getY() + " " + stand.getZ();
+    }
+
     private static BlockPos openNeighbour(ClientLevel level, BlockPos pos) {
         // Prefer the cell above, where a player would usually stand, then the sides.
         for (Direction direction : new Direction[] {Direction.UP, Direction.NORTH, Direction.SOUTH,
@@ -190,6 +199,67 @@ final class WorldProbe {
             }
         }
         return candidates;
+    }
+
+    /**
+     * Cells where a block can go near the player, nearest first: outward on the player's level, then
+     * upward, then downward. A cell qualifies when it is empty or replaceable (never plain water), free
+     * of the player and of any mob, and touches a solid, dry anchor face within reach.
+     */
+    static List<BlockPos> placementSpots(ClientLevel level, Player player) {
+        BlockPos feet = player.blockPosition();
+        net.minecraft.world.phys.Vec3 eyes = player.getEyePosition();
+        List<BlockPos> air = new ArrayList<>();
+        List<BlockPos> soft = new ArrayList<>();
+        for (int dy : new int[] {0, 1, 2, 3, -1, -2, -3}) {
+            for (int radius = 0; radius <= 3; radius++) {
+                for (int dx = -radius; dx <= radius; dx++) {
+                    for (int dz = -radius; dz <= radius; dz++) {
+                        if (Math.max(Math.abs(dx), Math.abs(dz)) != radius) {
+                            continue;
+                        }
+                        BlockPos cell = feet.offset(dx, dy, dz);
+                        if (!placeableCell(level, player, cell, eyes)) {
+                            continue;
+                        }
+                        (level.getBlockState(cell).isAir() ? air : soft).add(cell);
+                    }
+                }
+            }
+        }
+        air.addAll(soft);
+        return air;
+    }
+
+    static boolean placeableCell(ClientLevel level, Player player, BlockPos cell,
+            net.minecraft.world.phys.Vec3 eyes) {
+        var state = level.getBlockState(cell);
+        if (!state.isAir() && !(state.canBeReplaced() && state.getFluidState().isEmpty())) {
+            return false;
+        }
+        var above = level.getBlockState(cell.above());
+        if (!above.isAir() && !above.canBeReplaced()) {
+            return false;
+        }
+        var box = new net.minecraft.world.phys.AABB(cell);
+        if (player.getBoundingBox().intersects(box)
+                || !level.getEntities((Entity) null, box, entity -> true).isEmpty()) {
+            return false;
+        }
+        for (Direction side : Direction.values()) {
+            BlockPos anchor = cell.relative(side);
+            var anchorState = level.getBlockState(anchor);
+            if (!anchorState.getFluidState().isEmpty() || !anchorState.isFaceSturdy(level, anchor, side.getOpposite())) {
+                continue;
+            }
+            net.minecraft.world.phys.Vec3 face = net.minecraft.world.phys.Vec3.atCenterOf(anchor).add(
+                    side.getOpposite().getStepX() * 0.5, side.getOpposite().getStepY() * 0.5,
+                    side.getOpposite().getStepZ() * 0.5);
+            if (eyes.distanceToSqr(face) <= 20.25) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /** Nearest bed block within {@code radius}, or null. */

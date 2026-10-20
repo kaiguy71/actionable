@@ -39,7 +39,7 @@ class HomeJobsTest {
         assertEquals(3, step.size());
         assertEquals(-2, step.get(0)[1], "top cell first so nothing falls on the player");
         assertEquals(-4, step.get(2)[1]);
-        assertEquals(47, StairMine.maxStep(63), "a house at y=63 digs down to y=16");
+        assertEquals(121, StairMine.maxStep(63), "a house at y=63 digs down to just above bedrock");
     }
 
     @Test

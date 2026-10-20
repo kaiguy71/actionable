@@ -4,10 +4,14 @@ import java.util.Map;
 
 /**
  * Keeps an unequipped player near home. Until the player holds a stone pickaxe and a stone (or
- * better) sword, goals, mining sites and wandering stay within {@link #RADIUS} blocks of home.
+ * better) sword, goals, mining sites and wandering stay within {@link #RADIUS} blocks of home
+ * horizontally and {@link #VERTICAL} blocks vertically.
  */
 final class HomeRange {
-    static final int RADIUS = 64;
+    /** Horizontal range from home: 6 chunks. */
+    static final int RADIUS = 96;
+    /** Vertical range from home, above or below. */
+    static final int VERTICAL = 30;
     /** Extra distance allowed before the player is walked back, so chasing a sheep is not cut short. */
     static final int LEASH_SLACK = 16;
 
@@ -29,8 +33,9 @@ final class HomeRange {
     }
 
     /** True when a point is outside the allowed range; never true once the player is geared. */
-    static boolean outside(int[] home, boolean geared, int x, int z, int slack) {
-        return home != null && !geared && distance(home, x, z) > RADIUS + slack;
+    static boolean outside(int[] home, boolean geared, int x, int y, int z, int slack) {
+        return home != null && !geared
+                && (distance(home, x, z) > RADIUS + slack || Math.abs(y - home[1]) > VERTICAL + slack);
     }
 
     /** How far from home sheep and food animals may be chased without gear. */
@@ -67,6 +72,7 @@ final class HomeRange {
         }
         return "home=" + home[0] + "," + home[1] + "," + home[2] + (houseBuilt ? " (house built)" : " (start area)")
                 + (geared ? "; geared: may travel freely"
-                : "; stay within " + RADIUS + " blocks of home until you have a stone pickaxe and a stone sword");
+                : "; until you have a stone pickaxe and a stone sword stay within " + RADIUS
+                + " blocks (6 chunks) horizontally and " + VERTICAL + " blocks above or below home");
     }
 }

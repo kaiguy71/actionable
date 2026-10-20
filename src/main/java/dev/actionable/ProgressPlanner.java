@@ -577,7 +577,7 @@ final class ProgressPlanner {
         text.append("\n- night_prep_missing=").append(SafetyAssessment.nightPrepMissing(inventory));
         String progression = progression();
         if (!progression.isEmpty()) {
-            text.append("\nGame progression (earliest unfinished stage first):\n").append(progression);
+            text.append("\nGame progression (earliest unfinished stage first; lettered lines are options, branches D and N are either order):\n").append(progression);
         }
         return text.toString();
     }
@@ -713,10 +713,9 @@ final class ProgressPlanner {
 
         /**
          * Ends a plan that crafted at a table by mining that table, so it travels with the player.
-         * Skipped when it would push the plan past the step limit.
          */
         void pickUpTable() {
-            if (tableUsed && !table.home() && !ops.isEmpty() && ops.size() < ActionPlanner.MAX_STEPS) {
+            if (tableUsed && !table.home() && !ops.isEmpty()) {
                 ops.add(new Op("mine", TechTree.CRAFTING_TABLE, 1, ops.size() - 1));
             }
         }

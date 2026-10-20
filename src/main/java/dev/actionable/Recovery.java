@@ -6,10 +6,6 @@ package dev.actionable;
  * player's own feet six times), so known failures are handled here and the model sees only the rest.
  */
 final class Recovery {
-    /** Re-plans allowed per task before the model takes over, so a stuck plan cannot loop forever. */
-    static final int MAX_REPLANS = 3;
-    /** Placement candidates tried when the requested spot cannot take a block. */
-    static final int PLACEMENT_RETRIES = 4;
 
     private Recovery() {
     }

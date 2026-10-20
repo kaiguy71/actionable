@@ -61,9 +61,13 @@ public final class ActionableClient implements ClientModInitializer {
     private java.util.List<String> taskSteps = java.util.List.of();
     private int currentStep;
     private static final int DANGER_HEALTH = 6;
-    private static final int MAX_TASK_TICKS = 6000;
+    private static final int MAX_WHITE_FLAG_RESTARTS = 5;
+    /** Block/sky light at or below which a held torch is placed automatically. */
+    private static final int TORCH_LIGHT = 4;
+    /** Blocks walked per travel leg before the model is asked whether to continue. */
+    private static final int TRAVEL_LEG = 500;
     private static final int GOAL_MEMORY = 20;
-    private boolean autonomous = true;
+    private boolean autonomous;
     private boolean choosingGoal;
     private boolean escaping;
     private boolean defending;
@@ -111,6 +115,14 @@ public final class ActionableClient implements ClientModInitializer {
     private int waterTicks;
     private long lastSleepAttempt;
     private int wanderAttempts;
+    private int whiteFlagRestarts;
+    private long nextTorchTick;
+    private boolean finalCheck;
+    /** Set when code (inventory/world facts) already confirmed the last step, so no model re-check is needed. */
+    private boolean codeVerified;
+    /** Compass direction of the running travel leg, or empty/null when the running command is not one. */
+    private String travelDirection;
+    private boolean finalChecked;
     /** 0 = not eating, 1 = waiting for Baritone to let go of the keys, 2 = eating. */
     private int eatPhase;
     private long eatStartedAt;
@@ -149,6 +161,7 @@ public final class ActionableClient implements ClientModInitializer {
                 dispatcher.register(ClientCommands.literal("action")
                         .then(ClientCommands.argument("prompt", StringArgumentType.greedyString())
                                 .executes(context -> {
+                                    whiteFlagRestarts = 0;
                                     submit(context.getArgument("prompt", String.class));
                                     return 1;
                                 }))));
@@ -160,6 +173,11 @@ public final class ActionableClient implements ClientModInitializer {
                                     + " (use /actiondebug to toggle, /actiondebug full for all details).");
                             return 1;
                         })
+                        .then(ClientCommands.literal("capture")
+                                .executes(context -> {
+                                    captureContext(Minecraft.getInstance());
+                                    return 1;
+                                }))
                         .then(ClientCommands.literal("full")
                                 .executes(context -> {
                                     debugEnabled = true;
@@ -182,8 +200,14 @@ public final class ActionableClient implements ClientModInitializer {
                             return 1;
                         })));
 
-        ClientLifecycleEvents.CLIENT_STOPPING.register(Screenshots::archiveSession);
-        ClientPlayConnectionEvents.DISCONNECT.register((handler, client) -> Screenshots.archiveSession(client));
+        ClientLifecycleEvents.CLIENT_STOPPING.register(client -> {
+            resetToDefaults(client);
+            Screenshots.archiveSession(client);
+        });
+        ClientPlayConnectionEvents.DISCONNECT.register((handler, client) -> {
+            resetToDefaults(client);
+            Screenshots.archiveSession(client);
+        });
 
         HudElementRegistry.addLast(
                 Identifier.fromNamespaceAndPath("actionable", "debug_sidebar"),
@@ -221,11 +245,12 @@ public final class ActionableClient implements ClientModInitializer {
             tickSmelt(client);
             tickStairs(client);
             tickEat(client);
-            if (clientTick % 100 == 0 && eatPhase == 0 && pendingCraft == null && pendingSmelt == null
+            if (working() && clientTick % 100 == 0 && eatPhase == 0 && pendingCraft == null && pendingSmelt == null
                     && pendingBreak == null && !defending) {
                 arrangeHotbar(client);
             }
             tickWater(client);
+            tickTorch(client);
             tickStepCheck(client);
             while (toggleKey.consumeClick()) {
                 boolean controlDown = InputConstants.isKeyDown(InputConstants.KEY_LCONTROL)
@@ -240,10 +265,6 @@ public final class ActionableClient implements ClientModInitializer {
             tickSafety(client);
             tickNight(client);
             tickHomeRange(client);
-            if (enabled && activeTask != null && (!nightRoutine || nightJob)
-                    && pendingStairs == null && clientTick - taskStartedAtTick > MAX_TASK_TICKS) {
-                abandonTask(client, "took too long");
-            }
             if (enabled && autonomous && escaping && activeTask != null && clientTick % 20 == 0
                     && dangerEscape(client) == null) {
                 abandonTask(client, "threat cleared");
@@ -314,6 +335,10 @@ public final class ActionableClient implements ClientModInitializer {
         escaping = false;
         retreating = false;
         planner.attachImage(null);
+        planner.cancelPending();
+        finalCheck = false;
+        codeVerified = false;
+        finalChecked = false;
         generation++;
         activeTask = prompt;
         taskOrigin = java.util.Objects.requireNonNull(client.player).blockPosition();
@@ -436,7 +461,7 @@ public final class ActionableClient implements ClientModInitializer {
                         if (milestone.isEmpty()) {
                             // Nothing useful to do right now; look around and reconsider shortly.
                             tell(client, "No new goal available; exploring.");
-                            chosen = "explore to find new resources";
+                            chosen = "travel to find new resources";
                             why = "no milestone is reachable right now; new terrain may expose resources";
                         } else {
                             chosen = milestone.get().goal();
@@ -666,6 +691,9 @@ public final class ActionableClient implements ClientModInitializer {
 
     private void startGoal(Minecraft client, String goal, java.util.List<String> steps) {
         generation++;
+        finalCheck = false;
+        codeVerified = false;
+        finalChecked = false;
         activeTask = goal;
         taskSteps = java.util.List.copyOf(steps);
         currentStep = 0;
@@ -708,6 +736,9 @@ public final class ActionableClient implements ClientModInitializer {
         }
         taskSteps = java.util.List.of();
         currentStep = 0;
+        finalCheck = false;
+        codeVerified = false;
+        finalChecked = false;
         stepJudged = false;
         stepActionTaken = false;
         directStep = null;
@@ -742,9 +773,126 @@ public final class ActionableClient implements ClientModInitializer {
         escaping = false;
         retreating = false;
         returningHome = false;
+        finalCheck = false;
+        codeVerified = false;
+        finalChecked = false;
         activeTask = null;
         taskSteps = java.util.List.of();
         ticksUntilGoal = 40;
+    }
+
+    /**
+     * The model's white flag: it cannot make progress. A user task restarts from scratch with a fresh
+     * model session and the original prompt; an autonomous goal is dropped and a new one is chosen.
+     */
+    private void whiteFlag(Minecraft client, String reason) {
+        String prompt = activeTask;
+        boolean userTask = "requested with /action".equals(goalReason);
+        ActionableLog.LOGGER.info("[Actionable] white_flag task={} restarts={} reason={}", ActionableLog.text(prompt),
+                whiteFlagRestarts, ActionableLog.text(reason));
+        if (prompt != null) {
+            noteAttempt(prompt + " (white flag: " + compact(reason, 80) + ")");
+        }
+        if (!userTask || prompt == null) {
+            abandonTask(client, "white flag: " + compact(reason, 80));
+            return;
+        }
+        if (++whiteFlagRestarts > MAX_WHITE_FLAG_RESTARTS) {
+            abandonTask(client, "white flag thrown " + MAX_WHITE_FLAG_RESTARTS + " times in a row: " + compact(reason, 80));
+            whiteFlagRestarts = 0;
+            return;
+        }
+        tell(client, "White flag (" + compact(reason, 80) + "); restarting with a fresh session ("
+                + whiteFlagRestarts + "/" + MAX_WHITE_FLAG_RESTARTS + ").");
+        submit(prompt);
+    }
+
+    /**
+     * Returns the mod and the model session to a clean default state. Runs on disconnect and on game
+     * exit, so nothing waits on an in-flight model request and nothing carries into the next world.
+     */
+    /** Writes the whole model/mod interaction context to logs/actionable without touching the debug sidebar. */
+    private void captureContext(Minecraft client) {
+        StringBuilder state = new StringBuilder();
+        state.append("enabled=").append(enabled).append(", autonomous=").append(autonomous)
+                .append("\ntask=").append(activeTask).append("\ngoal=").append(currentGoal)
+                .append("\nplan_steps=").append(taskSteps).append(", current_step=").append(currentStep)
+                .append("\nlast_action=").append(lastAction).append("\nlast_result=").append(lastResult)
+                .append("\nerror_code=").append(errorCode).append(", last_error=").append(lastError)
+                .append("\nbaritone=").append(baritoneStatus).append(", running=").append(baritoneCommandRunning)
+                .append(", command=").append(currentBaritoneCommand)
+                .append("\nachieved_goals=").append(achievedGoals).append("\nhistory=").append(history);
+        try {
+            if (client.player != null && client.level != null) {
+                state.append("\nsynopsis=").append(WorldSynopsis.capture(client)).append("; ")
+                        .append(baritoneProgress(client));
+            }
+            java.nio.file.Path file = ContextCapture.write(client.gameDirectory.toPath(), state.toString());
+            tell(client, "Context saved to logs/actionable/" + file.getFileName());
+        } catch (java.io.IOException | RuntimeException e) {
+            tell(client, "Context capture failed: " + ActionPlanner.safeMessage(e));
+        }
+    }
+
+    private void resetToDefaults(Minecraft client) {
+        ContextCapture.clear();
+        planner.cancelPending();
+        generation++;
+        try {
+            cancelCraft(client);
+            cancelBreak(client);
+            cancelHomeWork(client);
+        } catch (RuntimeException e) {
+            ActionableLog.LOGGER.warn("[Actionable] reset_cancel_failed {}", ActionableLog.text(e.toString()));
+        }
+        if (eatPhase != 0) {
+            endEat(client, false);
+        }
+        pendingCraft = null;
+        pendingBreak = null;
+        pendingSmelt = null;
+        pendingStairs = null;
+        pendingHunt = null;
+        pendingMine = null;
+        pendingJumpPlace = null;
+        mineStart = null;
+        baritoneCommandRunning = false;
+        currentBaritoneCommand = "";
+        activeTask = null;
+        taskSteps = java.util.List.of();
+        currentStep = 0;
+        planning = false;
+        decomposing = false;
+        judging = false;
+        choosingGoal = false;
+        escaping = false;
+        retreating = false;
+        defending = false;
+        returningHome = false;
+        nightRoutine = false;
+        nightJob = false;
+        morningPending = false;
+        autonomous = false;
+        finalCheck = false;
+        codeVerified = false;
+        finalChecked = false;
+        home = null;
+        homeWorld = null;
+        WorldProbe.home = null;
+        houseBuiltSeen = false;
+        startArea = null;
+        history.clear();
+        achievedGoals.clear();
+        attemptedGoals.clear();
+        avoidAreas.clear();
+        lastAction = "";
+        lastResult = "none";
+        currentGoal = "Idle";
+        errorCode = "none";
+        lastError = "none";
+        whiteFlagRestarts = 0;
+        ticksUntilPlan = 0;
+        ticksUntilGoal = 0;
     }
 
     private void noteAttempt(String goal) {
@@ -808,7 +956,7 @@ public final class ActionableClient implements ClientModInitializer {
         // Tech-tree goals get an exact plan from code; the model only decomposes free-form tasks.
         java.util.List<String> known = planFor(client, activeTask, inventory,
                 WorldProbe.preferredLog(inventory, synopsis));
-        if (!known.isEmpty() && known.size() <= ActionPlanner.MAX_STEPS) {
+        if (!known.isEmpty()) {
             taskSteps = java.util.List.copyOf(known);
             announcePlan(client);
             currentStep = 0;
@@ -888,6 +1036,7 @@ public final class ActionableClient implements ClientModInitializer {
             }
             return;
         }
+        codeVerified = false;
         stopBaritone(client);
         currentStep++;
         stepJudged = false;
@@ -942,6 +1091,7 @@ public final class ActionableClient implements ClientModInitializer {
             return;
         }
         history.addLast(entry);
+        ContextCapture.event("action result", action + " -> " + result);
         ActionableLog.LOGGER.info("[Actionable] action={} result={}",
                 ActionableLog.text(action), ActionableLog.text(result));
         while (history.size() > HISTORY_LIMIT) {
@@ -962,6 +1112,15 @@ public final class ActionableClient implements ClientModInitializer {
 
     private void finishTask(Minecraft client, net.minecraft.client.multiplayer.ClientPacketListener connection,
             String reason) {
+        boolean codeRun = nightJob || escaping || nightRoutine || returningHome || pendingStairs != null
+                || client.player == null;
+        if (!finalCheck && !finalChecked && !codeVerified && !codeRun && activeTask != null) {
+            beginFinalCheck(client, reason);
+            return;
+        }
+        finalCheck = false;
+        finalChecked = false;
+        codeVerified = false;
         tell(client, "Task complete.");
         connection.sendChat("#cancel");
         baritoneCommandRunning = false;
@@ -981,21 +1140,43 @@ public final class ActionableClient implements ClientModInitializer {
         ticksUntilGoal = 60;
     }
 
+    /** Before a task counts as done, the model must look at the world once more and confirm the result. */
+    private void beginFinalCheck(Minecraft client, String reason) {
+        finalCheck = true;
+        finalChecked = true;
+        stopBaritone(client);
+        lastAction = "final_check";
+        lastResult = "FINAL_CHECK: (" + compact(reason, 80) + ") Before finishing, verify the ORIGINAL task \""
+                + compact(activeTask, 200) + "\" against the inventory and world synopsis now (and the screenshot"
+                + " attached if present). Return complete=true only if its end state really exists; otherwise"
+                + " continue with the missing work.";
+        tell(client, "Final check before finishing: " + compact(activeTask, 60));
+        long shotGeneration = generation;
+        Screenshots.capture(client, debugEnabled, image -> {
+            if (shotGeneration == generation && image != null) {
+                planner.attachImage(image);
+            }
+        });
+        ticksUntilPlan = 15;
+    }
+
     private void requestNextPlan(Minecraft client) {
         if (client.player == null || client.level == null || client.getConnection() == null || activeTask == null) {
             ticksUntilPlan = 20;
             return;
         }
+        boolean useSteps = !taskSteps.isEmpty() && !finalCheck;
         if (leaveWater(client)) {
             ticksUntilPlan = 60;
             return;
         }
-        if (!taskSteps.isEmpty()) {
+        if (useSteps) {
             // Quantity, house and bed steps are judged from the inventory and world, without a model call.
             String step = taskSteps.get(currentStep);
             java.util.Optional<Boolean> done = ProgressPlanner.stepSatisfied(step,
                     WorldProbe.inventory(client.player), tableNearby(client), facts(client));
             if (done.orElse(false)) {
+                codeVerified = true;
                 advanceStep(client, step);
                 return;
             }
@@ -1003,18 +1184,18 @@ public final class ActionableClient implements ClientModInitializer {
                 stepJudged = true;
             }
         }
-        if (!taskSteps.isEmpty() && !history.isEmpty() && !stepJudged) {
+        if (useSteps && !history.isEmpty() && !stepJudged) {
             requestStepCheck(client);
             return;
         }
-        if (!taskSteps.isEmpty() && Recovery.replannable(lastResult) && replans < Recovery.MAX_REPLANS
+        if (useSteps && Recovery.replannable(lastResult)
                 && replanFromInventory(client, lastResult)) {
             return;
         }
-        if (!taskSteps.isEmpty() && !stepActionTaken && executeStepDirectly(client)) {
+        if (useSteps && !stepActionTaken && executeStepDirectly(client)) {
             return;
         }
-        if (!taskSteps.isEmpty() && directStep != null && continueDirectStep(client)) {
+        if (useSteps && directStep != null && continueDirectStep(client)) {
             return;
         }
         long requestGeneration = generation;
@@ -1056,7 +1237,13 @@ public final class ActionableClient implements ClientModInitializer {
                 finishTask(client, connection, "Planner marked the task complete");
                 return;
             }
-            if (plan.stepComplete() && !taskSteps.isEmpty()) {
+            if (finalCheck) {
+                // The model found work left to do: continue freely on the original task.
+                finalCheck = false;
+                taskSteps = java.util.List.of();
+                currentStep = 0;
+            } else if (plan.stepComplete() && !taskSteps.isEmpty()) {
+                codeVerified = false;
                 advanceStep(client, taskSteps.get(currentStep));
                 return;
             }
@@ -1089,6 +1276,11 @@ public final class ActionableClient implements ClientModInitializer {
                             ? "Planner chose to wait; " + baritoneProgress(client)
                             : "Planner chose no input; reevaluate after next observation";
                     tell(client, baritoneCommandRunning ? "Waiting on current Baritone task." : "Waiting for next observation.");
+                }
+                case "white_flag" -> {
+                    lastAction = "white_flag";
+                    whiteFlag(client, action.query());
+                    return;
                 }
                 case "craft" -> startCraft(client, action.block(), Integer.parseInt(action.command()));
                 case "lookup" -> {
@@ -1138,19 +1330,11 @@ public final class ActionableClient implements ClientModInitializer {
                 }
                 case "place_block" -> {
                     stopBaritone(client);
-                    lastAction = "place " + action.block() + " at " + action.x() + "," + action.y() + "," + action.z();
-                    lastResult = placeWithFallback(client, action);
+                    lastAction = "place " + action.block() + " near " + action.x() + "," + action.y() + "," + action.z();
+                    lastResult = placeNearby(client, action);
                     reportBlockResult(client);
                 }
-                case "jump_place" -> {
-                    stopBaritone(client);
-                    lastAction = "jump-place " + action.block() + " at " + action.x() + "," + action.y() + "," + action.z();
-                    // Jumping is only needed when boxed in; a free spot nearby is faster and more reliable.
-                    lastResult = client.level != null && client.player != null
-                            && !WorldProbe.placementCandidates(client.level, client.player.blockPosition()).isEmpty()
-                            ? placeWithFallback(client, action) : startJumpPlace(client, action);
-                    reportBlockResult(client);
-                }
+                case "travel" -> travel(client, connection, action.command());
                 case "baritone" -> {
                     String command = homeRangeCommand(client, taskSteps.isEmpty() ? action.command()
                             : ProgressPlanner.alignMineQuantity(action.command(), taskSteps.get(currentStep)));
@@ -1480,9 +1664,6 @@ public final class ActionableClient implements ClientModInitializer {
             spliced.addAll(taskSteps.subList(currentStep + 1, taskSteps.size()));
             steps = spliced;
         }
-        if (steps.size() > ActionPlanner.MAX_STEPS + 4) {
-            return false;
-        }
         replans++;
         ActionableLog.LOGGER.info("[Actionable] replan count={} failure={}", replans,
                 ActionableLog.text(compact(failure, 120)));
@@ -1497,6 +1678,48 @@ public final class ActionableClient implements ClientModInitializer {
         announcePlan(client);
         ticksUntilPlan = 1;
         return true;
+    }
+
+    /**
+     * The model's place_block: the coordinates are only a hint. Tries the hint, then workable cells
+     * around the player (outward, up, down), and jumps to place beneath the player when boxed in.
+     */
+    private String placeNearby(Minecraft client, ActionPlanner.PlannedAction action) {
+        if (client.player == null || client.level == null) {
+            return "BLOCK_PLACE_FAILED_NO_WORLD: player world is unavailable";
+        }
+        if (TechTree.isDoor(action.block()) || action.block().endsWith("_bed")) {
+            return placeWithFallback(client, action);
+        }
+        var level = client.level;
+        var player = client.player;
+        BlockPos hint = new BlockPos(action.x(), action.y(), action.z());
+        java.util.List<BlockPos> spots = new java.util.ArrayList<>();
+        if (WorldProbe.placeableCell(level, player, hint, player.getEyePosition())) {
+            spots.add(hint);
+        }
+        for (BlockPos spot : WorldProbe.placementSpots(level, player)) {
+            if (!spot.equals(hint)) {
+                spots.add(spot);
+            }
+        }
+        String last = "";
+        int tries = 0;
+        for (BlockPos spot : spots) {
+            String result = placeBlock(client, new ActionPlanner.PlannedAction("place_block", "", action.block(),
+                    spot.getX(), spot.getY(), spot.getZ(), ""));
+            if (!Recovery.badPlacementSpot(result)) {
+                lastAction = "place " + action.block() + " at " + spot.getX() + "," + spot.getY() + "," + spot.getZ();
+                return result;
+            }
+            last = result;
+        }
+        // Boxed in (for example a 1x1 hole): jump and place the block beneath the player.
+        BlockPos feet = player.blockPosition();
+        String jump = startJumpPlace(client, new ActionPlanner.PlannedAction("place_block", "", action.block(),
+                feet.getX(), feet.getY(), feet.getZ(), ""));
+        return jump.startsWith("Jump started") || last.isBlank() ? jump : jump + " (nearby spots failed: "
+                + compact(last, 80) + ")";
     }
 
     /**
@@ -1522,9 +1745,6 @@ public final class ActionableClient implements ClientModInitializer {
             if (spot.equals(requested)) {
                 continue;
             }
-            if (tries++ >= Recovery.PLACEMENT_RETRIES) {
-                break;
-            }
             String retry = placeBlock(client, new ActionPlanner.PlannedAction("place_block", "", action.block(),
                     spot.getX(), spot.getY(), spot.getZ(), ""));
             if (!Recovery.badPlacementSpot(retry)) {
@@ -1536,7 +1756,7 @@ public final class ActionableClient implements ClientModInitializer {
     }
 
     /**
-     * Keeps model-chosen movement near home while the player lacks gear: explore becomes a walk to a
+     * Keeps model-chosen movement near home while the player lacks gear: travel becomes a walk to a
      * point near home, and a goto beyond the range is refused. Returns null when refused.
      */
     private String homeRangeCommand(Minecraft client, String command) {
@@ -1544,17 +1764,14 @@ public final class ActionableClient implements ClientModInitializer {
         if (anchor == null || geared(client)) {
             return command;
         }
-        if (command.equals("explore")) {
-            int[] target = HomeRange.searchTarget(anchor, wanderAttempts++, HomeRange.RADIUS);
-            tell(client, "Exploring near home instead of wandering off.");
-            return HomeRange.surfaceGoto(target);
-        }
         String[] parts = command.split("\\s+");
         if (parts[0].equals("goto") && parts.length == 4
-                && HomeRange.outside(anchor, false, Integer.parseInt(parts[1]), Integer.parseInt(parts[3]), 0)) {
+                && HomeRange.outside(anchor, false, Integer.parseInt(parts[1]), Integer.parseInt(parts[2]),
+                        Integer.parseInt(parts[3]), 0)) {
             lastAction = command;
-            lastResult = "GOTO_FAILED_OUTSIDE_HOME_RANGE: " + command + " is more than " + HomeRange.RADIUS
-                    + " blocks from home; stay near home until you have a stone pickaxe and a stone sword";
+            lastResult = "GOTO_FAILED_OUTSIDE_HOME_RANGE: " + command + " is beyond " + HomeRange.RADIUS
+                    + " blocks horizontally or " + HomeRange.VERTICAL + " vertically from home; stay in that range"
+                    + " until you have a stone pickaxe and a stone sword";
             return null;
         }
         return command;
@@ -1746,7 +1963,7 @@ public final class ActionableClient implements ClientModInitializer {
         // Ask Baritone itself: holding jump while it swims toward something makes the player bob in place.
         boolean baritoneMoving = player != null && player.isInWater()
                 && BaritoneProbe.query().map(BaritoneProbe.State::active).orElse(baritoneCommandRunning);
-        boolean hold = enabled && player != null && player.isInWater() && !baritoneMoving && !player.isSleeping();
+        boolean hold = working() && player != null && player.isInWater() && !baritoneMoving && !player.isSleeping();
         if (hold) {
             client.options.keyJump.setDown(true);
             holdingJump = true;
@@ -1919,6 +2136,14 @@ public final class ActionableClient implements ClientModInitializer {
      * Baritone, waits a moment for it to release the keys (it held them and cancelled every bite
      * before), then holds use until the hunger bar actually rises. A failed attempt waits ten seconds.
      */
+    /**
+     * True only while the mod has a reason to act: enabled and either working on a task or in autonomous mode.
+     * When disabled, or idle in manual mode waiting for a prompt, nothing may change the game state.
+     */
+    private boolean working() {
+        return enabled && (autonomous || activeTask != null);
+    }
+
     private void tickEat(Minecraft client) {
         var player = client.player;
         if (player == null || client.gameMode == null) {
@@ -1969,7 +2194,7 @@ public final class ActionableClient implements ClientModInitializer {
             }
             return;
         }
-        if (!enabled || clientTick % 20 != 0 || clientTick < eatBackoffUntil || defending || pendingCraft != null
+        if (!working() || clientTick % 20 != 0 || clientTick < eatBackoffUntil || defending || pendingCraft != null
                 || pendingSmelt != null || pendingBreak != null || player.containerMenu != player.inventoryMenu
                 || !FoodPlan.shouldEat(player.getFoodData().getFoodLevel(), player.getHealth(), player.getMaxHealth())) {
             return;
@@ -2009,6 +2234,87 @@ public final class ActionableClient implements ClientModInitializer {
      * Keeps the hotbar laid out: best pickaxe, axe and shovel first (Baritone only uses hotbar tools),
      * food in slot 7 and the best weapon in slot 8, swapping each in from wherever it is.
      */
+    /**
+     * Lights the player's surroundings without the model: when it is dark here and a torch is held,
+     * places one on the darkest reachable spot that is at least as dark as the player's own cell, so
+     * torches spread out. Cheap enough to run while Baritone is walking; the held slot is restored.
+     */
+    private void tickTorch(Minecraft client) {
+        var player = client.player;
+        var level = client.level;
+        var gameMode = client.gameMode;
+        if (!working() || player == null || level == null || gameMode == null || clientTick < nextTorchTick
+                || clientTick % 5 != 0 || player.containerMenu != player.inventoryMenu || player.isInWater()
+                || player.isSleeping() || eatPhase != 0 || pendingCraft != null || pendingBreak != null
+                || pendingSmelt != null || defending) {
+            return;
+        }
+        BlockPos feet = player.blockPosition();
+        int here = level.getMaxLocalRawBrightness(feet);
+        if (here > TORCH_LIGHT) {
+            return;
+        }
+        Item torch = inventoryHas(player, net.minecraft.world.item.Items.TORCH) ? net.minecraft.world.item.Items.TORCH
+                : inventoryHas(player, net.minecraft.world.item.Items.SOUL_TORCH)
+                ? net.minecraft.world.item.Items.SOUL_TORCH : null;
+        if (torch == null) {
+            return;
+        }
+        Vec3 eyes = player.getEyePosition();
+        BlockPos bestAnchor = null;
+        Direction bestFace = null;
+        double bestScore = Double.MAX_VALUE;
+        for (int dx = -3; dx <= 3; dx++) {
+            for (int dy = -1; dy <= 2; dy++) {
+                for (int dz = -3; dz <= 3; dz++) {
+                    BlockPos cell = feet.offset(dx, dy, dz);
+                    if (!level.getBlockState(cell).isAir()) {
+                        continue;
+                    }
+                    int light = level.getMaxLocalRawBrightness(cell);
+                    if (light > here) {
+                        continue;
+                    }
+                    for (Direction toward : new Direction[] {Direction.DOWN, Direction.NORTH, Direction.SOUTH,
+                            Direction.EAST, Direction.WEST}) {
+                        BlockPos anchor = cell.relative(toward);
+                        Direction face = toward.getOpposite();
+                        var anchorState = level.getBlockState(anchor);
+                        if (!anchorState.getFluidState().isEmpty() || !anchorState.isFaceSturdy(level, anchor, face)) {
+                            continue;
+                        }
+                        Vec3 hit = Vec3.atCenterOf(anchor).add(face.getStepX() * 0.5, face.getStepY() * 0.5,
+                                face.getStepZ() * 0.5);
+                        double distance = eyes.distanceToSqr(hit);
+                        double score = light * 100 + distance;
+                        if (distance <= 20.25 && score < bestScore
+                                && level.getEntities((net.minecraft.world.entity.Entity) null,
+                                        new net.minecraft.world.phys.AABB(cell), entity -> true).isEmpty()) {
+                            bestScore = score;
+                            bestAnchor = anchor;
+                            bestFace = face;
+                        }
+                    }
+                }
+            }
+        }
+        nextTorchTick = clientTick + (bestAnchor == null ? 100 : 40);
+        if (bestAnchor == null) {
+            return;
+        }
+        int slot = Hotbar.bring(client, torch);
+        if (slot < 0) {
+            return;
+        }
+        int previous = player.getInventory().getSelectedSlot();
+        player.getInventory().setSelectedSlot(slot);
+        Vec3 hit = Vec3.atCenterOf(bestAnchor).add(bestFace.getStepX() * 0.5, bestFace.getStepY() * 0.5,
+                bestFace.getStepZ() * 0.5);
+        gameMode.useItemOn(player, InteractionHand.MAIN_HAND, new BlockHitResult(hit, bestFace, bestAnchor, false));
+        player.getInventory().setSelectedSlot(previous);
+        ActionableLog.LOGGER.info("[Actionable] auto_torch light={} anchor={}", here, bestAnchor.toShortString());
+    }
+
     private void arrangeHotbar(Minecraft client) {
         var player = client.player;
         if (player == null || client.gameMode == null || player.containerMenu != player.inventoryMenu) {
@@ -2149,7 +2455,8 @@ public final class ActionableClient implements ClientModInitializer {
         }
         boolean geared = geared(client);
         if (returningHome) {
-            if (geared || HomeRange.distance(anchor, player.getBlockX(), player.getBlockZ()) <= HomeRange.RADIUS - 8) {
+            if (geared || !HomeRange.outside(anchor, false, player.getBlockX(), player.getBlockY(),
+                    player.getBlockZ(), -8)) {
                 returningHome = false;
                 activeTask = null;
                 taskSteps = java.util.List.of();
@@ -2164,7 +2471,8 @@ public final class ActionableClient implements ClientModInitializer {
         boolean hunting = pendingHunt != null || (!taskSteps.isEmpty() && (taskSteps.get(currentStep).startsWith("hunt ")
                 || taskSteps.get(currentStep).equalsIgnoreCase(ProgressPlanner.GATHER_FOOD)));
         if (escaping || retreating || nightRoutine || defending || hunting
-                || !HomeRange.outside(anchor, geared, player.getBlockX(), player.getBlockZ(), HomeRange.LEASH_SLACK)) {
+                || !HomeRange.outside(anchor, geared, player.getBlockX(), player.getBlockY(), player.getBlockZ(),
+                HomeRange.LEASH_SLACK)) {
             return;
         }
         if (activeTask != null) {
@@ -2320,7 +2628,7 @@ public final class ActionableClient implements ClientModInitializer {
                 SITE_SCAN_RADIUS);
         int[] anchor = anchor();
         boolean geared = geared(client);
-        sites.removeIf(site -> HomeRange.outside(anchor, geared, site.x(), site.z(), 0));
+        sites.removeIf(site -> HomeRange.outside(anchor, geared, site.x(), site.y(), site.z(), 0));
         if (sites.isEmpty() && anchor != null && !geared) {
             // Baritone's mine would roam unbounded to find more; look around near home instead.
             int[] target = HomeRange.searchTarget(anchor, wanderAttempts++, HomeRange.RADIUS);
@@ -2342,7 +2650,7 @@ public final class ActionableClient implements ClientModInitializer {
             }
             MiningPolicy.Site site = best.get();
             // From water, always walk to the dry stand cell first so Baritone starts mining from land.
-            if (site.distance() > MiningPolicy.WALK_FIRST_DISTANCE || player.isInWater()) {
+            if (player.isInWater()) {
                 executeBaritone(client, connection, "goto " + site.standX() + " " + site.standY() + " " + site.standZ());
                 pendingMine = mine;
                 pendingMineSince = clientTick;
@@ -2399,25 +2707,11 @@ public final class ActionableClient implements ClientModInitializer {
             tell(client, "Stuck in water; heading back to land.");
             return;
         }
-        if (mineStart != null && baritoneCommandRunning && currentBaritoneCommand.startsWith("mine ")
-                && MiningPolicy.strayed(mineStart, player.getBlockX(), player.getBlockY(), player.getBlockZ())) {
-            String command = currentBaritoneCommand;
-            stopBaritone(client);
-            lastAction = command;
-            lastResult = "MINE_STOPPED_STRAYED: Baritone went more than " + MiningPolicy.LEASH_DISTANCE
-                    + " blocks from where mining started; choose a closer exposed deposit or explore the surface";
-            errorCode = "MINE_STOPPED_STRAYED";
-            lastError = lastResult;
-            ActionableLog.LOGGER.info("[Actionable] mine_leash command={}", ActionableLog.text(command));
-            remember(lastAction, lastResult);
-            tell(client, lastResult);
-            ticksUntilPlan = 0;
-        }
     }
 
     /**
-     * Pulls the player out of dark underground areas when they lack cave gear. Decided in code, like
-     * fleeing, because the model walked into dark caves bare-handed.
+     * Tracks the safety assessment for the model and the debug panel. Darkness is only reported;
+     * it never cancels a task.
      */
     private void tickSafety(Minecraft client) {
         var player = client.player;
@@ -2449,31 +2743,11 @@ public final class ActionableClient implements ClientModInitializer {
             }
             return;
         }
-        if (!safety.retreat() || escaping || defending || HouseDesign.nearHouse(home, x, y, z)
-                || (home != null && StairMine.onStairs(x - home[0], y - home[1], z - home[2]))) {
-            return;
-        }
-        avoidAreas.addLast(new int[] {x, y, z});
-        while (avoidAreas.size() > AVOID_MEMORY) {
-            avoidAreas.removeFirst();
-        }
-        String interrupted = activeTask;
-        if (interrupted != null) {
-            noteAttempt(interrupted + " (stopped: dark underground without cave gear at " + x + "," + y + "," + z + ")");
-        }
-        ActionableLog.LOGGER.info("[Actionable] safety_retreat task={} position={},{},{} reasons={}",
-                ActionableLog.text(interrupted), x, y, z, ActionableLog.text(safety.reasons().toString()));
-        stopBaritone(client);
-        cancelCraft(client);
-        retreating = true;
-        goalReason = "dark underground without " + String.join(", ", safety.missingForCaves());
-        startGoal(client, "retreat from dark area to safety", java.util.List.of(SafetyAssessment.retreatCommand(
-                lastSafePosition, x, y, z, WorldProbe.surfaceY(level, x, z))));
     }
 
     /** Advances as soon as the inventory shows the current step is done, instead of at the next plan. */
     private void tickStepCheck(Minecraft client) {
-        if (!enabled || activeTask == null || taskSteps.isEmpty() || planning || judging || decomposing
+        if (!enabled || activeTask == null || taskSteps.isEmpty() || finalCheck || planning || judging || decomposing
                 || pendingCraft != null || pendingJumpPlace != null || client.player == null
                 || clientTick % 20 != 0) {
             return;
@@ -2557,6 +2831,7 @@ public final class ActionableClient implements ClientModInitializer {
         }
         connection.sendChat("#" + command);
         lastAction = command;
+        travelDirection = null;
         pendingMine = null;
         mineStart = null;
         baritoneCommandRunning = !command.equals("cancel");
@@ -2570,6 +2845,35 @@ public final class ActionableClient implements ClientModInitializer {
                 ? "Started Baritone command; " + baritoneProgress(client)
                 : "Baritone cancellation requested";
         tell(client, "Baritone: " + command);
+    }
+
+    /** A ~500 block walk in one compass direction: "#goto x z" leaves y open, so Baritone stays on the surface. */
+    private void travel(Minecraft client, net.minecraft.client.multiplayer.ClientPacketListener connection,
+            String direction) {
+        var player = client.player;
+        if (player == null) {
+            return;
+        }
+        int x = player.getBlockX();
+        int z = player.getBlockZ();
+        int[] anchor = anchor();
+        if (anchor != null && !geared(client)) {
+            int[] target = HomeRange.searchTarget(anchor, wanderAttempts++, HomeRange.RADIUS);
+            tell(client, "Travelling near home instead of wandering off.");
+            executeBaritone(client, connection, HomeRange.surfaceGoto(target));
+            travelDirection = "";
+            return;
+        }
+        switch (direction) {
+            case "NORTH" -> z -= TRAVEL_LEG;
+            case "SOUTH" -> z += TRAVEL_LEG;
+            case "EAST" -> x += TRAVEL_LEG;
+            default -> x -= TRAVEL_LEG;
+        }
+        executeBaritone(client, connection, "goto " + x + " " + z);
+        travelDirection = direction;
+        lastResult = "Started travelling " + direction + " " + TRAVEL_LEG + " blocks to x=" + x + " z=" + z
+                + "; " + baritoneProgress(client);
     }
 
     private void stopBaritone(Minecraft client) {
@@ -2604,6 +2908,13 @@ public final class ActionableClient implements ClientModInitializer {
                 currentBaritoneCommand = "";
                 lastResult = "Baritone finished or stopped by itself (idle): " + finished
                         + ". Check the inventory/surroundings to see if the goal was reached.";
+                if (travelDirection != null && !travelDirection.isEmpty()) {
+                    lastResult = "TRAVEL_LEG_DONE: walked " + TRAVEL_LEG + " blocks " + travelDirection
+                            + ". Check the synopsis for what you were looking for. If it is still missing, call"
+                            + " travel again (the same direction continues another " + TRAVEL_LEG
+                            + " blocks from here, or pick another); otherwise act on what you found.";
+                }
+                travelDirection = null;
                 if (activeTask != null && !planning) {
                     ticksUntilPlan = 0;
                 }
@@ -2797,33 +3108,10 @@ public final class ActionableClient implements ClientModInitializer {
             return "BLOCK_PLACE_FAILED_NO_HEADROOM: block above target " + target + " is "
                     + BuiltInRegistries.BLOCK.getKey(headroomState.getBlock());
         }
-        int hotbarSlot = -1;
-        for (int slot = 0; slot < 9; slot++) {
-            ItemStack stack = player.getInventory().getItem(slot);
-            if (!stack.isEmpty() && stack.is(blockItem)) {
-                hotbarSlot = slot;
-                break;
-            }
-        }
+        int hotbarSlot = Hotbar.bring(client, blockItem);
         if (hotbarSlot < 0) {
-            if (player.containerMenu == player.inventoryMenu) {
-                for (int inventorySlot = InventoryMenu.INV_SLOT_START;
-                     inventorySlot < InventoryMenu.INV_SLOT_END; inventorySlot++) {
-                    ItemStack stack = player.getInventory().getItem(inventorySlot);
-                    if (!stack.isEmpty() && stack.is(blockItem)) {
-                        int selectedSlot = player.getInventory().getSelectedSlot();
-                        // Arguments are (container, slot, button); they were swapped, so the swap never happened.
-                        gameMode.handleContainerInput(player.inventoryMenu.containerId, inventorySlot, selectedSlot,
-                                ContainerInput.SWAP, player);
-                        hotbarSlot = selectedSlot;
-                        break;
-                    }
-                }
-            }
-            if (hotbarSlot < 0) {
-                return "BLOCK_PLACE_FAILED_MATERIAL_MISSING: " + action.block()
-                        + " is not in inventory; gather required materials before placing";
-            }
+            return "BLOCK_PLACE_FAILED_MATERIAL_MISSING: " + action.block()
+                    + " is not in inventory; gather required materials before placing";
         }
 
         for (Direction offset : Direction.values()) {
@@ -2944,6 +3232,7 @@ public final class ActionableClient implements ClientModInitializer {
     }
 
     private static void tell(Minecraft client, String message) {
+        ContextCapture.event("mod", message);
         ActionableLog.LOGGER.info("[Actionable] {}", ActionableLog.text(message));
         if (client.player != null) {
             client.gui.hud.setOverlayMessage(Component.literal("[Actionable] " + message), false);

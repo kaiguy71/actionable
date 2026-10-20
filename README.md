@@ -1,5 +1,5 @@
 # Actionable version 0.1.4
-Readme Date: 10/14/2026
+Readme Date: 10/20/2026
 
 A client-side Fabric mod that plays Minecraft autonomously: an Ollama or Claude model chooses its own goals,
 breaks them into steps, and carries them out through Baritone.
@@ -31,10 +31,11 @@ Fabric Loader will report a missing or too-old version during launch.
 
 | Command | Effect |
 | --- | --- |
-| *(none)* | Autonomy is **on by default**. Join a world and Actionable starts choosing and pursuing its own goals with no input. |
-| `/action <task>` | Run one specific task, for example `/action get 4 oak logs`. Replaces whatever is running. When the task finishes, autonomous goal selection resumes. Tasks are capped at 1,000 characters. |
-| `/actionauto` | Toggle autonomous goal selection on or off. Turning it off abandons the current task; Actionable then only runs tasks you give it with `/action`. |
+| *(none)* | Autonomy is **off by default** (and resets to off on every disconnect or game exit). Use `/actionauto` to turn it on. |
+| `/action <task>` | Run one specific task, for example `/action get 4 oak logs`. Replaces whatever is running. When the task finishes, autonomous goal selection resumes if it is on. Every new task starts a fresh model session. Tasks are capped at 1,000 characters. |
+| `/actionauto` | Toggle autonomous goal selection on or off (first use turns it on). Turning it off abandons the current task; Actionable then only runs tasks you give it with `/action`. |
 | `/actiondebug` | Toggle the on-screen debug panel. |
+| `/actiondebug capture` | Save past 400 interations of model/mod interaction context (state, system prompts, every request and response, actions) to `logs/actionable/<timestamp>-contextOutput.md`, zipped instead when over 2 MB. Does not enable debug mode. |
 
 Type command names in full. A partial name such as `/act` is not a command and Minecraft will answer
 `Unknown or incomplete command`, which looks like the mod failing to load but is not.
@@ -56,7 +57,7 @@ Planning runs in four layers, each a separate call to the configured model:
 3. **Step loop** — works one step at a time, re-planning about every 10 seconds (200 ticks). The model
    sees the numbered plan with the current step marked, the last 5 actions and their results, Baritone's
    elapsed time and progress, and the world snapshot. It picks one action per turn, and may return
-   `wait` to let a running `mine` or `explore` continue.
+   `wait` to let a running `mine`, `goto` or `travel` continue.
 4. **Judge** — decides whether the current step's objective is already satisfied. Steps that name a
    quantity and an item (`mine 3 minecraft:oak_log`, `craft 4 minecraft:stick`) are checked against the
    inventory every second, with no model call. Other steps use a small dedicated model call. When a step is
@@ -88,11 +89,11 @@ Each is skipped once the inventory satisfies it.
 The first goals are a fixed checklist run by code: 20 logs, a 5x5 house (Baritone builds it from a
 generated schematic), a solid dry floor, a crafting table and a door inside, a wooden sword and pickaxe,
 3 white wool from sheep, and a bed. The house corner is saved per world in `config/actionable-homes.json`.
-Until it holds a stone pickaxe and stone sword, the player stays within 64 blocks of home.
+Until it holds a stone pickaxe and stone sword, the player stays within 6 chunks (96 blocks) horizontally and 30 blocks vertically of home.
 
 At night, a player with a bed sleeps. Without one it works from home, picking the most useful job it can
 do without leaving: hang the door, place the table, craft tools, build and use a furnace, or dig the
-staircase mine that starts inside the house (cobblestone first, then iron, down to y=16). The mine stops
+staircase mine that starts inside the house (cobblestone first, then iron, down toward bedrock). The mine stops
 and the player climbs out on a cave, water, lava, low health or food, or a full inventory. The briefing
 includes a Situation line with what the player has, needs and can do now.
 
@@ -107,19 +108,22 @@ Several decisions are made in code rather than by the model, because `gemma3:4b`
   soon as the threat clears.
 - **Dark areas.** Every second, Actionable rates the player's surroundings from light level, sky
   visibility, depth below the local surface (ignoring leaves), time of day, health, food and gear.
-  The rating is shown to the model as `safety={...}`. If the player is at least 4 blocks below the surface,
-  cannot see the sky, is at light level 4 or lower, and is not `cave_ready` (a pickaxe, a weapon and 4+
-  torches), Actionable abandons the current task. It then walks back to the last lit surface spot it
-  recorded, or straight up if there is none, and avoids that area when choosing later mining sites.
+  The rating is shown to the model as `safety={...}` and in the debug panel. Darkness is advice only:
+  it never cancels a task or forces a retreat. The model is told to prepare (torches, bed, weapon) and
+  keep working.
 - **Tools and mining sites.** Before a `mine` command reaches Baritone:
   - Items become the block that drops them (`cobblestone` → `stone`, `coal` → `coal_ore`).
   - A block that drops nothing without a tool the player lacks is refused with `MINE_FAILED_NO_TOOL`.
-  - Without cave gear, only deposits with a face exposed to the sky or to light 8+, and at most 6 blocks
-    below the surface, are accepted. If every loaded deposit is in the dark, the command is refused with
-    `MINE_FAILED_UNSAFE_SITE`. If the best site is more than 8 blocks away, Actionable walks there first
-    so Baritone starts next to it.
-  - A running `mine` is cancelled with `MINE_STOPPED_STRAYED` if Baritone takes the player more than
-    32 blocks from where mining started.
+  - Without cave gear, only deposits at most 30 blocks below the surface are accepted; if every loaded
+    deposit is deeper, the command is refused with `MINE_FAILED_UNSAFE_SITE`. Light level is not checked:
+    Baritone walks to far deposits by itself, and darkness is handled by automatic torches.
+- **Automatic torches.** When the player holds torches and the light at their feet is 4 or lower, a
+  torch is placed on a reachable nearby spot that is at least as dark as the player's cell (so torches
+  spread out), without involving the model and while Baritone keeps walking.
+- **Automatic hotbar.** Placing, mining, fighting and eating move the needed block, tool, weapon or food
+  into the hotbar for you (tools, weapon and food keep fixed slots; blocks use slots 4-7).
+- **No re-plan or placement-retry caps.** The model may re-plan as often as the world requires.
+  - A running `mine` is never cancelled for travelling far: Baritone walks to the nearest deposit.
 - **Goal validation and repeat avoidance.** A director goal that needs a missing tool, or names
   something Actionable cannot craft, is rejected in chat (`Rejected goal ...`). A chosen goal is also
   reduced to the resource it concerns, so "mine 20 stone" and "mine 8 cobblestone" count as the same
@@ -188,10 +192,9 @@ checks are not logged every tick. Restart Minecraft after installing the updated
 | `MINE_FAILED_NO_TOOL` | The block drops nothing without a tool the player lacks (for example stone with no pickaxe). |
 | `MINE_FAILED_UNSAFE_SITE` | Every loaded deposit nearby is dark or deep underground, and the player lacks cave gear. |
 | `MINE_FAILED_CRAFTED_ITEM` | The model tried to mine something that is crafted, such as planks. |
-| `MINE_STOPPED_STRAYED` | Baritone took the player more than 32 blocks from where mining started. |
 | `CRAFT_FAILED_*` | A craft could not be done: `UNSUPPORTED`, `MISSING_INGREDIENTS`, `NO_TABLE`, `TABLE_OUT_OF_REACH`, `TABLE_DID_NOT_OPEN`, `NO_RESULT`, `OTHER_SCREEN_OPEN`, `NO_WORLD`. |
 | `BLOCK_PLACE_FAILED_*` | A `place_block` could not be completed: `NO_ITEM`, `MATERIAL_MISSING`, `UNKNOWN_BLOCK`, `NO_SUPPORT`, `OUT_OF_REACH`, `TARGET_OCCUPIED`, `NO_HEADROOM`, `PLAYER_IN_WAY`, `NO_WORLD`. |
-| `JUMP_PLACE_FAILED_*` | A `jump_place` could not be completed: `NOT_CURRENT_CELL`, `NOT_GROUNDED`, `JUMP_TIMEOUT`, `TARGET_OCCUPIED`, `NO_HEADROOM`, `WORLD_ENDED`. |
+| `JUMP_PLACE_FAILED_*` | The automatic jump-and-place used when boxed in could not be completed: `NOT_GROUNDED`, `JUMP_TIMEOUT`, `TARGET_OCCUPIED`, `NO_HEADROOM`, `WORLD_ENDED`. |
 | `GAME_SESSION_ENDED` | The world or connection closed while a plan was in flight. |
 
 `BLOCK_PLACE_DEFERRED_*` is not an error. It appears in `Result` when a placement needed one more tick
@@ -199,21 +202,34 @@ checks are not logged every tick. Restart Minecraft after installing the updated
 
 ## Actions and safety
 
-The model's Baritone commands are restricted to an allowlist — `mine`, `goto`, `build`, `explore`,
-`find`, `pickup`, `farm`, `cancel`, `come`, `follow` — and each is argument-checked before it is sent,
+The model's Baritone commands are restricted to an allowlist — `mine`, `goto`, `cancel` —
+and each is argument-checked before it is sent,
 so the model cannot run an arbitrary chat command. `mine` takes `<quantity> <blockID>` (for example
 `mine 32 minecraft:diamond_ore`; no coordinates), `goto` takes exactly three integer coordinates (no
-block IDs), and `explore` takes no arguments. Commands that fail validation are discarded as
+block IDs), and long-distance searching is the separate `travel` action. `{"type":"travel","direction":"NORTH"}` (SOUTH, EAST or WEST) runs `#goto <x+/-500> <z>` from the current position (two coordinates, so Baritone picks the surface height). When the leg ends the model gets `TRAVEL_LEG_DONE` and decides whether to travel another 500 blocks or act on what it found. Before the player has stone gear, travel becomes a walk near home. The old `explore` command is gone. Commands that fail validation are discarded as
 `PLAN_NO_VALID_ACTION`. Small models often return a command as separate fields rather than one string,
 so Actionable reconstructs the command from either shape before validating it.
 
 Besides Baritone commands the model can return `attack`, `wait`, `lookup` (registered block/item IDs,
-tech-tree uses and recipes, and recipes known to the player's recipe book), `place_block`, `jump_place`, and
-`craft`. Baritone's own `build` command
-loads an existing `.schematic`, `.schem`, or `.litematic` file; it does not place individual blocks.
+tech-tree uses and recipes, and recipes known to the player's recipe book), `place_block`, `screenshot`, `use_block`, `menu`, `break_block`, `craft` and `white_flag`.
+The house uses Baritone's `build` with a generated schematic internally; the model cannot call it.
 Actionable's guarded single-block placement moves an available inventory stack to the hotbar, clears a
 replaceable plant at the target, aims at an adjacent sturdy face, and places the block if the target is
-in reach. `jump_place` jumps up and places the block beneath the player, for the player's own feet cell.
+in reach. The coordinates the model gives are only a hint: `place_block` searches outward from the
+player, then upward, then downward, for a free cell (no mob, not the player's own body, not plain water)
+with a solid anchor in reach, and jumps to place beneath the player when boxed in (such as a 1x1 hole).
+`jump_place` is accepted as an alias of `place_block`.
+
+`white_flag` is the model's way to give up: the current session is discarded, `#stop` is sent, and a user
+task restarts from scratch with the original prompt and a fresh model session (an autonomous goal is
+dropped and a new one chosen). Five consecutive restarts of the same task end it.
+
+Before any task counts as finished, the model gets one extra "final check" turn with a fresh synopsis
+and screenshot to confirm the original task's end state really exists; otherwise it keeps working.
+The check is skipped when code already confirmed the last step from the inventory or world (crafting, mining
+quantities, house, bed), and runs at most once per task.
+On disconnect, world exit or game exit, in-flight model requests are cancelled and all mod and model
+state is reset to defaults.
 Routine status goes to the actionbar; plans go to chat.
 
 ### Crafting

@@ -9,14 +9,8 @@ import java.util.Optional;
  * which can be deep inside a dark cave; these rules keep an unequipped player on exposed, lit deposits.
  */
 final class MiningPolicy {
-    /** Light at the exposed face that counts as lit without cave gear. */
-    static final int SAFE_LIGHT = 8;
     /** Deepest a deposit may sit below the local surface without cave gear. */
-    static final int MAX_SAFE_DEPTH = 6;
-    /** Deposits farther than this are walked to before mining, so Baritone starts near the right one. */
-    static final int WALK_FIRST_DISTANCE = 8;
-    /** Mining stops when Baritone drags the player farther than this from where mining started. */
-    static final int LEASH_DISTANCE = 32;
+    static final int MAX_SAFE_DEPTH = 30;
     /** Places the client retreated from are avoided within this radius. */
     static final int AVOID_RADIUS = 12;
 
@@ -39,9 +33,7 @@ final class MiningPolicy {
         if (caveReady) {
             return true;
         }
-        // Surface-level sites are fine even when dark: a tree trunk under its canopy at night is not a cave.
-        boolean surface = site.depthBelowSurface() <= 1;
-        return (surface || site.skyVisible() || site.light() >= SAFE_LIGHT) && site.depthBelowSurface() <= MAX_SAFE_DEPTH;
+        return site.depthBelowSurface() <= MAX_SAFE_DEPTH;
     }
 
     static boolean nearAvoided(Site site, List<int[]> avoid) {
@@ -71,22 +63,11 @@ final class MiningPolicy {
         return dx * dx + dy * dy + dz * dz <= 4.5 * 4.5;
     }
 
-    static boolean strayed(int[] start, int x, int y, int z) {
-        if (start == null) {
-            return false;
-        }
-        double dx = x - start[0];
-        double dy = y - start[1];
-        double dz = z - start[2];
-        return Math.sqrt(dx * dx + dy * dy + dz * dz) > LEASH_DISTANCE;
-    }
-
     /** Explains why no candidate was acceptable, naming the nearest one so the model can reason. */
     static String rejection(String block, List<Site> sites, List<String> missingForCaves) {
         Site nearest = sites.stream().min(Comparator.comparingDouble(Site::distance)).orElseThrow();
-        return "MINE_FAILED_UNSAFE_SITE: every loaded " + block + " nearby is in the dark or deep underground"
-                + " (nearest " + nearest.describe() + "). Without cave gear (missing "
-                + String.join(", ", missingForCaves) + ") mine exposed blocks on the surface instead:"
-                + " explore or goto open ground, or choose another resource.";
+        return "MINE_FAILED_UNSAFE_SITE: every loaded " + block + " nearby is more than " + MAX_SAFE_DEPTH
+                + " blocks below the surface (nearest " + nearest.describe() + "). Without cave gear (missing "
+                + String.join(", ", missingForCaves) + ") mine shallower deposits instead, or craft the gear.";
     }
 }

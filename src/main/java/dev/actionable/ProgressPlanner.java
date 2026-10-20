@@ -24,8 +24,6 @@ final class ProgressPlanner {
     static final String GO_TABLE = "go to crafting table";
     static final String LAY_FLOOR = "lay house floor";
     static final String GATHER_FOOD = "gather food";
-    /** The goal when no milestone is left: there is always something to do, and diamonds lead onward. */
-    static final String FALLBACK_GOAL = "mine 3 minecraft:diamond";
     private static final Pattern HOUSE_MINE = Pattern.compile("^dig house mine for (\\d{1,4}) ([a-z0-9_.-]+:[a-z0-9_./-]+)$");
     /** Planks kept for filling holes and water in the floor; the floor has 11 cells. */
     static final int FLOOR_PLANKS = 12;
@@ -407,10 +405,6 @@ final class ProgressPlanner {
      * director goals like "mine 20 stone" when the player has no pickaxe.
      */
     static Optional<String> goalProblem(String goal, Map<String, Integer> inventory) {
-        if (goal.strip().toLowerCase(Locale.ROOT).startsWith("explore")) {
-            return Optional.of("exploring is not available; pick a milestone goal, or " + FALLBACK_GOAL
-                    + " to find diamonds");
-        }
         Optional<QuantifiedStep> parsed = parse(goal);
         if (parsed.isEmpty()) {
             return Optional.empty();
@@ -619,7 +613,7 @@ final class ProgressPlanner {
                 text.append("\n- milestone_plan=").append(steps);
             }
         } else {
-            text.append("\n- next_milestone=none (early-game milestones done; gather what a plan needs, or mine diamonds)");
+            text.append("\n- next_milestone=none (early-game milestones done; explore or gather what a plan needs)");
         }
         text.append("\n- craftable_now=").append(TechTree.craftableNow(inventory, tableNearby));
         text.append("\n- inventory_uses=").append(inventoryUses(inventory));

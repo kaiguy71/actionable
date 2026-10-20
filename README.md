@@ -137,31 +137,12 @@ staircase mine that starts inside the house (cobblestone first, then iron, down 
 and the player climbs out on a cave, water, lava, low health or food, or a full inventory. The briefing
 includes a Situation line with what the player has, needs and can do now.
 
-### Diamond mine
+### Exploration comparison branch
 
-Any `mine N minecraft:diamond` (or `diamond_ore`) is run by code (`DeepMiner`, rules in `DeepMine`), not
-sent to Baritone directly, because diamonds are rarely loaded near the surface. It needs the Overworld,
-a pickaxe that can harvest diamonds, and cave gear (a pickaxe and a weapon). It then:
-
-1. walks clear of the house if needed, then digs a three-tall staircase down from where the player
-   stands to y=-58, heading east; it refuses to dig the house shell or floor;
-2. digs level two-tall tunnels there in a square spiral (legs of 16, 16, 32, 32, ... up to 64 blocks);
-3. while tunneling, every 2 seconds scans the loaded blocks within 32 blocks sideways and 16 up and down for diamond
-   ore. Ore within 40 blocks is handed to Baritone (`mine N <ore block>`); when Baritone goes idle,
-   or after 2 minutes, the mine looks again and resumes digging from where the player is. Ore Baritone
-   fails to reach after 3 tries is skipped;
-4. turns to another heading when the next cell touches lava, water, unloaded terrain, falling blocks,
-   damaging ground, or has no solid floor, and ends if all
-   four headings are blocked. It also ends at low health or food, a full inventory, 600 blocks dug with
-   no diamond, or 20 minutes, then walks back to the house door.
-
-It also returns when its diamond-capable pickaxe is lost. The mining step cannot advance until the
-return finishes (or times out after five minutes). Failed runs enter the normal goal retry cooldown.
-Night, danger, drowning, a new task and disconnect cancel its block breaking. Not verified in-game yet.
-Baritone's ability to reach buried ore selected by the scan remains an in-game assumption.
-The default diamond fallback is Overworld-only and reports `MINE_FAILED_WRONG_DIMENSION` in the Nether;
-autonomous fortress exploration is not implemented. Interrupted runs start from the current position;
-there is no persisted deep-mine entrance or tunnel-resume state.
+This branch preserves the original Baritone `explore` command, planner guidance and exploration fallback.
+Water-bucket searches use `explore` when no usable source is observed. Diamond mining uses the normal
+Baritone mining path; the experimental staircase/tunnel diamond miner is not included. Shared survival,
+crafting, logging, Nether preparation and repeat-guard fixes remain included.
 
 Several decisions are made in code rather than by the model, because `gemma3:4b` was measured failing them:
 
@@ -226,12 +207,10 @@ Several decisions are made in code rather than by the model, because `gemma3:4b`
   something Actionable cannot craft, is rejected in chat (`Rejected goal ...`). A chosen goal is also
   compared with its full action and objective; equivalent block/drop names are normalized. Goal identity preserves the action, target quantity and furniture/location rather than just
   its last word. Rejected, repeated or failed goals are replaced with the next progression milestone. A milestone
-  attempted twice recently is skipped. When no milestone is left, the goal is `mine 3 minecraft:diamond`
-  (see Diamond mine below).
+  attempted twice recently is skipped. When no milestone is left, Actionable explores instead.
 
 - **Loop and plan sanity.** The same goal attempted twice without being achieved is replaced the same way
-  as an achieved one. The user-requested removal of exploration is an explicit exception to the
-  repository rule against feature-based goal filtering; other plan steps are preserved. Duplicate steps are removed
+  as an achieved one. Exploration goals remain available; duplicate steps are removed
   and any `mine` quantity is capped at 64.
   Block interactions and menu moves are tracked by target so distinct targets are not treated as repeats.
   Within a task, an action that fails twice in a row, or is repeated 3 times with no observed progress,
@@ -245,8 +224,8 @@ Several decisions are made in code rather than by the model, because `gemma3:4b`
   location: it waits for changed conditions or a 60-second game-time cooldown. This check applies to
   forced milestones as well as director choices. Logs include `VERIFIED_WORK` and `GOAL_COOLDOWN`.
 
-Ordinary tasks still running after 5 minutes (6,000 ticks) are abandoned. Active staircase and diamond
-miners use their own timeouts. Actionable remembers the last 20 achieved and 20 attempted goals.
+Ordinary tasks still running after 5 minutes (6,000 ticks) are abandoned. The staircase miner
+uses its own timeout. Actionable remembers the last 20 achieved and 20 attempted goals.
 
 ## Debug panel
 
@@ -329,11 +308,10 @@ checks are not logged every tick. Restart Minecraft after installing the updated
 ## Actions and safety
 
 The model's Baritone commands are restricted to an allowlist — `mine`, `goto`, `build`,
-`find`, `pickup`, `farm`, `cancel`, `come`, `follow` — and each is argument-checked before it is sent,
+`explore`, `find`, `pickup`, `farm`, `cancel`, `come`, `follow` — and each is argument-checked before it is sent,
 so the model cannot run an arbitrary chat command. `mine` takes `<quantity> <blockID>` (for example
 `mine 32 minecraft:diamond_ore`; no coordinates), `goto` takes exactly three integer coordinates (no
-block IDs). There is no `explore` command: Baritone's explore circled and gave up, so it was removed,
-and a goal that starts with "explore" is rejected and replaced by the next milestone. Commands that fail
+block IDs), and `explore` takes no arguments. Exploration goals are accepted. Commands that fail
 validation are discarded as `PLAN_NO_VALID_ACTION`. Small models often return a command as separate fields rather than one string,
 so Actionable reconstructs the command from either shape before validating it.
 
@@ -367,8 +345,7 @@ uses exact coordinates: it never silently falls back to another cell, which woul
 
 The `fill water bucket` objective has a code-owned plan and controller. It does not ask a model to
 decompose that task into crafting or mining. It selects a loaded water source, fills from reach or
-walks to a dry bank with a clear interaction ray, and searches new surface columns with `goto x z`
-when no usable source is observed.
+walks to a dry bank with a clear interaction ray, and explores when no usable source is observed.
 Inventory evidence must show a water bucket before the objective completes; the normal task timeout
 still applies. It does not intentionally navigate into the source cell.
 

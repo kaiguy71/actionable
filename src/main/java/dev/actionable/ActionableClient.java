@@ -96,8 +96,6 @@ public final class ActionableClient implements ClientModInitializer {
     private BlockBreaker pendingBreak;
     private Smelter pendingSmelt;
     private StairMiner pendingStairs;
-    private DeepMiner pendingDeep;
-    private int waterSearchAttempts;
     /** True while the active task is a job the night routine chose (no bed, so work at home). */
     private boolean nightJob;
     /** Morning came while in the house mine; the task ends once the player has climbed out. */
@@ -205,7 +203,6 @@ public final class ActionableClient implements ClientModInitializer {
         ClientPlayConnectionEvents.DISCONNECT.register((handler, client) -> {
             cancelHomeWork(client);
             Screenshots.archiveSession(client);
-            waterSearchAttempts = 0;
             ThreatProbe.clear();
             goalRetries.clear();
             dangerMemory.clear();
@@ -264,7 +261,6 @@ public final class ActionableClient implements ClientModInitializer {
             tickBreak(client);
             tickSmelt(client);
             tickStairs(client);
-            tickDeepMine(client);
             tickEat(client);
             if (enabled && clientTick % 100 == 0 && eatPhase == 0 && pendingCraft == null && pendingSmelt == null
                     && pendingBreak == null && !defending) {
@@ -275,7 +271,7 @@ public final class ActionableClient implements ClientModInitializer {
             tickSafety(client);
             tickNight(client);
             if (enabled && activeTask != null && (!nightRoutine || nightJob)
-                    && pendingStairs == null && pendingDeep == null && clientTick - taskStartedAtTick > MAX_TASK_TICKS) {
+                    && pendingStairs == null && clientTick - taskStartedAtTick > MAX_TASK_TICKS) {
                 abandonTask(client, "took too long");
             }
             if (enabled && autonomous && activeTask == null && !requests.choosingGoal && !requests.decomposing && !nightRoutine
@@ -285,7 +281,7 @@ public final class ActionableClient implements ClientModInitializer {
             // Night, return-home and hunting are run by code; the model is not consulted while they run.
             if (enabled && activeTask != null && !requests.planning && !requests.decomposing && !requests.judging && (!nightRoutine || nightJob)
                     && pendingJumpPlace == null && pendingCraft == null && pendingHunt == null
-                    && pendingBreak == null && pendingSmelt == null && pendingStairs == null && pendingDeep == null
+                    && pendingBreak == null && pendingSmelt == null && pendingStairs == null
                     && eatPhase == 0 && ticksUntilPlan-- <= 0) {
                 requestNextPlan(client);
             }
@@ -457,11 +453,10 @@ public final class ActionableClient implements ClientModInitializer {
                         }
                         java.util.Optional<ProgressPlanner.Milestone> milestone = milestone(client);
                         if (milestone.isEmpty()) {
-                            // Every milestone is done or unreachable; there is always a goal, and diamonds
-                            // are what the Nether route and every later stage need.
-                            tell(client, "No new goal available; looking for diamonds.");
-                            chosen = ProgressPlanner.FALLBACK_GOAL;
-                            why = "no milestone is reachable right now; diamonds are needed for every later stage";
+                            // Look around and reconsider when no milestone is currently available.
+                            tell(client, "No new goal available; exploring.");
+                            chosen = "explore to find new resources";
+                            why = "no milestone is reachable right now; new terrain may expose resources";
                         } else {
                             chosen = milestone.get().goal();
                             why = milestone.get().why();
@@ -1536,11 +1531,7 @@ public final class ActionableClient implements ClientModInitializer {
                         + source.x() + "," + source.y() + "," + source.z();
             }
             case EXPLORE -> {
-                if (!baritoneBusy(client)) {
-                    var player = java.util.Objects.requireNonNull(client.player);
-                    executeBaritone(client, connection,
-                            BucketPlan.searchCommand(player.getBlockX(), player.getBlockZ(), waterSearchAttempts++));
-                }
+                if (!baritoneBusy(client)) executeBaritone(client, connection, "explore");
                 lastResult = "Searching loaded terrain for a water source reachable from dry ground";
             }
         }
@@ -2211,7 +2202,6 @@ public final class ActionableClient implements ClientModInitializer {
             cancelCraft(client);
             cancelBreak(client);
             pendingHunt = null;
-            cancelDeepMine(client);
             stopBaritone(client);
             activeTask = null;
             taskSteps = java.util.List.of();
@@ -2521,55 +2511,6 @@ public final class ActionableClient implements ClientModInitializer {
         }
     }
 
-    /** Runs the diamond mine; its result goes back to planning like any other finished action. */
-    private void tickDeepMine(Minecraft client) {
-        if (pendingDeep == null || defending || eatPhase != 0) {
-            return;
-        }
-        var connection = client.getConnection();
-        if (!enabled || connection == null) {
-            cancelHomeWork(client);
-            return;
-        }
-        String result = pendingDeep.tick(client, clientTick,
-                command -> executeBaritone(client, connection, command), () -> stopBaritone(client),
-                () -> baritoneBusy(client));
-        if (result == null) {
-            return;
-        }
-        pendingDeep = null;
-        lastAction = "dig diamond mine";
-        lastResult = result;
-        reportBlockResult(client);
-        remember(lastAction, lastResult);
-        ActionableLog.LOGGER.info("[Actionable] diamond_mine {}", ActionableLog.text(result));
-        if (!result.startsWith("MINED:")) {
-            goalRetries.failed(activeTask, goalRetryContext(client), clientTick);
-            abandonTask(client, result);
-            return;
-        }
-        ticksUntilPlan = 1;
-    }
-
-    /** Starts the diamond mine for a mine goal on diamonds, unless the player is not fit to go deep. */
-    private void startDeepMine(Minecraft client, String requested, int quantity) {
-        var level = java.util.Objects.requireNonNull(client.level);
-        SafetyAssessment.Result safety = WorldProbe.safety(client);
-        if (!level.dimension().identifier().toString().equals("minecraft:overworld")) {
-            lastResult = "MINE_FAILED_WRONG_DIMENSION: the diamond mine digs down from the Overworld surface";
-        } else if (!safety.caveReady()) {
-            lastResult = "MINE_FAILED_NOT_CAVE_READY: the diamond mine goes deep underground; first get "
-                    + String.join(", ", safety.missingForCaves());
-        } else {
-            stopBaritone(client);
-            pendingDeep = new DeepMiner(requested, quantity, home, clientTick);
-            lastResult = "Starting the " + pendingDeep.describe() + ": stairs down to y=" + DeepMine.TUNNEL_Y
-                    + ", then tunnels, scanning for diamond ore every " + DeepMine.SCAN_INTERVAL / 20 + " seconds";
-            tell(client, lastResult);
-        }
-        reportBlockResult(client);
-    }
-
     /** Stops furnace and house-mine work immediately (pause, defense of the task, abandon). */
     private void cancelHomeWork(Minecraft client) {
         cancelSmelt(client);
@@ -2577,16 +2518,7 @@ public final class ActionableClient implements ClientModInitializer {
             pendingStairs = null;
             stopBaritone(client);
         }
-        cancelDeepMine(client);
         morningPending = false;
-    }
-
-    private void cancelDeepMine(Minecraft client) {
-        if (pendingDeep != null) {
-            pendingDeep.cancel(client);
-            pendingDeep = null;
-            stopBaritone(client);
-        }
     }
 
     private static net.minecraft.client.multiplayer.ClientPacketListener connection(Minecraft client) {
@@ -2727,11 +2659,6 @@ public final class ActionableClient implements ClientModInitializer {
                     + TechTree.pickaxeFor(needed == TechTree.Tier.NONE ? TechTree.Tier.WOOD : needed)
                     + " (or the right tool); craft it first instead of mining by hand";
             reportBlockResult(client);
-            return;
-        }
-        if (DeepMine.isDiamondTarget(requested) || DeepMine.isDiamondTarget(blockId)) {
-            // Diamonds are rarely loaded near the surface: code digs down to them and keeps scanning.
-            startDeepMine(client, "minecraft:diamond", Integer.parseInt(parts[1]));
             return;
         }
         SafetyAssessment.Result safety = WorldProbe.safety(client);
@@ -2893,7 +2820,7 @@ public final class ActionableClient implements ClientModInitializer {
     /** Advances as soon as the inventory shows the current step is done, instead of at the next plan. */
     private void tickStepCheck(Minecraft client) {
         if (!enabled || activeTask == null || taskSteps.isEmpty() || requests.planning || requests.judging || requests.decomposing
-                || pendingCraft != null || pendingJumpPlace != null || pendingDeep != null || client.player == null
+                || pendingCraft != null || pendingJumpPlace != null || client.player == null
                 || clientTick % 20 != 0) {
             return;
         }

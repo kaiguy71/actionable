@@ -89,14 +89,13 @@ class ActionPlannerTest {
     }
 
     @Test
-    void exploreIsNotACommandAndDiamondMiningIs() {
-        assertEquals(Optional.empty(), ActionPlanner.validateCommand("explore"));
-        assertEquals(Optional.empty(), ActionPlanner.validateCommand("Explore"));
+    void exploreKeepsItsOriginalArgumentValidationAndPromptGuidance() {
+        assertEquals(Optional.of("explore"), ActionPlanner.validateCommand("explore"));
+        assertEquals(Optional.of("Explore"), ActionPlanner.validateCommand("Explore"));
+        assertEquals(Optional.empty(), ActionPlanner.validateCommand("explore extra"));
         assertEquals(Optional.of("mine 3 minecraft:diamond"), ActionPlanner.validateCommand("mine 3 minecraft:diamond"));
         for (String stage : new String[] {"director", "decomposition", "action"}) {
-            String prompt = ActionPlanner.systemPrompt(stage).toLowerCase(java.util.Locale.ROOT);
-            assertFalse(prompt.contains("- explore:") || prompt.contains("goto, explore") || prompt.contains("\"explore\""),
-                    stage + " prompt still offers explore");
+            assertTrue(ActionPlanner.systemPrompt(stage).contains("explore"), stage);
         }
     }
 

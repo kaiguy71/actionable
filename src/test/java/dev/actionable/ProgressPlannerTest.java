@@ -350,18 +350,8 @@ class ProgressPlannerTest {
         assertTrue(ProgressPlanner.goalProblem("craft 1 minecraft:beacon", Map.of()).isPresent());
         assertEquals(Optional.empty(), ProgressPlanner.goalProblem("mine 16 minecraft:oak_log", Map.of()));
         assertEquals(Optional.empty(), ProgressPlanner.goalProblem("craft 1 minecraft:wooden_pickaxe", Map.of()));
-        // Exploring was removed: it circled and gave up, so the planner is pointed at diamonds instead.
-        assertTrue(ProgressPlanner.goalProblem("explore", Map.of()).orElseThrow().contains("not available"));
-        assertTrue(ProgressPlanner.goalProblem("Explore to find new resources", Map.of()).isPresent());
-        assertEquals(Optional.empty(), ProgressPlanner.goalProblem(ProgressPlanner.FALLBACK_GOAL,
-                Map.of("minecraft:iron_pickaxe", 1)));
-    }
-
-    @Test
-    void fallbackGoalIsADiamondGoalThatNeedsAnIronPickaxe() {
-        assertEquals("mine 3 minecraft:diamond", ProgressPlanner.FALLBACK_GOAL);
-        assertTrue(ProgressPlanner.goalProblem(ProgressPlanner.FALLBACK_GOAL,
-                Map.of("minecraft:stone_pickaxe", 1)).isPresent());
+        assertEquals(Optional.empty(), ProgressPlanner.goalProblem("explore", Map.of()));
+        assertEquals(Optional.empty(), ProgressPlanner.goalProblem("Explore to find new resources", Map.of()));
     }
 
     @Test

@@ -21,7 +21,7 @@ final class ActionPlanner {
     static final int MAX_STEPS = 8;
     static final Set<String> MENU_OPS = Set.of("read", "quick_move", "move", "drop", "close");
     private static final Set<String> ALLOWED_COMMANDS =
-            Set.of("mine", "goto", "build", "find", "pickup", "farm", "cancel", "come", "follow");
+            Set.of("mine", "goto", "build", "explore", "find", "pickup", "farm", "cancel", "come", "follow");
     private static final String GOAL_HEADER = "GET TO THE NETHER!!!\n\n";
     private static final String SYSTEM_PROMPT = GOAL_HEADER + """
             You plan Minecraft tasks and can issue one next action per turn.
@@ -39,9 +39,7 @@ final class ActionPlanner {
               mining until the quantity is reached or the command is replaced. Quantity comes first; no
               coordinates or extra args.
             - goto <x> <y> <z>: exactly three integer coordinates; goto does not accept block IDs.
-            - mine <n> minecraft:diamond: code digs a staircase down to y=-58, tunnels there, scans the
-              loaded blocks every two seconds for diamond ore and mines it. Use it to find diamonds; there is
-              no explore command.
+            - explore: no arguments. It explores new terrain.
             - build <schematic_filename>: existing schematic only; never a block/item ID.
             Never emit coordinates after mine and never emit a block ID to goto.
             Other approved commands use their normal Baritone syntax, but do not invent arguments.
@@ -50,7 +48,8 @@ final class ActionPlanner {
             distance to a goto target where applicable, and recent Baritone feedback. If it is making
             useful progress, return action type "wait" to leave the current command running. If progress stalls,
             the environment changes, or the current command is not appropriate, issue a different valid
-            Baritone command to replace it. Do not resend an already-running command.
+            Baritone command to replace it. Do not resend an already-running command. Explore may be left
+            running while checking newly loaded biome/world information.
 
             Before building or placing, compare required items to inventory. Gather missing source materials
             first with mine and use the inventory/world facts; do not try to place an item that is unavailable.
@@ -90,7 +89,7 @@ final class ActionPlanner {
             pickaxe you lack (stone, coal ore and every ore need one; cobblestone comes from mining
             minecraft:stone), or when every nearby deposit is in a dark cave or deep underground and you
             lack cave gear. Mining has no fixed travel-distance cutoff. Read a
-            rejection and change plan (craft the tool, goto open surface ground, or pick another resource);
+            rejection and change plan (craft the tool, explore the surface, or pick another resource);
             never resend the rejected command. The synopsis safety={...} field rates light, depth and
             gear: when level=danger, get to light or the surface before anything else, and never go
             underground while cave_ready=false.
@@ -200,7 +199,7 @@ final class ActionPlanner {
     private static final String DECOMPOSE_PROMPT = GOAL_HEADER + """
             You break a Minecraft task into an ordered plan of concrete, verifiable steps.
             Each step must be achievable with these abilities only: Baritone navigation and mining
-            (mine, goto, find, pickup, farm, follow), crafting items in craftable_catalog,
+            (mine, goto, explore, find, pickup, farm, follow), crafting items in craftable_catalog,
             placing a single block from inventory, using buckets/flint and steel on observed coordinates,
             close-range melee against hostile mobs, equipping items
             already carried, and looking up block/item IDs. Building from schematics is NOT available.
@@ -238,7 +237,7 @@ final class ActionPlanner {
             You decide what a Minecraft player should do next, with no human giving instructions.
             You are given a progression briefing, the world state (including a safety assessment), goals
             already achieved, and goals recently attempted.
-            Abilities: Baritone navigation and mining (mine, goto, find, pickup, farm, follow),
+            Abilities: Baritone navigation and mining (mine, goto, explore, find, pickup, farm, follow),
             crafting the items in craftable_catalog (2x2 anywhere, 3x3 at a placed crafting table), placing
             a block from inventory, close-range melee against hostile mobs, equipping items already
             carried, and looking up IDs.
@@ -279,8 +278,7 @@ final class ActionPlanner {
             unless the state shows it clearly failed and is still worth doing.
             Goal forms: "craft 1 minecraft:wooden_pickaxe", "mine 8 minecraft:oak_log", "build house",
             "hunt 3 minecraft:white_wool", "place minecraft:crafting_table in house", "place door in house",
-            "place minecraft:white_bed in house", "mine 3 minecraft:diamond" (stairs down to the diamond layer,
-            then tunnels and scans for ore; needs an iron pickaxe and a weapon).
+            "place minecraft:white_bed in house", "explore".
             Return only JSON: {"goal":"craft 1 minecraft:wooden_pickaxe",
              "why":"stone and coal drop nothing without a pickaxe; it unlocks cobblestone for stone tools"}
             """;
@@ -654,7 +652,7 @@ final class ActionPlanner {
                     + " " + firstOf(action, "", "block", "block_id", "blockID", "item", "target");
             case "goto" -> verb + " " + firstOf(action, "", "x") + " " + firstOf(action, "", "y")
                     + " " + firstOf(action, "", "z");
-            case "cancel", "come" -> verb;
+            case "explore", "cancel", "come" -> verb;
             default -> verb + " " + firstOf(action, "", "target", "block", "block_id", "item", "name");
         };
     }
@@ -695,7 +693,7 @@ final class ActionPlanner {
                     return Optional.empty();
                 }
             }
-            case "come", "cancel" -> {
+            case "explore", "come", "cancel" -> {
                 if (parts.length != 1) {
                     return Optional.empty();
                 }

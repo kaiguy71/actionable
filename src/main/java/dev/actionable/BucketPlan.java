@@ -10,10 +10,6 @@ final class BucketPlan {
             boolean reachable, boolean visible, boolean dryBank) { }
     record Decision(Mode mode, Source source) { }
     private BucketPlan() { }
-    /** Search new surface columns without depending on Baritone's explore command. */
-    static String searchCommand(int x, int z, int attempt) {
-        return HomeRange.surfaceGoto(HuntSearch.leg(new int[] {x, 0, z}, attempt));
-    }
     static Decision choose(boolean filled, boolean empty, List<Source> sources) {
         if (filled) return new Decision(Mode.DONE, null);
         if (!empty) return new Decision(Mode.NEED_BUCKET, null);

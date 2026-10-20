@@ -7,12 +7,6 @@ import org.junit.jupiter.api.Test;
 
 class BucketPlanTest {
     @Test
-    void waterSearchUsesSurfaceColumnsAndChangesDirection() {
-        assertEquals("goto 0 -160", BucketPlan.searchCommand(0, 0, 0));
-        assertEquals("goto 160 0", BucketPlan.searchCommand(0, 0, 2));
-        assertEquals("goto 10 -220", BucketPlan.searchCommand(10, 20, 8));
-    }
-    @Test
     void fillingAnExistingBucketNeverGeneratesAnIronMiningOrCraftingPlan() {
         assertEquals(List.of("fill water bucket"), ProgressPlanner.stepsForGoal("fill water bucket",
                 Map.of("minecraft:bucket", 1), false, "minecraft:oak_log"));

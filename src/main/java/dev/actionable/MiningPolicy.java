@@ -75,6 +75,6 @@ final class MiningPolicy {
         return "MINE_FAILED_UNSAFE_SITE: every loaded " + block + " nearby is in the dark or deep underground"
                 + " (nearest " + nearest.describe() + "). Without cave gear (missing "
                 + String.join(", ", missingForCaves) + ") mine exposed blocks on the surface instead:"
-                + " goto open ground, or choose another resource.";
+                + " explore or goto open ground, or choose another resource.";
     }
 }

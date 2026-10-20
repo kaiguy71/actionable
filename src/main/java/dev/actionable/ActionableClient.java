@@ -1967,7 +1967,13 @@ public final class ActionableClient implements ClientModInitializer {
             return;
         }
         BlockPos feet = player.blockPosition();
-        int[] origin = home != null ? home : new int[] {feet.getX() + 1, feet.getY(), feet.getZ() + 1};
+        int[] origin = home;
+        if (origin == null) {
+            int[] site = client.level == null ? null : WorldProbe.bestHouseSite(client.level, feet);
+            origin = site != null ? site : new int[] {feet.getX() + 1, feet.getY(), feet.getZ() + 1};
+            ActionableLog.LOGGER.info("[Actionable] house_site chosen={},{},{} from feet={},{},{}",
+                    origin[0], origin[1], origin[2], feet.getX(), feet.getY(), feet.getZ());
+        }
         try {
             java.nio.file.Path dir = client.gameDirectory.toPath().resolve("schematics");
             java.nio.file.Files.createDirectories(dir);
@@ -1985,7 +1991,7 @@ public final class ActionableClient implements ClientModInitializer {
             ActionableLog.LOGGER.info("[Actionable] home_set at={},{},{}", origin[0], origin[1], origin[2]);
         }
         executeBaritone(client, connection, "build " + HouseDesign.SCHEMATIC_FILE + " " + origin[0] + " "
-                + origin[1] + " " + origin[2]);
+                + (origin[1] - 1) + " " + origin[2]);
         lastAction = ProgressPlanner.BUILD_HOUSE;
         lastResult = "Building a " + HouseDesign.WIDTH + "x" + HouseDesign.LENGTH + " " + planks + " house at "
                 + origin[0] + "," + origin[1] + "," + origin[2];

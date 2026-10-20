@@ -15,6 +15,8 @@ final class HouseDesign {
     static final int WIDTH = 5;
     static final int HEIGHT = 4;
     static final int LENGTH = 5;
+    /** The schematic starts one level below the house so the floor is built with it. */
+    static final int SCHEMATIC_HEIGHT = HEIGHT + 1;
     static final String SCHEMATIC_FILE = "actionable_house.schem";
     /*
      * Interior layout, looking down (x 1-3, z 1-3; doorway at x=2 in the north wall z=0):
@@ -99,8 +101,21 @@ final class HouseDesign {
         return wall && !doorway;
     }
 
+    /** True for the floor planks the schematic lays one level below the house (y = -1). */
+    static boolean floorPlank(int x, int z) {
+        return x >= 0 && x < WIDTH && z >= 0 && z < LENGTH
+                && floorCells().stream().anyMatch(cell -> cell[0] == x && cell[2] == z);
+    }
+
     static int planksNeeded() {
         int count = 0;
+        for (int z = 0; z < LENGTH; z++) {
+            for (int x = 0; x < WIDTH; x++) {
+                if (floorPlank(x, z)) {
+                    count++;
+                }
+            }
+        }
         for (int y = 0; y < HEIGHT; y++) {
             for (int z = 0; z < LENGTH; z++) {
                 for (int x = 0; x < WIDTH; x++) {
@@ -150,12 +165,14 @@ final class HouseDesign {
      * accepts versions 1 and 2 with the fields at the root compound.
      */
     static byte[] schematic(String planks, int dataVersion) {
-        byte[] blocks = new byte[WIDTH * HEIGHT * LENGTH];
-        for (int y = 0; y < HEIGHT; y++) {
+        byte[] blocks = new byte[WIDTH * SCHEMATIC_HEIGHT * LENGTH];
+        for (int row = 0; row < SCHEMATIC_HEIGHT; row++) {
+            int y = row - 1;
             for (int z = 0; z < LENGTH; z++) {
                 for (int x = 0; x < WIDTH; x++) {
                     // Palette 0 is air, 1 is planks; both fit in a single varint byte.
-                    blocks[(y * LENGTH + z) * WIDTH + x] = (byte) (solid(x, y, z) ? 1 : 0);
+                    boolean plank = y < 0 ? floorPlank(x, z) : solid(x, y, z);
+                    blocks[(row * LENGTH + z) * WIDTH + x] = (byte) (plank ? 1 : 0);
                 }
             }
         }
@@ -166,7 +183,7 @@ final class HouseDesign {
             intTag(out, "Version", 2);
             intTag(out, "DataVersion", dataVersion);
             shortTag(out, "Width", WIDTH);
-            shortTag(out, "Height", HEIGHT);
+            shortTag(out, "Height", SCHEMATIC_HEIGHT);
             shortTag(out, "Length", LENGTH);
             intTag(out, "PaletteMax", 2);
             out.writeByte(10);

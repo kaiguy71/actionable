@@ -16,7 +16,7 @@ import org.junit.jupiter.api.Test;
 class HouseAndHomeTest {
     @Test
     void houseIsAWalledRoofedHutWithADoorway() {
-        assertEquals(71, HouseDesign.planksNeeded());
+        assertEquals(79, HouseDesign.planksNeeded());
         assertTrue(HouseDesign.solid(0, 0, 0), "corner wall");
         assertTrue(HouseDesign.solid(2, 3, 2), "roof");
         assertFalse(HouseDesign.solid(2, 1, 2), "interior is open");
@@ -98,21 +98,23 @@ class HouseAndHomeTest {
         assertEquals(2, root.get("Version"));
         assertEquals(4440, root.get("DataVersion"));
         assertEquals((short) 5, root.get("Width"));
-        assertEquals((short) 4, root.get("Height"));
+        assertEquals((short) 5, root.get("Height"));
         assertEquals((short) 5, root.get("Length"));
         @SuppressWarnings("unchecked")
         Map<String, Object> palette = (Map<String, Object>) root.get("Palette");
         assertEquals(Map.of("minecraft:air", 0, "minecraft:spruce_planks", 1), palette);
         byte[] blocks = (byte[]) root.get("BlockData");
-        assertEquals(100, blocks.length);
+        assertEquals(125, blocks.length);
         int planks = 0;
         for (byte block : blocks) {
             planks += block;
         }
         assertEquals(HouseDesign.planksNeeded(), planks);
-        // Sponge order is (y * length + z) * width + x: the doorway at x=2, z=0 is air on the ground.
-        assertEquals(0, blocks[2]);
-        assertEquals(1, blocks[0]);
+        // Sponge order is (y * length + z) * width + x, with the floor layer first: the doorway at x=2, z=0
+        // is a floor plank below and air at ground level.
+        assertEquals(1, blocks[2]);
+        assertEquals(0, blocks[25 + 2]);
+        assertEquals(1, blocks[25]);
         assertArrayEquals(new int[] {0, 0, 0}, (int[]) root.get("Offset"));
     }
 

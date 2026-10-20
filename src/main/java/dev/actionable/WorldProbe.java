@@ -345,6 +345,62 @@ final class WorldProbe {
      * The next house cell needing a plank: a floor cell that is a hole or water, then a walkable cell
      * holding water. Null when the floor is sound and dry.
      */
+    static final int SITE_RADIUS = 14;
+    static final int SITE_STEP = 2;
+
+    /**
+     * Picks the house corner near {@code feet} with the least in the way: trees (logs and leaves) inside
+     * the house box and its one-block margin, uneven ground under it, and water. Ties go to the closest.
+     * The origin is at the walking level of the ground, like the player's feet.
+     */
+    static int[] bestHouseSite(ClientLevel level, BlockPos feet) {
+        int[] best = null;
+        double bestScore = Double.MAX_VALUE;
+        for (int dx = -SITE_RADIUS; dx <= SITE_RADIUS; dx += SITE_STEP) {
+            for (int dz = -SITE_RADIUS; dz <= SITE_RADIUS; dz += SITE_STEP) {
+                int x = feet.getX() + dx;
+                int z = feet.getZ() + dz;
+                if (!level.hasChunk(x >> 4, z >> 4) || !level.hasChunk((x + HouseDesign.WIDTH) >> 4,
+                        (z + HouseDesign.LENGTH) >> 4)) {
+                    continue;
+                }
+                int y = surfaceY(level, x + HouseDesign.WIDTH / 2, z + HouseDesign.LENGTH / 2);
+                double score = siteScore(level, x, y, z) + Math.sqrt((double) dx * dx + (double) dz * dz) * 0.5;
+                if (score < bestScore) {
+                    bestScore = score;
+                    best = new int[] {x, y, z};
+                }
+            }
+        }
+        return best;
+    }
+
+    private static double siteScore(ClientLevel level, int x, int y, int z) {
+        double score = 0;
+        for (int dx = -1; dx <= HouseDesign.WIDTH; dx++) {
+            for (int dz = -1; dz <= HouseDesign.LENGTH; dz++) {
+                boolean inside = dx >= 0 && dx < HouseDesign.WIDTH && dz >= 0 && dz < HouseDesign.LENGTH;
+                int ground = surfaceY(level, x + dx, z + dz);
+                if (inside) {
+                    score += Math.abs(ground - y) * 3;
+                    var below = level.getBlockState(new BlockPos(x + dx, ground - 1, z + dz));
+                    if (!below.getFluidState().isEmpty()) {
+                        score += 6;
+                    }
+                }
+                for (int dy = -1; dy <= HouseDesign.HEIGHT; dy++) {
+                    var state = level.getBlockState(new BlockPos(x + dx, y + dy, z + dz));
+                    if (state.is(net.minecraft.tags.BlockTags.LEAVES)) {
+                        score += inside ? 1 : 0.4;
+                    } else if (state.is(net.minecraft.tags.BlockTags.LOGS)) {
+                        score += inside ? 3 : 1;
+                    }
+                }
+            }
+        }
+        return score;
+    }
+
     static BlockPos houseFloorProblem(ClientLevel level, int[] origin) {
         for (int[] cell : HouseDesign.floorCells()) {
             BlockPos pos = new BlockPos(origin[0] + cell[0], origin[1] + cell[1], origin[2] + cell[2]);

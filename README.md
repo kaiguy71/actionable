@@ -89,7 +89,7 @@ Each is skipped once the inventory satisfies it.
 The first goals are a checklist run by code that mirrors `progression.txt`: 8 logs of the type that grows in
 the current biome (see the wood table), wooden pickaxe and axe, stone pickaxe/axe/shovel/sword, 64 cobblestone,
 16 logs, then a 5x5 house (Baritone builds it from a generated schematic) wherever the wood was found, a solid
-dry floor, a crafting table and a door inside, a wooden sword, 3 white wool from sheep, and a bed. The house corner is saved per world in `config/actionable-homes.json`.
+dry floor (the schematic lays its own plank floor one level below the house; the floor step only patches what is left, such as the doorstep), a crafting table and a door inside, a wooden sword, 3 white wool from sheep, and a bed. The house corner is saved per world in `config/actionable-homes.json`.
 Once a house exists, until the player holds a stone pickaxe and stone sword, it stays within 6 chunks (96 blocks) horizontally and 30 blocks vertically of home. Combat has per-mob styles (`MobFighter`), used in autonomous mode when a weapon is held and health is above 6:
 skeletons (also strays and bogged) are rushed, sprinting until near, and killed with jump-crit hits; creepers get one
 crit, then the bot sprints away while the attack recharges (and whenever the fuse swells) and steps back in for the
@@ -98,6 +98,9 @@ next hit until it dies. Other hostiles keep the plain melee defense.
 Reflexive shelter building (`Shelter`, autonomous mode only): with 3+ melee mobs within 9 blocks the bot pillars
 up 4 blocks with cheap blocks (cobblestone, dirt, planks...); with 2+ skeletons in line of sight and 9+ blocks it walls
 itself in (4 sides, 2 high, roof). It opens a gap and resumes once the threat has been gone for ~4 s (or after 60 s).
+
+The house site is scanned before building: within 14 blocks of the player, the bot picks the corner with the fewest
+logs and leaves in and around the house box, the flattest ground and no water, preferring closer spots.
 
 On death the LLM session is kept: the model is told the cause, the death coordinates and a 600 second window to
 recover its items (with a warning that the mobs may still be there, and the home location), and chooses

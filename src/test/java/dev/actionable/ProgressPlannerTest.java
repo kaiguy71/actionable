@@ -146,9 +146,9 @@ class ProgressPlannerTest {
     @Test
     void housePlanMakesEnoughPlanksThenBuilds() {
         List<String> steps = ProgressPlanner.stepsForGoal("build house", Map.of(OAK, 20), false, OAK);
-        assertEquals(List.of("craft 72 minecraft:oak_planks", "build house"), steps);
+        assertEquals(List.of("craft 80 minecraft:oak_planks", "build house"), steps);
         assertTrue(ProgressPlanner.HOUSE_PLANKS >= HouseDesign.planksNeeded());
-        assertEquals(List.of("mine 18 minecraft:oak_log", "craft 72 minecraft:oak_planks", "build house"),
+        assertEquals(List.of("mine 20 minecraft:oak_log", "craft 80 minecraft:oak_planks", "build house"),
                 ProgressPlanner.stepsForGoal("build house", Map.of(), false, OAK));
     }
 

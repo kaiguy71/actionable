@@ -81,6 +81,12 @@ public final class ActionableClient implements ClientModInitializer {
     private final java.util.ArrayDeque<String> history = new java.util.ArrayDeque<>();
     private static final int AVOID_MEMORY = 4;
     private static final int SITE_SCAN_RADIUS = 24;
+    private static final int SURFACE_SCAN_RADIUS = 48;
+    private static final int SURFACE_DROP_LIMIT = 4;
+    private static final java.util.List<String> BARITONE_SETTINGS = java.util.List.of(
+            "blacklistClosestOnFailure false", "useSwordToMine false", "allowParkour true",
+            "allowParkourAscend true", "allowParkourPlace true", "allowVines true", "legitMine false",
+            "smoothLook true");
     private Crafter pendingCraft;
     private boolean retreating;
     private boolean stepActionTaken;
@@ -557,6 +563,15 @@ public final class ActionableClient implements ClientModInitializer {
         return client.player != null && HomeRange.geared(WorldProbe.inventory(client.player));
     }
 
+    /**
+     * The home range only applies once a house exists and the player is still ungeared. Before that the
+     * house goes wherever the wood is, so searching for trees (or travelling to a forest) is never blocked.
+     */
+    private boolean rangeExempt(Minecraft client) {
+        loadHome(client);
+        return home == null || geared(client);
+    }
+
     private boolean tableNearby(Minecraft client) {
         if (client.player == null || client.level == null) {
             return false;
@@ -590,7 +605,15 @@ public final class ActionableClient implements ClientModInitializer {
         ProgressPlanner.Facts facts = facts(client);
         return ProgressPlanner.briefing(inventory, tableAccess(client), WorldProbe.preferredLog(inventory, synopsis),
                 facts, HomeRange.describe(anchor(), HomeRange.geared(inventory), facts.houseBuilt()))
+                + "\n" + woodLine(synopsis)
                 + "\n" + NeedsPlanner.report(inventory, situation(client, facts));
+    }
+
+    private static String woodLine(String synopsis) {
+        java.util.regex.Matcher biome = java.util.regex.Pattern.compile("current_biome=([a-z0-9_:.]+)").matcher(synopsis);
+        java.util.regex.Matcher nearby = java.util.regex.Pattern
+                .compile("nearby_loaded_biomes_sampled=(\\[.*?\\])(?:;|$)").matcher(synopsis);
+        return "Wood: " + TreeBiomes.advice(biome.find() ? biome.group(1) : "", nearby.find() ? nearby.group(1) : "");
     }
 
     /**
@@ -1761,7 +1784,7 @@ public final class ActionableClient implements ClientModInitializer {
      */
     private String homeRangeCommand(Minecraft client, String command) {
         int[] anchor = anchor();
-        if (anchor == null || geared(client)) {
+        if (anchor == null || rangeExempt(client)) {
             return command;
         }
         String[] parts = command.split("\\s+");
@@ -2453,8 +2476,13 @@ public final class ActionableClient implements ClientModInitializer {
         if (anchor == null) {
             return;
         }
-        boolean geared = geared(client);
+        boolean geared = rangeExempt(client);
         if (returningHome) {
+            if (!baritoneCommandRunning || !currentBaritoneCommand.startsWith("goto")) {
+                // Something else (a mine that kept running) took over; send the walk home again.
+                executeBaritone(client, client.getConnection(),
+                        "goto " + anchor[0] + " " + anchor[1] + " " + anchor[2]);
+            }
             if (geared || !HomeRange.outside(anchor, false, player.getBlockX(), player.getBlockY(),
                     player.getBlockZ(), -8)) {
                 returningHome = false;
@@ -2584,6 +2612,11 @@ public final class ActionableClient implements ClientModInitializer {
      * blocks the player cannot harvest, and walks to an exposed, lit deposit instead of letting Baritone
      * pick the nearest one, which may be deep in a dark cave.
      */
+    /** Blocks that only grow on the surface, where Baritone's mine must never be left to dig for them. */
+    private static boolean isSurfaceBlock(String blockId) {
+        return blockId.endsWith("_log") || blockId.endsWith("_wood");
+    }
+
     private void startMine(Minecraft client, net.minecraft.client.multiplayer.ClientPacketListener connection,
             String command) {
         String[] parts = command.split("\\s+");
@@ -2595,6 +2628,16 @@ public final class ActionableClient implements ClientModInitializer {
             return;
         }
         String blockId = TechTree.blockToMine(requested);
+        if (blockId.endsWith("_log") && client.level != null && client.player != null) {
+            // Any wood works; Baritone counts only the exact log asked for, so use the type actually in reach
+            // (else the type already held) instead of a literal oak_log that may be far away.
+            String near = WorldProbe.nearestLogType(client.level, client.player.blockPosition(), SURFACE_SCAN_RADIUS);
+            String held = near != null ? near : WorldProbe.preferredLog(WorldProbe.inventory(client.player), "");
+            if (!held.equals(blockId)) {
+                lastResult = "Using " + held + " instead of " + blockId + ": any wood type works for this goal";
+                blockId = held;
+            }
+        }
         String mine = "mine " + parts[1] + " " + blockId;
         if (blockId.equals(TechTree.CRAFTING_TABLE) && client.level != null && client.player != null) {
             BlockPos table = WorldProbe.nearestCraftingTable(client.level, client.player.blockPosition());
@@ -2624,12 +2667,30 @@ public final class ActionableClient implements ClientModInitializer {
             return;
         }
         SafetyAssessment.Result safety = WorldProbe.safety(client);
+        boolean surfaceOnly = isSurfaceBlock(blockId);
         java.util.List<MiningPolicy.Site> sites = WorldProbe.exposedSites(level, player.blockPosition(), block,
-                SITE_SCAN_RADIUS);
+                surfaceOnly ? SURFACE_SCAN_RADIUS : SITE_SCAN_RADIUS);
         int[] anchor = anchor();
-        boolean geared = geared(client);
+        boolean geared = rangeExempt(client);
         sites.removeIf(site -> HomeRange.outside(anchor, geared, site.x(), site.y(), site.z(), 0));
-        if (sites.isEmpty() && anchor != null && !geared) {
+        if (sites.isEmpty() && surfaceOnly) {
+            // With no log in loaded chunks Baritone's mine digs down into caves to look for one; walk the
+            // surface to fresh ground instead and ask again from there.
+            int[] here = {player.getBlockX(), player.getBlockY(), player.getBlockZ()};
+            int[] target = HomeRange.searchTarget(here, wanderAttempts++, SURFACE_SCAN_RADIUS * 2);
+            if (!geared && anchor != null && HomeRange.outside(anchor, false, target[0], target[1], target[2], 0)) {
+                target = HomeRange.searchTarget(anchor, wanderAttempts, HomeRange.RADIUS);
+            }
+            executeBaritone(client, connection, HomeRange.surfaceGoto(target));
+            pendingMine = mine;
+            pendingMineSince = clientTick;
+            lastAction = mine;
+            lastResult = "No " + blockId + " in loaded chunks nearby; walking the surface to " + target[0] + ","
+                    + target[2] + " to look for trees (never digging down for them); mining starts on arrival."
+                    + " " + TreeBiomes.table().lines().findFirst().orElse("");
+            return;
+        }
+        if (sites.isEmpty() && anchor != null && !geared && surfaceOnly) {
             // Baritone's mine would roam unbounded to find more; look around near home instead.
             int[] target = HomeRange.searchTarget(anchor, wanderAttempts++, HomeRange.RADIUS);
             executeBaritone(client, connection, HomeRange.surfaceGoto(target));
@@ -2644,8 +2705,9 @@ public final class ActionableClient implements ClientModInitializer {
             java.util.Optional<MiningPolicy.Site> best = MiningPolicy.choose(sites, safety.caveReady(),
                     java.util.List.copyOf(avoidAreas));
             if (best.isEmpty()) {
-                lastResult = MiningPolicy.rejection(blockId, sites, safety.missingForCaves());
-                reportBlockResult(client);
+                // Baritone knows where the block is, buried or not; let it dig to it.
+                executeBaritone(client, connection, mine);
+                mineStart = new int[] {player.getBlockX(), player.getBlockY(), player.getBlockZ()};
                 return;
             }
             MiningPolicy.Site site = best.get();
@@ -2681,6 +2743,11 @@ public final class ActionableClient implements ClientModInitializer {
             boolean stalled = clientTick - lastBaritoneMovementAt > 100 || clientTick - pendingMineSince > 1200;
             if (arrived || stalled) {
                 String mine = pendingMine;
+                if (isSurfaceBlock(mine.split("\\s+")[2])) {
+                    // Re-check for trees from the new spot; this walks on if there still are none.
+                    startMine(client, connection, mine);
+                    return;
+                }
                 executeBaritone(client, connection, mine);
                 mineStart = new int[] {player.getBlockX(), player.getBlockY(), player.getBlockZ()};
                 remember(mine, lastResult);
@@ -2688,6 +2755,18 @@ public final class ActionableClient implements ClientModInitializer {
             return;
         }
         boolean mining = baritoneCommandRunning && currentBaritoneCommand.startsWith("mine ");
+        if (mining && mineStart != null && player.getBlockY() < mineStart[1] - SURFACE_DROP_LIMIT
+                && isSurfaceBlock(currentBaritoneCommand.split("\\s+")[2])) {
+            // Baritone went underground looking for trees: stop and search the surface instead.
+            String command = currentBaritoneCommand;
+            stopBaritone(client);
+            lastAction = command;
+            lastResult = "MINE_ABORTED_DESCENDING: Baritone was digging down for wood; stopped. Searching the"
+                    + " surface for trees instead.";
+            remember(lastAction, lastResult);
+            startMine(client, connection, command);
+            return;
+        }
         waterTicks = mining && player.isInWater() ? waterTicks + 10 : 0;
         if (waterTicks >= Recovery.WATER_STUCK_TICKS) {
             // Mining from water: give up on this spot, swim to land, and let the step re-send from there.
@@ -2821,6 +2900,9 @@ public final class ActionableClient implements ClientModInitializer {
             // and land-reachable blocks, and let it build from the whole inventory.
             connection.sendChat("#set walkOnWaterOnePenalty 20");
             connection.sendChat("#set allowInventory true");
+            for (String setting : BARITONE_SETTINGS) {
+                connection.sendChat("#set " + setting);
+            }
             baritoneConfigured = true;
         }
         if (baritoneCommandRunning && command.equals(currentBaritoneCommand)) {
@@ -2828,6 +2910,11 @@ public final class ActionableClient implements ClientModInitializer {
             lastResult = "Existing Baritone command left running; " + baritoneProgress(client);
             tell(client, "Keeping Baritone task running: " + command);
             return;
+        }
+        if (!command.equals("cancel") && (baritoneCommandRunning
+                || BaritoneProbe.query().map(BaritoneProbe.State::active).orElse(false))) {
+            // A running mine does not always yield to a new goto; cancel it explicitly first.
+            connection.sendChat("#cancel");
         }
         connection.sendChat("#" + command);
         lastAction = command;
@@ -2857,7 +2944,7 @@ public final class ActionableClient implements ClientModInitializer {
         int x = player.getBlockX();
         int z = player.getBlockZ();
         int[] anchor = anchor();
-        if (anchor != null && !geared(client)) {
+        if (anchor != null && !rangeExempt(client)) {
             int[] target = HomeRange.searchTarget(anchor, wanderAttempts++, HomeRange.RADIUS);
             tell(client, "Travelling near home instead of wandering off.");
             executeBaritone(client, connection, HomeRange.surfaceGoto(target));
@@ -2879,7 +2966,7 @@ public final class ActionableClient implements ClientModInitializer {
     private void stopBaritone(Minecraft client) {
         pendingMine = null;
         mineStart = null;
-        if (!baritoneCommandRunning) {
+        if (!baritoneCommandRunning && !BaritoneProbe.query().map(BaritoneProbe.State::active).orElse(false)) {
             return;
         }
         var connection = client.getConnection();
@@ -2908,6 +2995,12 @@ public final class ActionableClient implements ClientModInitializer {
                 currentBaritoneCommand = "";
                 lastResult = "Baritone finished or stopped by itself (idle): " + finished
                         + ". Check the inventory/surroundings to see if the goal was reached.";
+                if (finished.startsWith("build " + HouseDesign.SCHEMATIC_FILE) && home != null) {
+                    // Baritone's build only ends when the schematic is done; a block or two may stay with terrain.
+                    houseBuiltSeen = true;
+                    lastResult = "HOUSE_BUILD_DONE: Baritone finished the house schematic. The house is complete;"
+                            + " do not place extra planks around it.";
+                }
                 if (travelDirection != null && !travelDirection.isEmpty()) {
                     lastResult = "TRAVEL_LEG_DONE: walked " + TRAVEL_LEG + " blocks " + travelDirection
                             + ". Check the synopsis for what you were looking for. If it is still missing, call"

@@ -75,6 +75,36 @@ final class WorldProbe {
      * first. Light, sky and depth are measured at the open face; the stand cell is a dry spot within
      * reach, so the player never mines from water (it bobbed in a lake trying to reach a shoreline log).
      */
+    /** The log block id nearest to {@code origin} within the radius, whatever its wood type; null if none. */
+    static String nearestLogType(ClientLevel level, BlockPos origin, int radius) {
+        BlockPos.MutableBlockPos cursor = new BlockPos.MutableBlockPos();
+        double best = Double.MAX_VALUE;
+        String found = null;
+        for (int dx = -radius; dx <= radius; dx++) {
+            for (int dz = -radius; dz <= radius; dz++) {
+                if (!level.hasChunk((origin.getX() + dx) >> 4, (origin.getZ() + dz) >> 4)) {
+                    continue;
+                }
+                for (int dy = -radius / 2; dy <= radius / 2; dy++) {
+                    double distance = dx * dx + dy * dy + dz * dz;
+                    if (distance >= best) {
+                        continue;
+                    }
+                    cursor.set(origin.getX() + dx, origin.getY() + dy, origin.getZ() + dz);
+                    var state = level.getBlockState(cursor);
+                    if (state.is(net.minecraft.tags.BlockTags.LOGS)) {
+                        String id = BuiltInRegistries.BLOCK.getKey(state.getBlock()).toString();
+                        if (!id.contains("stripped_")) {
+                            best = distance;
+                            found = id;
+                        }
+                    }
+                }
+            }
+        }
+        return found;
+    }
+
     static List<MiningPolicy.Site> exposedSites(ClientLevel level, BlockPos origin, Block block, int radius) {
         List<BlockPos> candidates = new ArrayList<>();
         BlockPos.MutableBlockPos cursor = new BlockPos.MutableBlockPos();
@@ -433,6 +463,11 @@ final class WorldProbe {
         }
         java.util.regex.Matcher log = java.util.regex.Pattern.compile("(minecraft:[a-z_]+_(?:log|stem))")
                 .matcher(nearbyResources);
-        return log.find() ? log.group(1) : "minecraft:oak_log";
+        if (log.find()) {
+            return log.group(1);
+        }
+        java.util.regex.Matcher biome = java.util.regex.Pattern.compile("current_biome=([a-z0-9_:.]+)")
+                .matcher(nearbyResources);
+        return biome.find() ? TreeBiomes.primaryLog(biome.group(1)).orElse("minecraft:oak_log") : "minecraft:oak_log";
     }
 }

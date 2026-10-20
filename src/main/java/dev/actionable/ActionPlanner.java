@@ -197,7 +197,8 @@ final class ActionPlanner {
             "craft 12 minecraft:oak_planks", "place minecraft:crafting_table nearby", "build house",
             "hunt 3 minecraft:white_wool" (kill white sheep), "place minecraft:white_bed in house",
             "place minecraft:crafting_table in house", "place door in house", "go to house" (to craft at
-            the house table). The house crafting table is never picked up. Quantities are totals
+            the house table). "build house" runs a Baritone schematic that finishes the whole house by itself; never place planks
+            by hand to complete or extend it, and treat HOUSE_BUILD_DONE as final. The house crafting table is never picked up. Quantities are totals
             to hold when the step finishes. 3x3 recipes need a placed crafting table. Reuse the crafting
             table: if one is in inventory, place it; if one is placed elsewhere, "mine 1
             minecraft:crafting_table" picks it up. Never plan to craft a second table. End a plan that
@@ -236,15 +237,12 @@ final class ActionPlanner {
             hostile mobs, choose to reach light or the surface. Darkness is not a reason to
             stop: carry torches and keep working. Escape at health 6 or lower and avoid
             creepers. Fight only mobs marked melee_reachable=true.
-            Early game is a fixed checklist run by code: 20 logs; build the house; put a crafting table
-            inside the house (it stays there for good); craft and hang a door; craft a wooden sword; craft
-            a wooden pickaxe (gather more wood first if short); kill sheep for 3 white wool; craft the bed
-            and place it inside the house; sleep at night. Then: stone pickaxe, stone sword, food (24 hunger
-            points carried), a furnace in the house, and only then coal for torches. Coal waits until there is
-            a furnace and food, unless you hold raw ore that needs smelting; a coal goal before that is
-            rejected. Only after that come the pickaxe,
-            stone tools, food, torches and iron; never race to cobblestone, coal or iron before the house
-            and bed exist. Stay within 96 blocks horizontally and 30 vertically of home until you have a stone pickaxe and a stone sword.
+            Early game is a checklist run by code that mirrors the progression list: 8 logs of the type in the
+            Wood: line (or travel to a wooded biome if there are no trees), wooden pickaxe and axe, stone
+            pickaxe/axe/shovel/sword, 64 cobblestone, 16 logs, then the house (the house goes wherever the
+            wood was found), a table inside it, door, wooden sword, wool, bed, food, furnace, torches, iron.
+            Stay within 96 blocks horizontally and 30 vertically of home only once a house exists and until
+            you have a stone pickaxe and a stone sword; before the house there is no range limit.
             The briefing ends with a Situation line: what you have, what you still need and why, and the
             best job you can do right now. Use it. With a bed in the house you sleep at night. Without one,
             code works from home at night: it finishes the house, crafts tools, smelts in the house furnace,
@@ -252,7 +250,7 @@ final class ActionPlanner {
             After that, follow the game progression list in the briefing: pick one concrete goal from the
             earliest stage that is not finished (judge by inventory and goals already achieved). Commit to
             it: do not switch to a different stage or invent a new project halfway.
-            Lettered lines (14A, 14B...) are options of one stage: choose the one that suits the terrain and
+            Lettered lines (17A, 17B...) are options of one stage: choose the one that suits the terrain and
             finish it. The D (diamond) and N (nether) branches can be done in either order; both come before
             the End prep (E).
             next_milestone is normally the right goal; choose something else only when safety or the

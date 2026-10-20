@@ -54,7 +54,7 @@ final class ProgressPlanner {
     }
 
     /** HOLD milestones are inventory targets; the others are checked in the world. */
-    enum Kind { HOLD, HOUSE, FLOOR, TABLE, DOOR, BED, FOOD, FURNACE }
+    enum Kind { HOLD, STOCK, HOUSE, FLOOR, TABLE, DOOR, BED, FOOD, FURNACE }
 
     record Milestone(String item, int count, String why, Kind kind) {
         Milestone(String item, int count, String why) {
@@ -71,7 +71,7 @@ final class ProgressPlanner {
                 case BED -> PLACE_BED;
                 case FOOD -> GATHER_FOOD;
                 case FURNACE -> NeedsPlanner.PLACE_FURNACE;
-                case HOLD -> TechTree.recipeFor(item).isPresent() ? "craft " + count + " " + item
+                case HOLD, STOCK -> TechTree.recipeFor(item).isPresent() ? "craft " + count + " " + item
                         : TechTree.huntedFrom(item).isPresent() ? "hunt " + count + " " + item
                         : "mine " + count + " " + TechTree.blockToMine(item);
             };
@@ -87,9 +87,24 @@ final class ProgressPlanner {
     static final int FOUNDATION_MILESTONES = 10;
 
     static final List<Milestone> MILESTONES = List.of(
-            new Milestone("minecraft:oak_log", 20,
-                    "trees are the safest early resource: 20 logs make 80 planks for a small house, a crafting"
-                            + " table, tools and a bed"),
+            new Milestone("minecraft:oak_log", 8,
+                    "trees are the safest early resource: 8 logs make 32 planks for a crafting table and the first"
+                            + " tools; use the log type that grows in this biome (Wood: line), or travel to a biome"
+                            + " with trees"),
+            new Milestone("minecraft:wooden_pickaxe", 1,
+                    "stone, coal and every ore drop nothing without a pickaxe; this unlocks cobblestone"),
+            new Milestone("minecraft:wooden_axe", 1, "chops trees faster and is a second weapon"),
+            new Milestone("minecraft:stone_pickaxe", 1,
+                    "needed to mine iron ore, and mines stone faster; the stone tools also lift the home range"),
+            new Milestone("minecraft:stone_axe", 1, "chops wood faster than a wooden axe"),
+            new Milestone("minecraft:stone_shovel", 1, "digs dirt, sand and gravel faster"),
+            new Milestone("minecraft:stone_sword", 1,
+                    "a weapon makes nights and caves survivable"),
+            new Milestone("minecraft:cobblestone", 64,
+                    "64 stone for the house, furnace and tools; mined once, before building", Kind.STOCK),
+            new Milestone("minecraft:oak_log", 16,
+                    "16 logs of wood for the house, door, bed and table; gathered once, before building",
+                    Kind.STOCK),
             new Milestone("house", 1,
                     "a small shelter near the trees to sleep in and hide from mobs at night; stay close to it"
                             + " until you have stone tools", Kind.HOUSE),
@@ -103,17 +118,10 @@ final class ProgressPlanner {
                     "a door closes the doorway so mobs cannot walk in at night", Kind.DOOR),
             new Milestone("minecraft:wooden_sword", 1,
                     "a sword before hunting: sheep die faster and you can defend yourself"),
-            new Milestone("minecraft:wooden_pickaxe", 1,
-                    "stone, coal and every ore drop nothing without a pickaxe; this unlocks cobblestone and coal"),
-            new Milestone("minecraft:wooden_axe", 1, "chops trees faster and is a second weapon"),
             new Milestone(TechTree.WHITE_WOOL, 3,
                     "kill white sheep: 3 white wool + 3 planks make a bed, and sheep drop mutton for food"),
             new Milestone(TechTree.WHITE_BED, 1,
                     "a bed inside the house lets you sleep through the night and sets your respawn point", Kind.BED),
-            new Milestone("minecraft:stone_pickaxe", 1,
-                    "needed to mine iron ore, and mines stone faster"),
-            new Milestone("minecraft:stone_sword", 1,
-                    "a weapon makes nights and caves survivable"),
             new Milestone("food", FoodPlan.STOCK_WANTED,
                     "health only regenerates when fed; carry food before heading out to mine", Kind.FOOD),
             new Milestone("furnace", 1,
@@ -154,8 +162,17 @@ final class ProgressPlanner {
             default -> {
             }
         }
+        if (milestone.kind() == Kind.STOCK) {
+            // One-time stockpiles for building: done when held, or once the house stands and used them up.
+            int held = TechTree.matches(TechTree.LOGS, milestone.item())
+                    ? TechTree.count(inventory, TechTree.LOGS) : TechTree.held(inventory, milestone.item());
+            return facts.houseBuilt() || held >= milestone.count();
+        }
         if (TechTree.matches(TechTree.LOGS, milestone.item())) {
-            // Logs become planks, so count wood in plank units; a built house means wood is done.
+            // Logs become planks, so count wood in plank units; a built house or wooden tools mean wood is done.
+            if (TechTree.pickaxeTier(inventory).compareTo(TechTree.Tier.WOOD) >= 0) {
+                return true;
+            }
             int planks = TechTree.count(inventory, TechTree.LOGS) * 4 + TechTree.count(inventory, TechTree.PLANKS);
             return facts.houseBuilt() || planks >= milestone.count() * 4;
         }

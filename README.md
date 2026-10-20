@@ -1,4 +1,4 @@
-# Actionable version 0.1.4
+# Actionable version 0.1.4b
 Readme Date: 10/20/2026
 
 A client-side Fabric mod that plays Minecraft autonomously: an Ollama or Claude model chooses its own goals,
@@ -86,10 +86,17 @@ Each is skipped once the inventory satisfies it.
 
 ### Early game and nights
 
-The first goals are a fixed checklist run by code: 20 logs, a 5x5 house (Baritone builds it from a
-generated schematic), a solid dry floor, a crafting table and a door inside, a wooden sword and pickaxe,
-3 white wool from sheep, and a bed. The house corner is saved per world in `config/actionable-homes.json`.
-Until it holds a stone pickaxe and stone sword, the player stays within 6 chunks (96 blocks) horizontally and 30 blocks vertically of home.
+The first goals are a checklist run by code that mirrors `progression.txt`: 8 logs of the type that grows in
+the current biome (see the wood table), wooden pickaxe and axe, stone pickaxe/axe/shovel/sword, 64 cobblestone,
+16 logs, then a 5x5 house (Baritone builds it from a generated schematic) wherever the wood was found, a solid
+dry floor, a crafting table and a door inside, a wooden sword, 3 white wool from sheep, and a bed. The house corner is saved per world in `config/actionable-homes.json`.
+Once a house exists, until the player holds a stone pickaxe and stone sword, it stays within 6 chunks (96 blocks) horizontally and 30 blocks vertically of home. Mining logs never lets Baritone dig down for trees: with no log in loaded chunks the bot walks the surface to
+look for trees, and a mine that descends more than 4 blocks is stopped. On first use each launch the mod also sets
+Baritone options: `blacklistClosestOnFailure false`, `useSwordToMine false`, all three parkour options,
+`allowVines true`, `legitMine false` and `smoothLook true`.
+
+Before the house exists there is no range limit, so the bot can travel to a forest for wood. New
+Baritone commands always `#cancel` a running one first, so a return-home `goto` is not swallowed by a `mine`.
 
 At night, a player with a bed sleeps. Without one it works from home, picking the most useful job it can
 do without leaving: hang the door, place the table, craft tools, build and use a furnace, or dig the
@@ -117,6 +124,7 @@ Several decisions are made in code rather than by the model, because `gemma3:4b`
   - Without cave gear, only deposits at most 30 blocks below the surface are accepted; if every loaded
     deposit is deeper, the command is refused with `MINE_FAILED_UNSAFE_SITE`. Light level is not checked:
     Baritone walks to far deposits by itself, and darkness is handled by automatic torches.
+- **Wood by biome.** The briefing has a `Wood:` line built from `TreeBiomes`: which logs grow in the current biome, or, in a treeless biome (desert, ocean, badlands, peaks...), the nearest loaded biome with trees and its vector, else a hint to `travel`. The `lookup` tool returns the full biome/log table for queries containing wood, tree, log or biome.
 - **Automatic torches.** When the player holds torches and the light at their feet is 4 or lower, a
   torch is placed on a reachable nearby spot that is at least as dark as the player's cell (so torches
   spread out), without involving the model and while Baritone keeps walking.

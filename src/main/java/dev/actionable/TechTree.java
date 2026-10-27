@@ -321,6 +321,10 @@ final class TechTree {
         return path.endsWith("_sword") || path.endsWith("_axe") || path.equals("mace") || path.equals("trident");
     }
 
+    static boolean isBed(String item) {
+        return item.startsWith("minecraft:") && item.endsWith("_bed");
+    }
+
     static boolean isDoor(String item) {
         return item.endsWith("_door") && !item.equals("minecraft:iron_door") && !item.contains("copper");
     }

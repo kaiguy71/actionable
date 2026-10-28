@@ -124,9 +124,13 @@ final class MobFighter {
     /** Jump when ready, then hit on the way down: a falling, non-sprinting strike is a critical hit. */
     private String crit(Minecraft client, Entity target, String name) {
         var player = client.player;
-        if (player.getAttackStrengthScale(0) < READY) {
+        if (!ReachRule.cooldownReady(player.getAttackStrengthScale(0))) {
             client.options.keyJump.setDown(false);
             return "FIGHT_WAIT_COOLDOWN";
+        }
+        if (ReachRule.distanceToHitbox(player, target) > ReachRule.MAX_REACH) {
+            client.options.keyJump.setDown(false);
+            return "FIGHT_OUT_OF_REACH";
         }
         if (player.onGround()) {
             client.options.keyJump.setDown(true);

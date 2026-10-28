@@ -96,7 +96,10 @@ final class MeleeCombat {
             client.player.getInventory().setSelectedSlot(bestSlot);
             return "ATTACK_WAIT_WEAPON_SELECTED";
         }
-        if (client.player.isUsingItem() || client.player.getAttackStrengthScale(0) < 0.9F) {
+        if (ReachRule.distanceToHitbox(client.player, target) > ReachRule.MAX_REACH) {
+            return "ATTACK_FAILED_OUT_OF_REACH_OR_OBSTRUCTED";
+        }
+        if (client.player.isUsingItem() || !ReachRule.cooldownReady(client.player.getAttackStrengthScale(0))) {
             return "ATTACK_WAIT_COOLDOWN";
         }
         client.player.lookAt(EntityAnchorArgument.Anchor.EYES, target.getEyePosition());

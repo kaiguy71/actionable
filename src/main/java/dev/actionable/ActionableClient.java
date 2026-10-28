@@ -35,6 +35,7 @@ public final class ActionableClient implements ClientModInitializer {
     /** The panel is drawn at this fraction of normal GUI size so the game stays visible behind it. */
     private static final float DEBUG_PANEL_SCALE = 0.6f;
     private KeyMapping toggleKey;
+    private boolean agentHudEnabled;
     private boolean enabled = true;
     private boolean debugEnabled;
     private boolean debugDetailed;
@@ -178,6 +179,25 @@ public final class ActionableClient implements ClientModInitializer {
                         KeyMapping.Category.MISC
                 )
         );
+        GemmaConfig.load();
+        ClientCommandRegistrationCallback.EVENT.register((dispatcher, registryAccess) ->
+                dispatcher.register(ClientCommands.literal("llmagent")
+                        .then(ClientCommands.literal("config")
+                                .then(ClientCommands.literal("endpoint")
+                                        .executes(context -> {
+                                            tell(Minecraft.getInstance(), "Ollama endpoint: " + GemmaConfig.endpoint());
+                                            return 1;
+                                        })
+                                        .then(ClientCommands.argument("url", StringArgumentType.greedyString())
+                                                .executes(context -> {
+                                                    Minecraft client = Minecraft.getInstance();
+                                                    if (GemmaConfig.setEndpoint(context.getArgument("url", String.class))) {
+                                                        tell(client, "Ollama endpoint set to " + GemmaConfig.endpoint());
+                                                        return 1;
+                                                    }
+                                                    tell(client, "Invalid endpoint. Use http://host:port");
+                                                    return 0;
+                                                }))))));
         ClientCommandRegistrationCallback.EVENT.register((dispatcher, registryAccess) ->
                 dispatcher.register(ClientCommands.literal("action")
                         .then(ClientCommands.argument("prompt", StringArgumentType.greedyString())
@@ -197,6 +217,16 @@ public final class ActionableClient implements ClientModInitializer {
                         .then(ClientCommands.literal("capture")
                                 .executes(context -> {
                                     captureContext(Minecraft.getInstance());
+                                    return 1;
+                                }))
+                        .then(ClientCommands.literal("combat")
+                                .executes(context -> {
+                                    agentHudEnabled = !agentHudEnabled;
+                                    debugEnabled = agentHudEnabled;
+                                    tacticalAgent.setTracking(agentHudEnabled);
+                                    tell(Minecraft.getInstance(), "Combat debug "
+                                            + (agentHudEnabled ? "on: debug sidebar, tactic overlay and tracking in "
+                                            + "logs/gemma_agent.log." : "off."));
                                     return 1;
                                 }))
                         .then(ClientCommands.literal("full")
@@ -233,6 +263,11 @@ public final class ActionableClient implements ClientModInitializer {
         HudElementRegistry.addLast(
                 Identifier.fromNamespaceAndPath("actionable", "debug_sidebar"),
                 (graphics, deltaTracker) -> renderDebugSidebar(Minecraft.getInstance(), graphics)
+        );
+
+        HudElementRegistry.addLast(
+                Identifier.fromNamespaceAndPath("actionable", "agent_debug_hud"),
+                (graphics, deltaTracker) -> renderAgentHud(Minecraft.getInstance(), graphics)
         );
 
         ClientReceiveMessageEvents.GAME.register((message, overlay) -> {
@@ -695,6 +730,7 @@ public final class ActionableClient implements ClientModInitializer {
             return null;
         }
         if (!hurt && (MeleeCombat.reachable(client, nearest)
+                || TacticBook.isTactical(BuiltInRegistries.ENTITY_TYPE.getKey(nearest.getType()).getPath())
                 || (MobFighter.engageable(client, nearest) && hasWeapon(client)))) {
             return null;
         }
@@ -704,6 +740,7 @@ public final class ActionableClient implements ClientModInitializer {
 
     /** Immediate defense does not wait for a model round trip or abandon the interrupted task. */
     private final MobFighter mobFighter = new MobFighter();
+    private final TacticalAgent tacticalAgent = new TacticalAgent();
     private final Shelter shelter = new Shelter();
 
     private boolean tickShelter(Minecraft client) {
@@ -759,6 +796,38 @@ public final class ActionableClient implements ClientModInitializer {
                 && client.player != null && client.player.isAlive() && client.player.getHealth() > DANGER_HEALTH
                 && client.mouseHandler.isMouseGrabbed() && client.isWindowActive()
                 && dangerEscape(client) == null;
+        if (ready && tacticalAgent.wants(client, clientTick)) {
+            if (!defending) {
+                defending = true;
+                ActionableLog.LOGGER.info("[Actionable] tactics_started task={}", ActionableLog.text(activeTask));
+                generation++;
+                planning = false;
+                judging = false;
+                choosingGoal = false;
+                pendingJumpPlace = null;
+                cancelCraft(client);
+                cancelBreak(client);
+                mobFighter.release(client);
+            }
+            lastAction = "tactics";
+            lastResult = tacticalAgent.tick(client, clientTick, new TacticalAgent.Baritone() {
+                @Override
+                public void run(String command) {
+                    var connection = client.getConnection();
+                    if (connection != null) {
+                        executeBaritone(client, connection, command);
+                    }
+                }
+
+                @Override
+                public void cancel() {
+                    stopBaritone(client);
+                }
+            });
+            currentGoal = "Gemma tactics";
+            return true;
+        }
+        tacticalAgent.release(client);
         // Skeletons and creepers get their own fighting style; everything else is plain close-range melee.
         net.minecraft.world.entity.Entity special = ready && hasWeapon(client) ? MobFighter.nearest(client) : null;
         net.minecraft.world.entity.Entity target = special != null ? special
@@ -3627,6 +3696,21 @@ public final class ActionableClient implements ClientModInitializer {
                     index == 0 ? 0xFFFFD34E : 0xFFFFFFFF);
         }
         graphics.pose().popMatrix();
+    }
+
+    /** Opaque dark backing keeps white text well above a 4.5:1 contrast ratio in daylight and in caves. */
+    private void renderAgentHud(Minecraft client, net.minecraft.client.gui.GuiGraphicsExtractor graphics) {
+        if (!agentHudEnabled || client.player == null || client.level == null) {
+            return;
+        }
+        int lineHeight = client.font.lineHeight + 2;
+        int y = 4;
+        for (String line : tacticalAgent.hudLines()) {
+            int width = client.font.width(line);
+            graphics.fill(2, y - 1, 8 + width, y + lineHeight - 1, 0xE0000000);
+            graphics.text(client.font, line, 5, y, y == 4 ? 0xFFFFD34E : 0xFFFFFFFF);
+            y += lineHeight;
+        }
     }
 
     private static String position(Minecraft client) {

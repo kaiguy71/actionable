@@ -142,7 +142,7 @@ final class ActionPlanner {
               world spawn. Your session continues; the death note gives the cause, the death coordinates,
               and the seconds left before your dropped items despawn (600). The mobs that killed you may
               still be there, so at night or without a weapon and light source prepare first (or accept
-              the loss); your home location stays in the briefing. Go back with goto and pick the items up.
+              the loss); your home location stays in the briefing. Go back with goto and pick your items up.
             - {"type":"white_flag","reason":"short"} gives up on this attempt when you truly cannot make
               progress (repeated failures after a screenshot and a fresh look). The session is thrown
               away and the original task restarts from scratch with a fresh mind.

@@ -1,5 +1,5 @@
-# Actionable Version 0.1.5
-Readme Date: 10/27/2026
+# Actionable version 0.2
+Readme Date: 10/20/2026
 
 Actionable is a client-side Fabric mod that plays Minecraft autonomously. A local Ollama model or
 Claude Code chooses goals and carries them out through Baritone.
@@ -49,6 +49,8 @@ current command; the active task resumes when Actionable is enabled again.
   survival decisions, and autonomous behavior
 - [Actions and safety](docs/actions-and-safety.md) — supported model actions, Baritone command
   validation, crafting, menus, placement, and combat
+- [Gemma tactical agent](docs/gemma-tactical-agent.md) — tactical combat behavior, configuration,
+  and diagnostics
 - [Configuration](docs/configuration.md) — Ollama and Claude Code providers and JVM properties
 - [Debugging and troubleshooting](docs/debugging.md) — logs, debug panel, states, error codes, and
   common Ollama issues
@@ -56,6 +58,4 @@ current command; the active task resumes when Actionable is enabled again.
 - [Limitations](docs/limitations.md) — current feature constraints
 
 ## Contributors
-
-Kai Battistoni, Chayse Collins, Abram Eastham, Ethan Claybourn, Joey Ruffing, with help from ChatGPT
-and Claude Code.
+Kai Battistoni, Chayse Collins, Abram Eastham, Ethan Claybourn, Joey Ruffing, with help from ChatGPT and Claude Code

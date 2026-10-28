@@ -1,4 +1,4 @@
-# Actionable version 0.1.5
+# Actionable version 0.2TEST
 Readme Date: 10/20/2026
 
 A client-side Fabric mod that plays Minecraft autonomously: an Ollama or Claude model chooses its own goals,
@@ -386,3 +386,14 @@ such as `gemma3:4b` is a practical starting point on consumer hardware.
 
 ## Contributors
 Kai Battistoni, Chayse Collins, Abram Eastham, Ethan Claybourn, Joey Ruffing, with help from ChatGPT and Claude Code
+
+## Gemma tactical agent
+
+Against Spiders, Endermen, Shulkers, Wardens, Skeletons, Witches, Piglins, Hoglins, Blazes, Ghasts and raid mobs,
+the mod pushes a state snapshot to the local Ollama server asynchronously (100 ms budget) and turns the returned
+tactic into Baritone commands. On timeout or malformed JSON it holds position with a raised shield.
+
+- `/llmagent config endpoint <url>` sets the Ollama URL (e.g. `http://localhost:11434`); it is saved in `config/`.
+- `/actiondebug combat` toggles the debug sidebar, the tactic overlay (tactic, target, Baritone path, Ollama latency) and runtime tracking: tactic changes and a p95 latency summary (PASS/FAIL vs 100 ms) are written to `logs/gemma_agent.log`.
+- Invalid payloads (with 1-based line numbers), timeouts and connection drops are logged to `logs/gemma_agent.log`.
+- Melee attacks are gated by a 4.5-block reach limit and the weapon's attack cooldown meter.

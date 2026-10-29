@@ -496,6 +496,11 @@ final class WorldProbe {
     }
 
     static BlockPos houseFloorProblem(ClientLevel level, int[] origin) {
+        return houseFloorProblem(level, origin, pos -> false);
+    }
+
+    /** As above, ignoring cells {@code skip} accepts (furniture already displaced once and put back). */
+    static BlockPos houseFloorProblem(ClientLevel level, int[] origin, java.util.function.Predicate<BlockPos> skip) {
         for (int[] cell : HouseDesign.floorCells()) {
             BlockPos pos = new BlockPos(origin[0] + cell[0], origin[1] + cell[1], origin[2] + cell[2]);
             var state = level.getBlockState(pos);
@@ -512,14 +517,14 @@ final class WorldProbe {
         for (int y = 0; y <= 1; y++) {
             BlockPos entry = new BlockPos(origin[0] + HouseDesign.DOOR_STAND[0], origin[1] + y,
                     origin[2] + HouseDesign.DOOR_STAND[2]);
-            if (!level.getBlockState(entry).getCollisionShape(level, entry).isEmpty()) return entry;
+            if (!level.getBlockState(entry).getCollisionShape(level, entry).isEmpty() && !skip.test(entry)) return entry;
         }
         for (int y = 0; y < HouseDesign.HEIGHT - 1; y++) {
             for (int z = 1; z < HouseDesign.LENGTH - 1; z++) {
                 for (int x = 1; x < HouseDesign.WIDTH - 1; x++) {
                     BlockPos pos = new BlockPos(origin[0] + x, origin[1] + y, origin[2] + z);
                     var state = level.getBlockState(pos);
-                    if (!state.getCollisionShape(level, pos).isEmpty() && !houseFixture(state, y)) return pos;
+                    if (!state.getCollisionShape(level, pos).isEmpty() && !houseFixture(state, y) && !skip.test(pos)) return pos;
                 }
             }
         }
@@ -619,7 +624,21 @@ final class WorldProbe {
     }
 
     private static boolean houseFixture(net.minecraft.world.level.block.state.BlockState state, int relativeY) {
-        return relativeY == 0 && (state.hasBlockEntity() || state.is(net.minecraft.world.level.block.Blocks.CRAFTING_TABLE));
+        // Furniture named explicitly: a bed may not report a block entity, and it was broken as "terrain".
+        return (relativeY == 0 && (state.hasBlockEntity() || furniture(state))) || isBedOrDoor(state);
+    }
+
+    /** Blocks the player owns and wants back: never terrain to be cleared without picking them up. */
+    static boolean furniture(net.minecraft.world.level.block.state.BlockState state) {
+        return isBedOrDoor(state) || state.is(net.minecraft.world.level.block.Blocks.CRAFTING_TABLE)
+                || state.is(net.minecraft.world.level.block.Blocks.FURNACE)
+                || state.is(net.minecraft.world.level.block.Blocks.CHEST)
+                || state.is(net.minecraft.world.level.block.Blocks.BARREL);
+    }
+
+    private static boolean isBedOrDoor(net.minecraft.world.level.block.state.BlockState state) {
+        return state.getBlock() instanceof net.minecraft.world.level.block.BedBlock
+                || state.getBlock() instanceof net.minecraft.world.level.block.DoorBlock;
     }
 
     static String describeHouse(ClientLevel level) {

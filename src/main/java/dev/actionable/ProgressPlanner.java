@@ -196,7 +196,8 @@ final class ProgressPlanner {
                     + inventory.getOrDefault("minecraft:lava_bucket", 0) >= milestone.count();
         }
         if (milestone.item().equals(TechTree.WHITE_WOOL)) {
-            return facts.bedPlaced() || inventory.getOrDefault(TechTree.WHITE_BED, 0) > 0
+            // A bed already in hand (picked back up after being moved) means no more wool is needed.
+            return facts.bedPlaced() || inventory.keySet().stream().anyMatch(TechTree::isBed)
                     || TechTree.held(inventory, milestone.item()) >= milestone.count();
         }
         TechTree.Tier pickaxe = TechTree.tierOf(milestone.item());
@@ -626,7 +627,7 @@ final class ProgressPlanner {
             return List.copyOf(steps);
         }
         if (goal.strip().equalsIgnoreCase(PLACE_BED)) {
-            List<String> steps = new ArrayList<>(inventory.getOrDefault(TechTree.WHITE_BED, 0) > 0 ? List.of()
+            List<String> steps = new ArrayList<>(inventory.keySet().stream().anyMatch(TechTree::isBed) ? List.of()
                     : stepsFor(TechTree.WHITE_BED, 1, inventory, table, log));
             steps.add(PLACE_BED);
             return List.copyOf(steps);

@@ -116,6 +116,18 @@ public final class ActionableClient implements ClientModInitializer {
     private StairMiner pendingStairs;
     private DeepMiner pendingDeep;
     private int waterSearchAttempts;
+    /** Where furniture was broken out of the way; the drop is walked over so it is picked up. */
+    private BlockPos furnitureDrop;
+    /**
+     * Item to pick up after a code-driven block break for a mine step (flint from gravel). Drops were
+     * left on the ground, so "mine 1 flint" broke gravel forever without ever holding flint.
+     */
+    private String collectItem;
+    private long collectStartAt;
+    private long collectUntil;
+    private BlockPos collectGoto;
+    /** Cells whose furniture was displaced once; never treated as an obstruction again. */
+    private final java.util.Set<BlockPos> displacedCells = new java.util.HashSet<>();
     /** True while the active task is a job the night routine chose (no bed, so work at home). */
     private boolean nightJob;
     /** Morning came while in the house mine; the task ends once the player has climbed out. */
@@ -343,6 +355,7 @@ public final class ActionableClient implements ClientModInitializer {
             tickMining(client);
             tickHunt(client);
             tickBreak(client);
+            tickCollect(client);
             tickSmelt(client);
             tickStairs(client);
             tickDeepMine(client);
@@ -374,7 +387,8 @@ public final class ActionableClient implements ClientModInitializer {
             // Night, return-home and hunting are run by code; the model is not consulted while they run.
             if (enabled && activeTask != null && !requests.planning && !requests.decomposing && !requests.judging && (!nightRoutine || nightJob)
                     && pendingJumpPlace == null && pendingCraft == null && pendingHunt == null
-                    && pendingBreak == null && pendingSmelt == null && pendingStairs == null && pendingDeep == null
+                    && pendingBreak == null && collectItem == null && pendingSmelt == null && pendingStairs == null
+                    && pendingDeep == null
                     && eatPhase == 0 && ticksUntilPlan-- <= 0) {
                 requestNextPlan(client);
             }
@@ -1931,7 +1945,10 @@ public final class ActionableClient implements ClientModInitializer {
                 return false;
             }
         } else if (step.equalsIgnoreCase(ProgressPlanner.PLACE_BED)) {
-            placeInHouse(client, connection, step, TechTree.WHITE_BED, HouseDesign.BED_STAND, HouseDesign.BED_FOOT);
+            // Any bed in the inventory goes back in, including one picked up after being moved.
+            String bed = WorldProbe.inventory(player).keySet().stream().filter(TechTree::isBed).findFirst()
+                    .orElse(TechTree.WHITE_BED);
+            placeInHouse(client, connection, step, bed, HouseDesign.BED_STAND, HouseDesign.BED_FOOT);
         } else if (step.equalsIgnoreCase(ProgressPlanner.PLACE_TABLE_IN_HOUSE)) {
             placeInHouse(client, connection, step, TechTree.CRAFTING_TABLE, HouseDesign.DOOR_STAND, HouseDesign.TABLE_CELL);
         } else if (step.equalsIgnoreCase(NeedsPlanner.PLACE_FURNACE)) {
@@ -2016,7 +2033,7 @@ public final class ActionableClient implements ClientModInitializer {
     private boolean fixHouseFloor(Minecraft client, net.minecraft.client.multiplayer.ClientPacketListener connection) {
         var player = java.util.Objects.requireNonNull(client.player);
         var level = java.util.Objects.requireNonNull(client.level);
-        BlockPos cell = WorldProbe.houseFloorProblem(level, home);
+        BlockPos cell = WorldProbe.houseFloorProblem(level, home, displacedCells::contains);
         if (cell == null) {
             return false;
         }
@@ -2130,6 +2147,14 @@ public final class ActionableClient implements ClientModInitializer {
 
     private boolean breakForDoor(Minecraft client, BlockPos pos, String why) {
         stopBaritone(client);
+        var state = java.util.Objects.requireNonNull(client.level).getBlockState(pos);
+        if (WorldProbe.furniture(state)) {
+            // Breaking furniture out of the way is fine, but it is picked back up and put back afterwards.
+            furnitureDrop = pos.immutable();
+            displacedCells.add(pos.immutable());
+            ActionableLog.LOGGER.info("[Actionable] furniture_displaced block={} at={},{},{}",
+                    BuiltInRegistries.BLOCK.getKey(state.getBlock()), pos.getX(), pos.getY(), pos.getZ());
+        }
         BlockBreaker.Start start = BlockBreaker.start(client, pos.getX(), pos.getY(), pos.getZ(), clientTick);
         if (start.breaker() == null) {
             lastResult = start.result();
@@ -2142,6 +2167,49 @@ public final class ActionableClient implements ClientModInitializer {
         ActionableLog.LOGGER.info("[Actionable] door_fix {}", ActionableLog.text(lastResult));
         tell(client, lastResult);
         return true;
+    }
+
+    private void startCollect(String item) {
+        collectItem = item;
+        collectStartAt = clientTick + 4;
+        collectUntil = clientTick + 100;
+        collectGoto = null;
+    }
+
+    /** Walks onto dropped items of the step's kind so they are picked up, then lets planning continue. */
+    private void tickCollect(Minecraft client) {
+        if (collectItem == null || clientTick < collectStartAt) {
+            return;
+        }
+        var player = client.player;
+        var connection = client.getConnection();
+        if (!enabled || player == null || client.level == null || connection == null || clientTick > collectUntil) {
+            collectItem = null;
+            ticksUntilPlan = 1;
+            return;
+        }
+        net.minecraft.world.entity.item.ItemEntity nearest = null;
+        double best = 10;
+        for (net.minecraft.world.entity.Entity entity : client.level.entitiesForRendering()) {
+            if (entity instanceof net.minecraft.world.entity.item.ItemEntity drop && drop.isAlive()
+                    && itemId(drop.getItem()).equals(collectItem) && drop.distanceTo(player) < best) {
+                nearest = drop;
+                best = drop.distanceTo(player);
+            }
+        }
+        if (nearest == null) {
+            // Nothing of that kind dropped (gravel gives flint only sometimes): carry on.
+            collectItem = null;
+            ticksUntilPlan = 1;
+            return;
+        }
+        BlockPos at = nearest.blockPosition();
+        if (!at.equals(collectGoto)) {
+            collectGoto = at;
+            executeBaritone(client, connection, "goto " + at.getX() + " " + at.getY() + " " + at.getZ());
+            ActionableLog.LOGGER.info("[Actionable] collect item={} at={},{},{}", ActionableLog.text(collectItem),
+                    at.getX(), at.getY(), at.getZ());
+        }
     }
 
     /** Problems left before the house door is right: stray doors and blocks in the doorway. */
@@ -2507,6 +2575,17 @@ public final class ActionableClient implements ClientModInitializer {
             }
         });
         pendingBreak = null;
+        if (!taskSteps.isEmpty() && result.startsWith("BROKE")) {
+            ProgressPlanner.parse(taskSteps.get(currentStep)).filter(step -> step.verb().equals("mine"))
+                    .ifPresent(step -> startCollect(TechTree.dropOf(TechTree.blockToMine(step.item()))));
+        }
+        if (furnitureDrop != null) {
+            // Step onto the spot so the dropped bed, table or furnace goes back into the inventory.
+            BlockPos drop = furnitureDrop;
+            furnitureDrop = null;
+            executeBaritone(client, connection, "goto " + drop.getX() + " " + drop.getY() + " " + drop.getZ());
+            ActionableLog.LOGGER.info("[Actionable] furniture_pickup at={},{},{}", drop.getX(), drop.getY(), drop.getZ());
+        }
         if (unstickResume != null) {
             // A snag was cleared mid-walk: carry on with the same command, without a planning round.
             String resume = unstickResume;
@@ -3848,6 +3927,8 @@ public final class ActionableClient implements ClientModInitializer {
             for (String setting : BARITONE_SETTINGS) {
                 connection.sendChat("#set " + setting);
             }
+            // Baritone echoed every command into chat; with goto/cancel per block that was a flood.
+            connection.sendChat("#set echoCommands false");
             baritoneConfigured = true;
         }
         if (baritoneCommandRunning && command.equals(currentBaritoneCommand)) {

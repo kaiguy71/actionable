@@ -61,7 +61,7 @@ final class ProgressPlanner {
     }
 
     /** HOLD milestones are inventory targets; the others are checked in the world. */
-    enum Kind { HOLD, HOUSE, FLOOR, TABLE, DOOR, BED, FOOD, FURNACE, NETHER }
+    enum Kind { HOLD, STOCK, HOUSE, FLOOR, TABLE, DOOR, BED, FOOD, FURNACE, NETHER }
 
     record Milestone(String item, int count, String why, Kind kind) {
         Milestone(String item, int count, String why) {
@@ -79,7 +79,7 @@ final class ProgressPlanner {
                 case FOOD -> GATHER_FOOD;
                 case FURNACE -> NeedsPlanner.PLACE_FURNACE;
                 case NETHER -> NetherProgress.ENTER;
-                case HOLD -> item.equals("minecraft:water_bucket") ? "fill water bucket"
+                case HOLD, STOCK -> item.equals("minecraft:water_bucket") ? "fill water bucket"
                         : TechTree.recipeFor(item).isPresent() ? "craft " + count + " " + item
                         : TechTree.huntedFrom(item).isPresent() ? "hunt " + count + " " + item
                         : "mine " + count + " " + TechTree.blockToMine(item);
@@ -96,9 +96,24 @@ final class ProgressPlanner {
     static final int FOUNDATION_MILESTONES = 10;
 
     static final List<Milestone> MILESTONES = List.of(
-            new Milestone("minecraft:oak_log", 20,
-                    "trees are the safest early resource: 20 logs make 80 planks for a small house, a crafting"
-                            + " table, tools and a bed"),
+            new Milestone("minecraft:oak_log", 8,
+                    "trees are the safest early resource: 8 logs make 32 planks for a crafting table and the first"
+                            + " tools; use the log type that grows in this biome (Wood: line), or travel to a biome"
+                            + " with trees"),
+            new Milestone("minecraft:wooden_pickaxe", 1,
+                    "stone, coal and every ore drop nothing without a pickaxe; this unlocks cobblestone"),
+            new Milestone("minecraft:wooden_axe", 1, "chops trees faster and is a second weapon"),
+            new Milestone("minecraft:stone_pickaxe", 1,
+                    "needed to mine iron ore, and mines stone faster; the stone tools also lift the home range"),
+            new Milestone("minecraft:stone_axe", 1, "chops wood faster than a wooden axe"),
+            new Milestone("minecraft:stone_shovel", 1, "digs dirt, sand and gravel faster"),
+            new Milestone("minecraft:stone_sword", 1,
+                    "a weapon makes nights and caves survivable"),
+            new Milestone("minecraft:cobblestone", 64,
+                    "64 stone for the house, furnace and tools; mined once, before building", Kind.STOCK),
+            new Milestone("minecraft:oak_log", 16,
+                    "16 logs of wood for the house, door, bed and table; gathered once, before building",
+                    Kind.STOCK),
             new Milestone("house", 1,
                     "a small shelter near the trees to sleep in and hide from mobs at night; stay close to it"
                             + " until you have stone tools", Kind.HOUSE),
@@ -112,17 +127,10 @@ final class ProgressPlanner {
                     "a door closes the doorway so mobs cannot walk in at night", Kind.DOOR),
             new Milestone("minecraft:wooden_sword", 1,
                     "a sword before hunting: sheep die faster and you can defend yourself"),
-            new Milestone("minecraft:wooden_pickaxe", 1,
-                    "stone, coal and every ore drop nothing without a pickaxe; this unlocks cobblestone and coal"),
-            new Milestone("minecraft:wooden_axe", 1, "chops trees faster and is a second weapon"),
             new Milestone(TechTree.WHITE_WOOL, 3,
                     "kill white sheep: 3 white wool + 3 planks make a bed, and sheep drop mutton for food"),
             new Milestone(TechTree.WHITE_BED, 1,
                     "a bed inside the house lets you sleep through the night and sets your respawn point", Kind.BED),
-            new Milestone("minecraft:stone_pickaxe", 1,
-                    "needed to mine iron ore, and mines stone faster"),
-            new Milestone("minecraft:stone_sword", 1,
-                    "a weapon makes nights and caves survivable"),
             new Milestone("food", FoodPlan.STOCK_WANTED,
                     "health only regenerates when fed; carry food before heading out to mine", Kind.FOOD),
             new Milestone("furnace", 1,
@@ -166,8 +174,17 @@ final class ProgressPlanner {
             default -> {
             }
         }
+        if (milestone.kind() == Kind.STOCK) {
+            // One-time stockpiles for building: done when held, or once the house stands and used them up.
+            int held = TechTree.matches(TechTree.LOGS, milestone.item())
+                    ? TechTree.count(inventory, TechTree.LOGS) : TechTree.held(inventory, milestone.item());
+            return facts.houseBuilt() || held >= milestone.count();
+        }
         if (TechTree.matches(TechTree.LOGS, milestone.item())) {
-            // Logs become planks, so count wood in plank units; a built house means wood is done.
+            // Logs become planks, so count wood in plank units; a built house or wooden tools mean wood is done.
+            if (TechTree.pickaxeTier(inventory).compareTo(TechTree.Tier.WOOD) >= 0) {
+                return true;
+            }
             int planks = TechTree.count(inventory, TechTree.LOGS) * 4 + TechTree.count(inventory, TechTree.PLANKS);
             return facts.houseBuilt() || planks >= milestone.count() * 4;
         }
@@ -219,6 +236,73 @@ final class ProgressPlanner {
         int food = order.indexOf(order.stream().filter(m -> m.kind() == Kind.FOOD).findFirst().orElseThrow());
         order.add(food, coal);
         return List.copyOf(order);
+    }
+
+    /**
+     * Drops the trailing "pick the table back up" step when the next milestone is a craft that needs no
+     * mining, so back-to-back crafts share one table placement instead of breaking and re-placing it.
+     */
+    static List<String> keepTableForNext(String goal, List<String> steps, Map<String, Integer> inventory,
+            TableAccess table, String preferredLog) {
+        String pickup = "mine 1 " + TechTree.CRAFTING_TABLE;
+        if (steps.size() < 2 || !steps.get(steps.size() - 1).equalsIgnoreCase(pickup)) {
+            return steps;
+        }
+        boolean seen = false;
+        for (Milestone milestone : ordered(inventory)) {
+            if (milestone.goal().equalsIgnoreCase(goal.strip())
+                    || milestone.item().equalsIgnoreCase(goal.strip())) {
+                seen = true;
+                continue;
+            }
+            if (!seen || satisfied(milestone, inventory)) {
+                continue;
+            }
+            if (milestone.kind() != Kind.HOLD || TechTree.recipeFor(milestone.item()).isEmpty()) {
+                return steps;
+            }
+            List<String> next = stepsFor(milestone.item(), milestone.count(), inventory, TableAccess.NEARBY,
+                    preferredLog);
+            boolean craftsOnly = !next.isEmpty() && next.stream().allMatch(step -> step.startsWith("craft") || step.equalsIgnoreCase(pickup));
+            return craftsOnly ? List.copyOf(steps.subList(0, steps.size() - 1)) : steps;
+        }
+        return steps;
+    }
+
+    /**
+     * The craftable tool milestones that follow the goal's own in a row (e.g. wooden pickaxe + axe, or all four
+     * stone tools), so their materials are gathered together before any crafting. Empty when not applicable.
+     */
+    static List<Map.Entry<String, Integer>> craftBatch(String goal, Map<String, Integer> inventory) {
+        List<Map.Entry<String, Integer>> batch = new ArrayList<>();
+        boolean seen = false;
+        for (Milestone milestone : ordered(inventory)) {
+            boolean craft = milestone.kind() == Kind.HOLD && TechTree.recipeFor(milestone.item()).isPresent();
+            if (!seen) {
+                seen = milestone.goal().equalsIgnoreCase(goal.strip());
+                if (!seen) {
+                    continue;
+                }
+            } else if (!craft) {
+                break;
+            }
+            if (!craft) {
+                return List.of();
+            }
+            // A tier change (wooden to stone) needs mining between crafts, so it starts a new batch.
+            if (!batch.isEmpty() && !tier(batch.get(0).getKey()).equals(tier(milestone.item()))) {
+                break;
+            }
+            if (!satisfied(milestone, inventory)) {
+                batch.add(Map.entry(milestone.item(), milestone.count()));
+            }
+        }
+        return batch.size() > 1 ? batch : List.of();
+    }
+
+    private static String tier(String item) {
+        String name = item.substring(item.indexOf(':') + 1);
+        return name.substring(0, Math.max(0, name.indexOf('_')));
     }
 
     static boolean holdsRawOre(Map<String, Integer> inventory) {
@@ -456,13 +540,21 @@ final class ProgressPlanner {
      */
     static List<String> stepsFor(String item, int count, Map<String, Integer> inventory, TableAccess table,
             String preferredLog) {
-        if (TechTree.matches(TechTree.LOGS, item)) {
+        return stepsForAll(List.of(Map.entry(item, count)), inventory, table, preferredLog);
+    }
+
+    /** One plan for several items: all materials are gathered first, then everything is crafted at one table. */
+    static List<String> stepsForAll(List<Map.Entry<String, Integer>> wanted, Map<String, Integer> inventory,
+            TableAccess table, String preferredLog) {
+        List<Map.Entry<String, Integer>> needs = new ArrayList<>();
+        for (Map.Entry<String, Integer> entry : wanted) {
             // Any wood counts toward a log goal; the plan names the log type found nearby.
-            item = TechTree.LOGS;
+            needs.add(Map.entry(TechTree.matches(TechTree.LOGS, entry.getKey()) ? TechTree.LOGS : entry.getKey(),
+                    entry.getValue()));
         }
         try {
             Expansion first = new Expansion(inventory, table, preferredLog, List.of());
-            first.need(item, count);
+            needs.forEach(need -> first.need(need.getKey(), need.getValue()));
             // Mining that needs no new tool is hoisted to the front; otherwise held materials get used up
             // by early crafts and the remainder is mined mid-plan, adding steps.
             List<Op> hoisted = first.ops.stream()
@@ -471,7 +563,7 @@ final class ProgressPlanner {
                 return first.steps(inventory);
             }
             Expansion second = new Expansion(inventory, table, preferredLog, hoisted);
-            second.need(item, count);
+            needs.forEach(need -> second.need(need.getKey(), need.getValue()));
             return second.steps(inventory);
         } catch (IllegalArgumentException unknown) {
             return List.of();
@@ -627,7 +719,7 @@ final class ProgressPlanner {
         text.append("\n- night_prep_missing=").append(SafetyAssessment.nightPrepMissing(inventory));
         String progression = progression();
         if (!progression.isEmpty()) {
-            text.append("\nGame progression (earliest unfinished stage first):\n").append(progression);
+            text.append("\nGame progression (earliest unfinished stage first; lettered lines are options, branches D and N are either order):\n").append(progression);
         }
         return text.toString();
     }

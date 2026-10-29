@@ -18,10 +18,9 @@ import java.util.concurrent.Executors;
 
 final class ActionPlanner {
     private static final int MAX_COMMAND_LENGTH = 256;
-    static final int MAX_STEPS = 8;
     static final Set<String> MENU_OPS = Set.of("read", "quick_move", "move", "drop", "close");
     private static final Set<String> ALLOWED_COMMANDS =
-            Set.of("mine", "goto", "build", "find", "pickup", "farm", "cancel", "come", "follow");
+            Set.of("mine", "goto", "cancel");
     private static final String GOAL_HEADER = "GET TO THE NETHER!!!\n\n";
     private static final String SYSTEM_PROMPT = GOAL_HEADER + """
             You plan Minecraft tasks and can issue one next action per turn.
@@ -40,23 +39,32 @@ final class ActionPlanner {
               coordinates or extra args.
             - goto <x> <y> <z>: exactly three integer coordinates; goto does not accept block IDs.
             - mine <n> minecraft:diamond: code digs a staircase down to y=-58, tunnels there, scans the
-              loaded blocks every two seconds for diamond ore and mines it. Use it to find diamonds; there is
-              no explore command.
-            - build <schematic_filename>: existing schematic only; never a block/item ID.
+              loaded blocks every two seconds for diamond ore and mines it. Use it to find diamonds.
+            - cancel: stops the running Baritone command.
             Never emit coordinates after mine and never emit a block ID to goto.
-            Other approved commands use their normal Baritone syntax, but do not invent arguments.
+            Do not invent other commands.
+
+            Travel (long-distance search): {"type":"travel","direction":"NORTH"} (or SOUTH, EAST, WEST)
+            walks about 500 blocks that way to the surface, over loaded and unloaded terrain alike. It is the
+            only way to search far away, so use it only when what you need (a biome, a block, a structure)
+            is not in the synopsis at all. Pick a direction using the biome vectors if you have any. It stops
+            by itself after the leg; the result then asks whether to continue. Read each observation while
+            it walks and replace it with a targeted mine or goto the moment you see what you need. Call
+            travel again to continue another ~500 blocks in the same or another direction.
 
             The latest observation includes Baritone's currently executing command, elapsed time, player movement,
             distance to a goto target where applicable, and recent Baritone feedback. If it is making
             useful progress, return action type "wait" to leave the current command running. If progress stalls,
             the environment changes, or the current command is not appropriate, issue a different valid
-            Baritone command to replace it. Do not resend an already-running command.
+            Baritone command to replace it. Do not resend an already-running command. Replace a travel
+            leg as soon as the new world information gives you a target.
 
             Before building or placing, compare required items to inventory. Gather missing source materials
             first with mine and use the inventory/world facts; do not try to place an item that is unavailable.
-            It can place one held/inventory block; use "place_block" for a nearby valid surface and "jump_place"
-            only when placing into the player's current feet cell. jump_place jumps one block and places at the
-            original feet cell after clearing replaceable flowers/plants. It cannot create schematic files.
+            Use "place_block" to put one inventory block down. The x,y,z is only a hint: code searches outward
+            from you (then up, then down) for a reachable spot with a solid anchor that is free of mobs and
+            of your own body, clears flowers/grass, and jumps to place beneath you if you are boxed in (a 1x1
+            hole). The result says where the block went. Schematic files cannot be created.
 
             Furnace: a furnace turns raw items into useful ones: raw iron/gold/copper into ingots, raw
             beef/porkchop/mutton/chicken/rabbit/fish into cooked food (much more filling), sand into glass.
@@ -88,12 +96,13 @@ final class ActionPlanner {
 
             Tools and safety are enforced. A mine command is rejected when the block drops nothing without a
             pickaxe you lack (stone, coal ore and every ore need one; cobblestone comes from mining
-            minecraft:stone), or when every nearby deposit is in a dark cave or deep underground and you
-            lack cave gear. Mining has no fixed travel-distance cutoff. Read a
-            rejection and change plan (craft the tool, goto open surface ground, or pick another resource);
+            minecraft:stone), or when every nearby deposit is more than 30 blocks below the surface and
+            you lack cave gear. Mining may walk a long way to the nearest deposit; that is normal, let it work
+            (use "wait"); never walk closer first. Read a rejection and change plan (craft the tool, pick a shallower deposit, or pick another resource);
             never resend the rejected command. The synopsis safety={...} field rates light, depth and
-            gear: when level=danger, get to light or the surface before anything else, and never go
-            underground while cave_ready=false.
+            gear: when level=danger, get to light or the surface before anything else, and get to
+            the surface when health is low. Torches are placed automatically when it is dark and you hold some,
+            and blocks, tools and food are moved to the hotbar for you: just name the item.
             Use "lookup" with a short search query to find registered block/item IDs or player-known recipes.
             Nether entry is the objective. Iron/diamond tools and armor, a shield, bucket, flint and steel,
             and golden boots are craftable. Smelt raw iron/gold before crafting ingot items.
@@ -119,7 +128,13 @@ final class ActionPlanner {
             Basic melee combat is available: {"type":"attack","entity_id":123} sends one hit to a
             live hostile mob identified in nearby_hostile_mobs. Only attack targets marked melee_reachable=true.
             Attacks respect weapon cooldown and line of sight. No ranged attacks or combat pathfinding.
-            Never target players or neutral mobs. Escape creepers and flee when health is 6 or lower.
+            Skeletons and creepers are fought by code with specialised styles when you hold a weapon: skeletons are
+            rushed and killed with jump crits, creepers are crit once then backed away from while the attack
+            recharges, repeatedly; do not run from them at range with a weapon in hand.
+            Reflex building also runs in code: with 3+ melee mobs close and cheap blocks (cobblestone, dirt, planks)
+            held, the bot pillars up 4 blocks out of reach; with 2+ skeletons in sight and 9+ blocks it walls
+            itself in (4 sides, 2 high, plus a roof), then opens a gap once they are gone. Carry spare cobblestone.
+            Never target players or neutral mobs. Flee when health is 6 or lower.
             Observe target health/death before claiming damage or kills; repeat attack if still needed.
             The synopsis lists everything carried: occupied inventory slots, totals, held_item, offhand, armor worn
             (head/chest/legs/feet) and free_inventory_slots. Use {"type":"equip","item":"minecraft:iron_sword"}
@@ -148,8 +163,20 @@ final class ActionPlanner {
             - {"type":"menu","op":"move","slot":A,"to_slot":B} moves the stack in slot A into slot B.
             - {"type":"menu","op":"drop","slot":N} throws the stack out; {"type":"menu","op":"close"} closes it.
             - {"type":"screenshot"} captures what the player sees; the image arrives with your next turn.
-              Use it only when the text state is not enough (what a structure looks like, where you are).
+              It is your best tool when confused, stuck, in a rough situation (trapped in a hole or
+              water, surrounded, repeated failures, a result that makes no sense) and for checking what
+              a build or the surroundings really look like. When in doubt, take one before guessing again.
+            - {"type":"respawn"} only while the synopsis says you are DEAD: respawns you at your bed or the
+              world spawn. Your session continues; the death note gives the cause, the death coordinates,
+              and the seconds left before your dropped items despawn (600). The mobs that killed you may
+              still be there, so at night or without a weapon and light source prepare first (or accept
+              the loss); your home location stays in the briefing. Go back with goto and pick your items up.
+            - {"type":"white_flag","reason":"short"} gives up on this attempt when you truly cannot make
+              progress (repeated failures after a screenshot and a fresh look). The session is thrown
+              away and the original task restarts from scratch with a fresh mind.
 
+            At night without a bed your main jobs are: get a bed (3 wool + 3 planks, or find one in a village),
+            or mine coal for torches. Do not stop working or wait inside.
             Night and darkness: dark is a risk, never a reason to freeze. Night makes hostile mobs spawn
             on the surface in the dark, so before dusk gather a sword, torches/lantern/campfire and a bed
             (3 wool + 3 planks) when affordable. At night you may sleep in a bed, stay near light, keep
@@ -157,8 +184,9 @@ final class ActionPlanner {
             because light is low; act on actual hostile mobs and low health. Once a house or bed exists,
             code takes you home at night and sleeps; you are not asked while that runs.
 
-            Travel has no fixed home radius: goto and mining may go beyond the start area.
-            Never plan while sinking in water: get onto land first; code swims you out.
+            Home range: until you hold a stone pickaxe and a stone sword, stay within 6 chunks (96 blocks)
+            horizontally and 30 blocks above or below home (see home= in the briefing). A goto farther away is refused and travel becomes a walk to a
+            spot near home. Never plan while sinking in water: get onto land first; code swims you out.
 
             Return only JSON:
             {"summary":"short status","goal":"current subgoal","complete":false,
@@ -167,8 +195,6 @@ final class ActionPlanner {
                 "action":{"type":"wait"}}
             or {"summary":"place block","goal":"place table","complete":false,
                 "action":{"type":"place_block","block":"minecraft:crafting_table","x":-11,"y":120,"z":15}}
-            or {"summary":"jump and place","goal":"place below player","complete":false,
-                "action":{"type":"jump_place","block":"minecraft:crafting_table","x":-11,"y":120,"z":15}}
             or {"summary":"identify item","goal":"look up crafting table","complete":false,
                 "action":{"type":"lookup","query":"crafting table"}}
             or {"summary":"hold sword","goal":"prepare to fight","complete":false,
@@ -194,13 +220,16 @@ final class ActionPlanner {
             action whose objective is already met. For example, if the current step is
             "mine 4 minecraft:oak_log" and the inventory already holds 4 oak logs, return
             "step_complete":true. Otherwise omit step_complete or set it to false.
-            Use complete=true only when the final step is finished.
+            Use complete=true only when the final step is finished, and only after a last check: compare
+            the inventory and world synopsis with the ORIGINAL task (the item is really held, the
+            structure really exists; take a screenshot when the text cannot show it). If anything is
+            missing, continue working instead. A completion that fails that check is sent back to you.
             """;
 
     private static final String DECOMPOSE_PROMPT = GOAL_HEADER + """
             You break a Minecraft task into an ordered plan of concrete, verifiable steps.
             Each step must be achievable with these abilities only: Baritone navigation and mining
-            (mine, goto, find, pickup, farm, follow), crafting items in craftable_catalog,
+            (mine, goto, travel), crafting items in craftable_catalog,
             placing a single block from inventory, using buckets/flint and steel on observed coordinates,
             close-range melee against hostile mobs, equipping items
             already carried, and looking up block/item IDs. Building from schematics is NOT available.
@@ -209,13 +238,14 @@ final class ActionPlanner {
             Every material you gather must be used by a later step or by the task itself; know why you
             collect it. Use the progression briefing: tools come before the blocks that need them (stone,
             coal and ores drop nothing without the right pickaxe), and cobblestone is obtained by mining
-            minecraft:stone. Do not plan to go underground when cave_ready=false.
+            minecraft:stone. Without cave gear stay within 30 blocks of the surface.
             Write steps in these forms so they can be checked: "mine 3 minecraft:oak_log",
             "craft 12 minecraft:oak_planks", "place minecraft:crafting_table nearby", "build house",
             "hunt 3 minecraft:white_wool" (kill white sheep), "place minecraft:white_bed in house",
             "place minecraft:crafting_table in house", "place door in house", "go to house" (to craft at
-            the house table). Build the house before any step that places furniture inside it. The house crafting table
-            is never picked up. Quantities are totals
+            the house table). Build the house before any step that places furniture inside it. "build house" runs a
+            Baritone schematic that finishes the whole house by itself; never place planks by hand to complete or
+            extend it, and treat HOUSE_BUILD_DONE as final. The house crafting table is never picked up. Quantities are totals
             to hold when the step finishes. 3x3 recipes need a placed crafting table. Reuse the crafting
             table: if one is in inventory, place it; if one is placed elsewhere, "go to crafting table"
             walks there to use it. Never plan a second table or a pickup after crafting. Only reclaim
@@ -238,7 +268,7 @@ final class ActionPlanner {
             You decide what a Minecraft player should do next, with no human giving instructions.
             You are given a progression briefing, the world state (including a safety assessment), goals
             already achieved, and goals recently attempted.
-            Abilities: Baritone navigation and mining (mine, goto, find, pickup, farm, follow),
+            Abilities: Baritone navigation and mining (mine, goto, travel),
             crafting the items in craftable_catalog (2x2 anywhere, 3x3 at a placed crafting table), placing
             a block from inventory, close-range melee against hostile mobs, equipping items already
             carried, and looking up IDs.
@@ -253,26 +283,25 @@ final class ActionPlanner {
             crafting_table shows one in inventory or placed nearby.
             Safety comes first. Darkness alone is only caution: at night keep working, or prepare (weapon,
             torches, lantern/campfire, bed) and sleep. If safety level=danger because of low health or
-            hostile mobs, choose to reach light or the surface. Do not choose
-            goals that take you underground or into dark caves while cave_ready=false; prefer exposed
-            blocks on the surface, cliffs and hillsides near you. Escape at health 6 or lower and avoid
+            hostile mobs, choose to reach light or the surface. Darkness is not a reason to
+            stop: carry torches and keep working. Escape at health 6 or lower and avoid
             creepers. Fight only mobs marked melee_reachable=true.
-            Early game is a fixed checklist run by code: 20 logs; build the house; put a crafting table
-            inside the house (it stays there for good); craft and hang a door; craft a wooden sword; craft
-            a wooden pickaxe (gather more wood first if short); kill sheep for 3 white wool; craft the bed
-            and place it inside the house; sleep at night. Then: stone pickaxe, stone sword, food (24 hunger
-            points carried), a furnace in the house, and only then coal for torches. Coal waits until there is
-            a furnace and food, unless you hold raw ore that needs smelting; a coal goal before that is
-            rejected. Only after that come the pickaxe,
-            stone tools, food, torches and iron; never race to cobblestone, coal or iron before the house
-            and bed exist. Travel has no fixed home radius.
+            Early game is a checklist run by code that mirrors the progression list: 8 logs of the type in the
+            Wood: line (or travel to a wooded biome if there are no trees), wooden pickaxe and axe, stone
+            pickaxe/axe/shovel/sword, 64 cobblestone, 16 logs, then the house (the house goes wherever the
+            wood was found), a table inside it, door, wooden sword, wool, bed, food, furnace, torches, iron.
+            Stay within 96 blocks horizontally and 30 vertically of home only once a house exists and until
+            you have a stone pickaxe and a stone sword; before the house there is no range limit.
             The briefing ends with a Situation line: what you have, what you still need and why, and the
             best job you can do right now. Use it. With a bed in the house you sleep at night. Without one,
             code works from home at night: it finishes the house, crafts tools, smelts in the house furnace,
-            and digs the house staircase mine for cobblestone and then iron, down to y=16, stopping at caves.
+            and digs the house staircase mine for cobblestone and then iron, down toward bedrock, stopping at caves or lava.
             After that, follow the game progression list in the briefing: pick one concrete goal from the
             earliest stage that is not finished (judge by inventory and goals already achieved). Commit to
             it: do not switch to a different stage or invent a new project halfway.
+            Lettered lines (17A, 17B...) are options of one stage: choose the one that suits the terrain and
+            finish it. The D (diamond) and N (nether) branches can be done in either order; both come before
+            the End prep (E).
             next_milestone is normally the right goal; choose something else only when safety or the
             world state gives a clear reason, and say what it is.
             Never repeat a goal listed as already achieved, and do not repeat a recently attempted goal
@@ -334,11 +363,22 @@ final class ActionPlanner {
     private final HttpClient http = HttpClient.newBuilder()
             .connectTimeout(Duration.ofSeconds(5))
             .build();
-    private final ExecutorService executor = Executors.newSingleThreadExecutor(task -> {
-        Thread thread = new Thread(task, "actionable-planner");
-        thread.setDaemon(true);
-        return thread;
-    });
+    private volatile ExecutorService executor = newExecutor();
+
+    private static ExecutorService newExecutor() {
+        return Executors.newSingleThreadExecutor(task -> {
+            Thread thread = new Thread(task, "actionable-planner");
+            thread.setDaemon(true);
+            return thread;
+        });
+    }
+
+    /** Interrupts any in-flight or queued model request so a stale answer never blocks the next one. */
+    synchronized void cancelPending() {
+        pendingImage = null;
+        executor.shutdownNow();
+        executor = newExecutor();
+    }
 
     private volatile String pendingImage;
 
@@ -460,6 +500,24 @@ final class ActionPlanner {
 
     private String send(String endpoint, JsonObject body) {
         String stage = requestContext.get().stage();
+        JsonArray sent = body.getAsJsonArray("messages");
+        String system = sent.get(0).getAsJsonObject().get("content").getAsString();
+        String user = sent.get(1).getAsJsonObject().get("content").getAsString();
+        boolean hasImage = sent.get(1).getAsJsonObject().has("images");
+        long started = System.nanoTime();
+        try {
+            String response = sendRequest(endpoint, body, stage);
+            ContextCapture.exchange(stage, system, user, hasImage, response,
+                    (System.nanoTime() - started) / 1_000_000, null);
+            return response;
+        } catch (RuntimeException exception) {
+            ContextCapture.exchange(stage, system, user, hasImage, null,
+                    (System.nanoTime() - started) / 1_000_000, safeMessage(exception));
+            throw exception;
+        }
+    }
+
+    private String sendRequest(String endpoint, JsonObject body, String stage) {
         String provider = System.getProperty("actionable.model.provider", "ollama");
         if (provider.equalsIgnoreCase("claude")) {
             JsonArray messages = body.getAsJsonArray("messages");
@@ -509,9 +567,6 @@ final class ActionPlanner {
                     .strip();
             if (!step.isBlank()) {
                 steps.add(step);
-            }
-            if (steps.size() == MAX_STEPS) {
-                break;
             }
         }
         return steps;
@@ -597,6 +652,19 @@ final class ActionPlanner {
                 return Optional.empty();
             }
         }
+        if (type.equals("travel") || type.equals("explore")) {
+            String direction = firstOf(action, "", "direction", "dir", "heading").toUpperCase(Locale.ROOT);
+            return Set.of("NORTH", "SOUTH", "EAST", "WEST").contains(direction)
+                    ? Optional.of(new PlannedAction("travel", direction, "", 0, 0, 0, ""))
+                    : Optional.empty();
+        }
+        if (type.equals("white_flag")) {
+            return Optional.of(new PlannedAction("white_flag", "", "", 0, 0, 0,
+                    cleanText(action, "reason", "no reason given", 120)));
+        }
+        if (type.equals("respawn")) {
+            return Optional.of(new PlannedAction("respawn", "", "", 0, 0, 0, ""));
+        }
         if (type.equals("screenshot")) {
             return Optional.of(new PlannedAction("screenshot", "", "", 0, 0, 0, ""));
         }
@@ -622,11 +690,12 @@ final class ActionPlanner {
             }
             return Optional.of(new PlannedAction("menu", op, "", slot, toSlot, 0, ""));
         }
+        // jump_place is the old name of the same action; place_block now jumps by itself when needed.
         if ((type.equals("place_block") || type.equals("jump_place")) && action.has("block")
                 && action.has("x") && action.has("y") && action.has("z")) {
             String block = action.get("block").getAsString();
             if (block.matches("[a-z0-9_.-]+:[a-z0-9_./-]+")) {
-                return Optional.of(new PlannedAction(type, "", block,
+                return Optional.of(new PlannedAction("place_block", "", block,
                         action.get("x").getAsInt(), action.get("y").getAsInt(), action.get("z").getAsInt(), ""));
             }
         }
@@ -697,17 +766,6 @@ final class ActionPlanner {
             }
             case "come", "cancel" -> {
                 if (parts.length != 1) {
-                    return Optional.empty();
-                }
-            }
-            case "build" -> {
-                if (parts.length != 2
-                        || !parts[1].matches("[A-Za-z0-9_.-]+\\.(?i:schematic|schem|litematic)")) {
-                    return Optional.empty();
-                }
-            }
-            case "find", "pickup", "farm", "follow" -> {
-                if (parts.length < 2) {
                     return Optional.empty();
                 }
             }

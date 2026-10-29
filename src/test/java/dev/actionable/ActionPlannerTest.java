@@ -21,10 +21,9 @@ class ActionPlannerTest {
     }
 
     @Test
-    void promptsAllowTravelBeyondHomeAndMiningStart() {
-        assertTrue(ActionPlanner.systemPrompt("action").contains("mining may go beyond the start area"));
-        assertTrue(ActionPlanner.systemPrompt("action").contains("no fixed travel-distance cutoff"));
-        assertTrue(ActionPlanner.systemPrompt("director").contains("Travel has no fixed home radius"));
+    void promptsDescribeHomeRangeAndTravel() {
+        assertTrue(ActionPlanner.systemPrompt("action").contains("Home range: until you hold a stone pickaxe"));
+        assertTrue(ActionPlanner.systemPrompt("action").contains("Travel (long-distance search)"));
         var movement = action("{\"type\":\"baritone\",\"command\":\"goto 1000 70 -1000\"}");
         assertEquals("goto 1000 70 -1000", movement.command());
     }
@@ -123,5 +122,32 @@ class ActionPlannerTest {
         assertEquals(65, action.y());
         assertEquals(-9, action.z());
         assertTrue(PlannerSchema.forStage("action").contains("\"break_block\""));
+    }
+
+    @Test
+    void whiteFlagAndPlaceAliasParse() {
+        assertEquals("white_flag", action("{\"type\":\"white_flag\",\"reason\":\"stuck\"}").type());
+        assertEquals("stuck", action("{\"type\":\"white_flag\",\"reason\":\"stuck\"}").query());
+        assertEquals("place_block", action(
+                "{\"type\":\"jump_place\",\"block\":\"minecraft:dirt\",\"x\":1,\"y\":2,\"z\":3}").type());
+    }
+
+    @Test
+    void redundantCommandsAreRejected() {
+        for (String verb : new String[] {"build a.schem", "find stone", "come", "follow bob", "pickup x", "farm"}) {
+            assertTrue(ActionPlanner.validateCommand(verb).isEmpty(), verb);
+        }
+        assertTrue(ActionPlanner.validateCommand("explore").isEmpty(), "explore is replaced by travel");
+        assertTrue(ActionPlanner.validateCommand("cancel").isPresent());
+    }
+
+    @Test
+    void travelNeedsACompassDirection() {
+        var travel = ActionPlanner.parseAction(com.google.gson.JsonParser.parseString(
+                "{\"type\":\"travel\",\"direction\":\"north\"}").getAsJsonObject());
+        assertEquals("travel", travel.orElseThrow().type());
+        assertEquals("NORTH", travel.orElseThrow().command());
+        assertTrue(ActionPlanner.parseAction(com.google.gson.JsonParser.parseString(
+                "{\"type\":\"travel\",\"direction\":\"up\"}").getAsJsonObject()).isEmpty());
     }
 }

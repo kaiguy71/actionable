@@ -83,6 +83,42 @@ final class WorldProbe {
      * first. Light, sky and depth are measured at the open face; the stand cell is a dry spot within
      * reach, so the player never mines from water (it bobbed in a lake trying to reach a shoreline log).
      */
+    /** The log block id nearest to {@code origin} within the radius, whatever its wood type; null if none. */
+    static String nearestLogType(ClientLevel level, BlockPos origin, int radius) {
+        BlockPos pos = nearestLog(level, origin, radius);
+        return pos == null ? null : BuiltInRegistries.BLOCK.getKey(level.getBlockState(pos).getBlock()).toString();
+    }
+
+    /** The nearest natural log of any wood type within the radius; null if none is loaded. */
+    static BlockPos nearestLog(ClientLevel level, BlockPos origin, int radius) {
+        BlockPos.MutableBlockPos cursor = new BlockPos.MutableBlockPos();
+        double best = Double.MAX_VALUE;
+        BlockPos found = null;
+        for (int dx = -radius; dx <= radius; dx++) {
+            for (int dz = -radius; dz <= radius; dz++) {
+                if (!level.hasChunk((origin.getX() + dx) >> 4, (origin.getZ() + dz) >> 4)) {
+                    continue;
+                }
+                for (int dy = -radius / 2; dy <= radius / 2; dy++) {
+                    double distance = dx * dx + dy * dy + dz * dz;
+                    if (distance >= best) {
+                        continue;
+                    }
+                    cursor.set(origin.getX() + dx, origin.getY() + dy, origin.getZ() + dz);
+                    var state = level.getBlockState(cursor);
+                    if (state.is(net.minecraft.tags.BlockTags.LOGS)) {
+                        String id = BuiltInRegistries.BLOCK.getKey(state.getBlock()).toString();
+                        if (!id.contains("stripped_")) {
+                            best = distance;
+                            found = cursor.immutable();
+                        }
+                    }
+                }
+            }
+        }
+        return found;
+    }
+
     static List<MiningPolicy.Site> exposedSites(ClientLevel level, BlockPos origin, Block block, int radius) {
         List<BlockPos> candidates = new ArrayList<>();
         BlockPos.MutableBlockPos cursor = new BlockPos.MutableBlockPos();
@@ -202,6 +238,15 @@ final class WorldProbe {
         return sources;
     }
 
+    /** A goto command to a free standing cell within reach of the target, never the target block itself. */
+    static String gotoBeside(ClientLevel level, BlockPos target) {
+        BlockPos stand = dryStandNear(level, target);
+        if (stand == null) {
+            stand = target.above();
+        }
+        return "goto " + stand.getX() + " " + stand.getY() + " " + stand.getZ();
+    }
+
     private static BlockPos openNeighbour(ClientLevel level, BlockPos pos) {
         // Prefer the cell above, where a player would usually stand, then the sides.
         for (Direction direction : new Direction[] {Direction.UP, Direction.NORTH, Direction.SOUTH,
@@ -234,6 +279,67 @@ final class WorldProbe {
             }
         }
         return candidates;
+    }
+
+    /**
+     * Cells where a block can go near the player, nearest first: outward on the player's level, then
+     * upward, then downward. A cell qualifies when it is empty or replaceable (never plain water), free
+     * of the player and of any mob, and touches a solid, dry anchor face within reach.
+     */
+    static List<BlockPos> placementSpots(ClientLevel level, Player player) {
+        BlockPos feet = player.blockPosition();
+        net.minecraft.world.phys.Vec3 eyes = player.getEyePosition();
+        List<BlockPos> air = new ArrayList<>();
+        List<BlockPos> soft = new ArrayList<>();
+        for (int dy : new int[] {0, 1, 2, 3, -1, -2, -3}) {
+            for (int radius = 0; radius <= 3; radius++) {
+                for (int dx = -radius; dx <= radius; dx++) {
+                    for (int dz = -radius; dz <= radius; dz++) {
+                        if (Math.max(Math.abs(dx), Math.abs(dz)) != radius) {
+                            continue;
+                        }
+                        BlockPos cell = feet.offset(dx, dy, dz);
+                        if (!placeableCell(level, player, cell, eyes)) {
+                            continue;
+                        }
+                        (level.getBlockState(cell).isAir() ? air : soft).add(cell);
+                    }
+                }
+            }
+        }
+        air.addAll(soft);
+        return air;
+    }
+
+    static boolean placeableCell(ClientLevel level, Player player, BlockPos cell,
+            net.minecraft.world.phys.Vec3 eyes) {
+        var state = level.getBlockState(cell);
+        if (!state.isAir() && !(state.canBeReplaced() && state.getFluidState().isEmpty())) {
+            return false;
+        }
+        var above = level.getBlockState(cell.above());
+        if (!above.isAir() && !above.canBeReplaced()) {
+            return false;
+        }
+        var box = new net.minecraft.world.phys.AABB(cell);
+        if (player.getBoundingBox().intersects(box)
+                || !level.getEntities((Entity) null, box, entity -> true).isEmpty()) {
+            return false;
+        }
+        for (Direction side : Direction.values()) {
+            BlockPos anchor = cell.relative(side);
+            var anchorState = level.getBlockState(anchor);
+            if (!anchorState.getFluidState().isEmpty() || !anchorState.isFaceSturdy(level, anchor, side.getOpposite())) {
+                continue;
+            }
+            net.minecraft.world.phys.Vec3 face = net.minecraft.world.phys.Vec3.atCenterOf(anchor).add(
+                    side.getOpposite().getStepX() * 0.5, side.getOpposite().getStepY() * 0.5,
+                    side.getOpposite().getStepZ() * 0.5);
+            if (eyes.distanceToSqr(face) <= 20.25) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /** Nearest bed block within {@code radius}, or null. */
@@ -333,6 +439,62 @@ final class WorldProbe {
      * The next house cell needing a plank: a floor cell that is a hole or water, then a walkable cell
      * holding water. Null when the floor is sound and dry.
      */
+    static final int SITE_RADIUS = 14;
+    static final int SITE_STEP = 2;
+
+    /**
+     * Picks the house corner near {@code feet} with the least in the way: trees (logs and leaves) inside
+     * the house box and its one-block margin, uneven ground under it, and water. Ties go to the closest.
+     * The origin is at the walking level of the ground, like the player's feet.
+     */
+    static int[] bestHouseSite(ClientLevel level, BlockPos feet) {
+        int[] best = null;
+        double bestScore = Double.MAX_VALUE;
+        for (int dx = -SITE_RADIUS; dx <= SITE_RADIUS; dx += SITE_STEP) {
+            for (int dz = -SITE_RADIUS; dz <= SITE_RADIUS; dz += SITE_STEP) {
+                int x = feet.getX() + dx;
+                int z = feet.getZ() + dz;
+                if (!level.hasChunk(x >> 4, z >> 4) || !level.hasChunk((x + HouseDesign.WIDTH) >> 4,
+                        (z + HouseDesign.LENGTH) >> 4)) {
+                    continue;
+                }
+                int y = surfaceY(level, x + HouseDesign.WIDTH / 2, z + HouseDesign.LENGTH / 2);
+                double score = siteScore(level, x, y, z) + Math.sqrt((double) dx * dx + (double) dz * dz) * 0.5;
+                if (score < bestScore) {
+                    bestScore = score;
+                    best = new int[] {x, y, z};
+                }
+            }
+        }
+        return best;
+    }
+
+    private static double siteScore(ClientLevel level, int x, int y, int z) {
+        double score = 0;
+        for (int dx = -1; dx <= HouseDesign.WIDTH; dx++) {
+            for (int dz = -1; dz <= HouseDesign.LENGTH; dz++) {
+                boolean inside = dx >= 0 && dx < HouseDesign.WIDTH && dz >= 0 && dz < HouseDesign.LENGTH;
+                int ground = surfaceY(level, x + dx, z + dz);
+                if (inside) {
+                    score += Math.abs(ground - y) * 3;
+                    var below = level.getBlockState(new BlockPos(x + dx, ground - 1, z + dz));
+                    if (!below.getFluidState().isEmpty()) {
+                        score += 6;
+                    }
+                }
+                for (int dy = -1; dy <= HouseDesign.HEIGHT; dy++) {
+                    var state = level.getBlockState(new BlockPos(x + dx, y + dy, z + dz));
+                    if (state.is(net.minecraft.tags.BlockTags.LEAVES)) {
+                        score += inside ? 1 : 0.4;
+                    } else if (state.is(net.minecraft.tags.BlockTags.LOGS)) {
+                        score += inside ? 3 : 1;
+                    }
+                }
+            }
+        }
+        return score;
+    }
+
     static BlockPos houseFloorProblem(ClientLevel level, int[] origin) {
         for (int[] cell : HouseDesign.floorCells()) {
             BlockPos pos = new BlockPos(origin[0] + cell[0], origin[1] + cell[1], origin[2] + cell[2]);
@@ -383,16 +545,32 @@ final class WorldProbe {
      * placed by mistake and are taken back.
      */
     static List<BlockPos> strayDoors(ClientLevel level, int[] home) {
+        List<BlockPos> doors = new ArrayList<>(doorsAround(level, home));
+        doors.removeIf(pos -> isDoorway(home, pos));
+        return doors;
+    }
+
+    /** The doorway column, or any door in the north wall line, counts as the house door. */
+    static boolean isDoorway(int[] home, BlockPos pos) {
+        return pos.getY() == home[1] + HouseDesign.DOOR_CELL[1] && pos.getZ() == home[2] + HouseDesign.DOOR_CELL[2]
+                && pos.getX() >= home[0] + 1 && pos.getX() <= home[0] + HouseDesign.WIDTH - 2;
+    }
+
+    /** True when a door hangs in the house's doorway (or one cell either side of it in the north wall). */
+    static boolean houseDoorPlaced(ClientLevel level, int[] home) {
+        return doorsAround(level, home).stream().anyMatch(pos -> isDoorway(home, pos));
+    }
+
+    /** Lower halves of every door in or around the house. */
+    static List<BlockPos> doorsAround(ClientLevel level, int[] home) {
         List<BlockPos> doors = new ArrayList<>();
-        BlockPos doorway = new BlockPos(home[0] + HouseDesign.DOOR_CELL[0], home[1] + HouseDesign.DOOR_CELL[1],
-                home[2] + HouseDesign.DOOR_CELL[2]);
         for (BlockPos pos : BlockPos.betweenClosed(new BlockPos(home[0] - 2, home[1] - 1, home[2] - 3),
                 new BlockPos(home[0] + HouseDesign.WIDTH + 1, home[1] + HouseDesign.HEIGHT, home[2] + HouseDesign.LENGTH + 1))) {
             var state = level.getBlockState(pos);
             if (state.getBlock() instanceof net.minecraft.world.level.block.DoorBlock
                     && state.getValue(net.minecraft.world.level.block.DoorBlock.HALF)
                             == net.minecraft.world.level.block.state.properties.DoubleBlockHalf.LOWER
-                    && !pos.equals(doorway)) {
+                    ) {
                 doors.add(pos.immutable());
             }
         }
@@ -531,6 +709,11 @@ final class WorldProbe {
         }
         java.util.regex.Matcher log = java.util.regex.Pattern.compile("(minecraft:[a-z_]+_(?:log|stem))")
                 .matcher(nearbyResources);
-        return log.find() ? log.group(1) : "minecraft:oak_log";
+        if (log.find()) {
+            return log.group(1);
+        }
+        java.util.regex.Matcher biome = java.util.regex.Pattern.compile("current_biome=([a-z0-9_:.]+)")
+                .matcher(nearbyResources);
+        return biome.find() ? TreeBiomes.primaryLog(biome.group(1)).orElse("minecraft:oak_log") : "minecraft:oak_log";
     }
 }

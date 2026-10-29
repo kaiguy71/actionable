@@ -93,9 +93,9 @@ final class Crafter {
             }
             if (!WorldProbe.tableInReach(player, table)) {
                 return new Start(null, "CRAFT_FAILED_TABLE_OUT_OF_REACH: crafting table at " + table.getX() + ","
-                        + table.getY() + "," + table.getZ() + "; goto " + table.getX() + " " + (table.getY() + 1)
-                        + " " + table.getZ() + " first, or mine 1 minecraft:crafting_table to pick it up"
-                        + " and place it nearby");
+                        + table.getY() + "," + table.getZ() + "; run " + WorldProbe.gotoBeside(client.level, table)
+                        + " (a free cell beside it; never goto the table's own coordinates), or mine 1"
+                        + " minecraft:crafting_table to pick it up and place it nearby");
             }
         }
         int crafts = (target - held + recipe.get().yield() - 1) / recipe.get().yield();

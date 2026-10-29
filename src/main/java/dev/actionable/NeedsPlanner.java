@@ -87,8 +87,7 @@ final class NeedsPlanner {
                         + " tools and a furnace, and the house mine is safe"));
             } else if (tier.compareTo(TechTree.Tier.STONE) >= 0
                     && TechTree.held(inventory, "minecraft:raw_iron") < IRON_WANTED) {
-                candidates.add(new Task(MINE_IRON, "enough cobblestone; dig deeper toward iron, down to y="
-                        + StairMine.BOTTOM_Y));
+                candidates.add(new Task(MINE_IRON, "enough cobblestone; dig deeper toward iron"));
             }
         }
         for (Task task : candidates) {
@@ -129,7 +128,7 @@ final class NeedsPlanner {
         int wool = TechTree.held(inventory, TechTree.WHITE_WOOL);
         if (situation.night()) {
             text.append(facts.bedPlaced() ? " night; a bed is placed, so sleep."
-                    : " night and no bed (" + wool + "/3 white wool), so you cannot sleep; stay home and do home jobs.");
+                    : " night and no bed (" + wool + "/3 white wool), so you cannot sleep; keep working: get 3 wool for a bed (or find a village bed) or mine coal for torches.");
         } else {
             text.append(" day.");
         }

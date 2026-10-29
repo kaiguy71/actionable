@@ -11,7 +11,7 @@ final class PlannerSchema {
                     "why":{"type":"string","minLength":1}},"required":["goal","why"],"additionalProperties":false}
                     """;
             case "decomposition" -> """
-                    {"type":"object","properties":{"steps":{"type":"array","minItems":1,"maxItems":8,
+                    {"type":"object","properties":{"steps":{"type":"array","minItems":1,
                     "items":{"type":"string","minLength":1}}},"required":["steps"],"additionalProperties":false}
                     """;
             case "judge" -> """
@@ -22,7 +22,7 @@ final class PlannerSchema {
                     {"type":"object","properties":{"summary":{"type":"string"},"goal":{"type":"string"},
                     "complete":{"type":"boolean"},"step_complete":{"type":"boolean"},"action":{
                     "type":"object","properties":{"type":{"type":"string","enum":["baritone","wait",
-                    "lookup","place_block","jump_place","attack","craft","equip","use_block","use_item","menu","screenshot","break_block"]},
+                    "lookup","place_block","jump_place","attack","craft","equip","use_block","use_item","menu","screenshot","break_block","white_flag"]},
                     "face":{"type":"string","enum":["up","down","north","south","east","west"]},
                     "op":{"type":"string","enum":["read","quick_move","move","drop","close"]},
                     "slot":{"type":"integer"},"to_slot":{"type":"integer"},"command":{"type":"string"},

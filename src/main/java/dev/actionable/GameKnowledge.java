@@ -22,6 +22,10 @@ final class GameKnowledge {
             return "Lookup query is empty.";
         }
 
+        if (normalized.matches(".*(wood|tree|log|biome).*")) {
+            return TreeBiomes.table();
+        }
+
         List<String> blocks = new ArrayList<>();
         for (var block : BuiltInRegistries.BLOCK) {
             Identifier id = BuiltInRegistries.BLOCK.getKey(java.util.Objects.requireNonNull(block));

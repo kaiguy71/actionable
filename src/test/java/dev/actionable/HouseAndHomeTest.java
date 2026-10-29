@@ -16,7 +16,7 @@ import org.junit.jupiter.api.Test;
 class HouseAndHomeTest {
     @Test
     void houseIsAWalledRoofedHutWithADoorway() {
-        assertEquals(71, HouseDesign.planksNeeded());
+        assertEquals(79, HouseDesign.planksNeeded());
         assertTrue(HouseDesign.solid(0, 0, 0), "corner wall");
         assertTrue(HouseDesign.solid(2, 3, 2), "roof");
         assertFalse(HouseDesign.solid(2, 1, 2), "interior is open");
@@ -98,21 +98,23 @@ class HouseAndHomeTest {
         assertEquals(2, root.get("Version"));
         assertEquals(4440, root.get("DataVersion"));
         assertEquals((short) 5, root.get("Width"));
-        assertEquals((short) 4, root.get("Height"));
+        assertEquals((short) 5, root.get("Height"));
         assertEquals((short) 5, root.get("Length"));
         @SuppressWarnings("unchecked")
         Map<String, Object> palette = (Map<String, Object>) root.get("Palette");
         assertEquals(Map.of("minecraft:air", 0, "minecraft:spruce_planks", 1), palette);
         byte[] blocks = (byte[]) root.get("BlockData");
-        assertEquals(100, blocks.length);
+        assertEquals(125, blocks.length);
         int planks = 0;
         for (byte block : blocks) {
             planks += block;
         }
         assertEquals(HouseDesign.planksNeeded(), planks);
-        // Sponge order is (y * length + z) * width + x: the doorway at x=2, z=0 is air on the ground.
-        assertEquals(0, blocks[2]);
-        assertEquals(1, blocks[0]);
+        // Sponge order is (y * length + z) * width + x, with the floor layer first: the doorway at x=2, z=0
+        // is a floor plank below and air at ground level.
+        assertEquals(1, blocks[2]);
+        assertEquals(0, blocks[25 + 2]);
+        assertEquals(1, blocks[25]);
         assertArrayEquals(new int[] {0, 0, 0}, (int[]) root.get("Offset"));
     }
 
@@ -126,9 +128,50 @@ class HouseAndHomeTest {
     }
 
     @Test
-    void homeBriefingDoesNotImposeATravelRadius() {
+    void ungearedPlayersStayNearHome() {
+        int[] home = {0, 64, 0};
+        assertFalse(HomeRange.outside(home, false, 90, 64, 0, 0));
+        assertTrue(HomeRange.outside(home, false, 100, 64, 0, 0));
+        assertFalse(HomeRange.outside(home, false, 100, 64, 0, HomeRange.LEASH_SLACK), "slack for chasing sheep");
+        assertFalse(HomeRange.outside(home, false, 0, 94, 0, 0));
+        assertTrue(HomeRange.outside(home, false, 0, 95, 0, 0), "more than 30 blocks above");
+        assertTrue(HomeRange.outside(home, false, 0, 33, 0, 0), "more than 30 blocks below");
+        assertFalse(HomeRange.outside(home, true, 500, 500, 500, 0), "geared players roam freely");
+        assertFalse(HomeRange.outside(null, false, 500, 500, 500, 0), "no home yet, no range");
+    }
+
+    @Test
+    void searchSweepsARingAroundHomeInsteadOfCrissCrossing() {
+        int[] home = {100, 70, -50};
+        for (int attempt = 0; attempt < 7; attempt++) {
+            int[] here = HomeRange.searchTarget(home, attempt, HomeRange.HUNT_RANGE);
+            int[] next = HomeRange.searchTarget(home, attempt + 1, HomeRange.HUNT_RANGE);
+            double hop = Math.hypot(next[0] - here[0], next[2] - here[2]);
+            assertTrue(hop < 30, "neighbouring compass points, not across home: " + hop);
+            assertEquals(32, HomeRange.distance(home, here[0], here[2]), 1.0, "first ring");
+        }
+        assertEquals(56, HomeRange.distance(home, HomeRange.searchTarget(home, 8, 96)[0],
+                HomeRange.searchTarget(home, 8, 96)[2]), 1.0, "then the next ring out");
+        for (int attempt = 0; attempt < 40; attempt++) {
+            int[] near = HomeRange.searchTarget(home, attempt, HomeRange.RADIUS);
+            assertFalse(HomeRange.outside(home, false, near[0], 64, near[2], 0), "log and explore searches stay in range");
+            int[] far = HomeRange.searchTarget(home, attempt, HomeRange.HUNT_RANGE);
+            assertTrue(HomeRange.distance(home, far[0], far[2]) <= HomeRange.HUNT_RANGE);
+            assertEquals(home[1], far[1]);
+        }
+    }
+
+    @Test
+    void searchWalksNameOnlyTheColumnSoBaritoneNeverDigsDown() {
+        int[] target = HomeRange.searchTarget(new int[] {38, 63, -8}, 0, HomeRange.HUNT_RANGE);
+        assertEquals("goto " + target[0] + " " + target[2], HomeRange.surfaceGoto(target));
+        assertEquals(3, HomeRange.surfaceGoto(target).split(" ").length, "no height: Baritone picks the ground level");
+    }
+
+    @Test
+    void describeTellsTheModelTheRule() {
         assertTrue(HomeRange.describe(new int[] {1, 2, 3}, false, true)
-                .contains("no fixed travel radius"));
+                .contains("96 blocks (6 chunks) horizontally and 30 blocks above or below home"));
         assertTrue(HomeRange.describe(null, false, false).contains("none yet"));
     }
 

@@ -86,8 +86,8 @@ class SafetyAndMiningTest {
     }
 
     @Test
-    void unequippedPlayerOnlyMinesExposedLitShallowBlocks() {
-        MiningPolicy.Site cave = site(0, 40, 0, 0, false, 25, 5);
+    void unequippedPlayerOnlyMinesShallowBlocks() {
+        MiningPolicy.Site cave = site(0, 40, 0, 0, false, 45, 5);
         MiningPolicy.Site outcrop = site(20, 70, 0, 15, true, 0, 20);
         assertFalse(MiningPolicy.safe(cave, false));
         assertTrue(MiningPolicy.safe(outcrop, false));
@@ -96,14 +96,14 @@ class SafetyAndMiningTest {
 
     @Test
     void caveGearAllowsTheNearestDeposit() {
-        MiningPolicy.Site cave = site(0, 40, 0, 0, false, 25, 5);
+        MiningPolicy.Site cave = site(0, 40, 0, 0, false, 45, 5);
         MiningPolicy.Site outcrop = site(20, 70, 0, 15, true, 0, 20);
         assertEquals(Optional.of(cave), MiningPolicy.choose(List.of(cave, outcrop), true, List.of()));
     }
 
     @Test
     void litButDeepIsStillUnsafeWithoutGear() {
-        assertFalse(MiningPolicy.safe(site(0, 40, 0, 14, false, 20, 5), false));
+        assertFalse(MiningPolicy.safe(site(0, 40, 0, 14, false, 31, 5), false));
         assertTrue(MiningPolicy.safe(site(0, 64, 0, 14, false, 4, 5), false));
     }
 
@@ -117,11 +117,11 @@ class SafetyAndMiningTest {
 
     @Test
     void noAcceptableSiteExplainsWhy() {
-        String reason = MiningPolicy.rejection("minecraft:stone", List.of(site(0, 40, 0, 0, false, 25, 5)),
+        String reason = MiningPolicy.rejection("minecraft:stone", List.of(site(0, 40, 0, 0, false, 45, 5)),
                 List.of("pickaxe", "weapon"));
         assertTrue(reason.startsWith("MINE_FAILED_UNSAFE_SITE"));
         assertTrue(reason.contains("missing pickaxe, weapon"));
-        assertTrue(MiningPolicy.choose(List.of(site(0, 40, 0, 0, false, 25, 5)), false, List.of()).isEmpty());
+        assertTrue(MiningPolicy.choose(List.of(site(0, 40, 0, 0, false, 45, 5)), false, List.of()).isEmpty());
     }
 
     @Test
@@ -135,7 +135,7 @@ class SafetyAndMiningTest {
         // Trunk side under a dark canopy at night: no sky, low light, but at surface level.
         assertTrue(MiningPolicy.safe(site(0, 70, 0, 3, false, 0, 6), false));
         assertTrue(MiningPolicy.safe(site(0, 70, 0, 3, false, 1, 6), false));
-        assertFalse(MiningPolicy.safe(site(0, 60, 0, 3, false, 5, 6), false), "a dark pit is still unsafe");
+        assertTrue(MiningPolicy.safe(site(0, 60, 0, 3, false, 5, 6), false), "darkness is handled by torches");
     }
 
     @Test

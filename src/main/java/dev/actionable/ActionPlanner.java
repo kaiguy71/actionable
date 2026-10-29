@@ -18,6 +18,10 @@ import java.util.concurrent.Executors;
 
 final class ActionPlanner {
     private static final int MAX_COMMAND_LENGTH = 256;
+    /** Model-written plans are cut to this many steps; code-built tech-tree plans are bounded by the tree. */
+    static final int MAX_STEPS = 8;
+    /** Characters of an Ollama error body kept in the failure message, so an HTTP 400 says why. */
+    static final int ERROR_BODY_LIMIT = 200;
     static final Set<String> MENU_OPS = Set.of("read", "quick_move", "move", "drop", "close");
     private static final Set<String> ALLOWED_COMMANDS =
             Set.of("mine", "goto", "cancel");
@@ -304,22 +308,14 @@ final class ActionPlanner {
     private final HttpClient http = HttpClient.newBuilder()
             .connectTimeout(Duration.ofSeconds(5))
             .build();
-    private volatile ExecutorService executor = newExecutor();
-
-    private static ExecutorService newExecutor() {
-        return Executors.newSingleThreadExecutor(task -> {
-            Thread thread = new Thread(task, "actionable-planner");
-            thread.setDaemon(true);
-            return thread;
-        });
-    }
-
-    /** Interrupts any in-flight or queued model request so a stale answer never blocks the next one. */
-    synchronized void cancelPending() {
-        pendingImage = null;
-        executor.shutdownNow();
-        executor = newExecutor();
-    }
+    // One worker for the planner's lifetime. Stale work is not interrupted: the preflight in submit skips
+    // queued requests and settlement discards late results, so every future still completes and every
+    // TaskControl owner is released (shutdownNow left discarded futures incomplete and owners stuck).
+    private final ExecutorService executor = Executors.newSingleThreadExecutor(task -> {
+        Thread thread = new Thread(task, "actionable-planner");
+        thread.setDaemon(true);
+        return thread;
+    });
 
     private volatile String pendingImage;
 
@@ -329,19 +325,43 @@ final class ActionPlanner {
     }
 
     CompletableFuture<ActionPlan> plan(String task, String synopsis, String lastAction, String lastResult,
-            String planContext, String history) {
-        return CompletableFuture.supplyAsync(
-                () -> loggedRequest("action", () -> requestPlan(task, synopsis, lastAction, lastResult, planContext, history)), executor);
+            String planContext, String history, java.util.function.BooleanSupplier stillCurrent) {
+        return submit("action", stillCurrent,
+                () -> requestPlan(task, synopsis, lastAction, lastResult, planContext, history));
     }
 
-    CompletableFuture<java.util.List<String>> decompose(String task, String synopsis, String briefing) {
-        return CompletableFuture.supplyAsync(
-                () -> loggedRequest("decomposition", () -> requestSteps(task, synopsis, briefing)), executor);
+    CompletableFuture<java.util.List<String>> decompose(String task, String synopsis, String briefing,
+            java.util.function.BooleanSupplier stillCurrent) {
+        return submit("decomposition", stillCurrent, () -> requestSteps(task, synopsis, briefing));
     }
 
-    CompletableFuture<GoalChoice> chooseGoal(String synopsis, String briefing, String achieved, String attempted) {
-        return CompletableFuture.supplyAsync(
-                () -> loggedRequest("director", () -> requestGoal(synopsis, briefing, achieved, attempted)), executor);
+    CompletableFuture<GoalChoice> chooseGoal(String synopsis, String briefing, String achieved, String attempted,
+            java.util.function.BooleanSupplier stillCurrent) {
+        return submit("director", stillCurrent, () -> requestGoal(synopsis, briefing, achieved, attempted));
+    }
+
+    /**
+     * Runs one model request on the planner thread. {@code stillCurrent} is checked when the request
+     * reaches the front of the queue, immediately before the model call, so a request that went stale
+     * while queued never calls Ollama or the Claude CLI. The skipped request completes with
+     * {@link StaleRequestException}, which the client discards during settlement.
+     */
+    <T> CompletableFuture<T> submit(String stage, java.util.function.BooleanSupplier stillCurrent,
+            java.util.function.Supplier<T> request) {
+        return CompletableFuture.supplyAsync(() -> {
+            if (!stillCurrent.getAsBoolean()) {
+                ActionableLog.LOGGER.info("[Actionable] model_request_skipped stage={} reason=stale", stage);
+                throw new StaleRequestException(stage);
+            }
+            return loggedRequest(stage, request);
+        }, executor);
+    }
+
+    /** A queued request that went stale before its model call began. Not a backend failure. */
+    static final class StaleRequestException extends java.util.concurrent.CancellationException {
+        StaleRequestException(String stage) {
+            super("STALE_REQUEST_SKIPPED: " + stage);
+        }
     }
 
     private GoalChoice requestGoal(String synopsis, String briefing, String achieved, String attempted) {
@@ -372,8 +392,9 @@ final class ActionPlanner {
         return new GoalChoice(goal, cleanText(chosen, "why", "", 200).strip());
     }
 
-    CompletableFuture<Boolean> checkStep(String objective, String inventory, String recent) {
-        return CompletableFuture.supplyAsync(() -> loggedRequest("judge", () -> requestStepVerdict(objective, inventory, recent)), executor);
+    CompletableFuture<Boolean> checkStep(String objective, String inventory, String recent,
+            java.util.function.BooleanSupplier stillCurrent) {
+        return submit("judge", stillCurrent, () -> requestStepVerdict(objective, inventory, recent));
     }
 
     private boolean requestStepVerdict(String objective, String inventory, String recent) {
@@ -482,7 +503,8 @@ final class ActionPlanner {
         try {
             HttpResponse<String> response = http.send(request, HttpResponse.BodyHandlers.ofString());
             if (response.statusCode() < 200 || response.statusCode() >= 300) {
-                throw new IllegalStateException("Ollama returned HTTP " + response.statusCode());
+                throw new IllegalStateException("Ollama returned HTTP " + response.statusCode()
+                        + errorExcerpt(response.body()));
             }
             JsonObject responseJson = JsonParser.parseString(response.body()).getAsJsonObject();
             return responseJson.getAsJsonObject("message").get("content").getAsString();
@@ -510,6 +532,9 @@ final class ActionPlanner {
                     .strip();
             if (!step.isBlank()) {
                 steps.add(step);
+            }
+            if (steps.size() == MAX_STEPS) {
+                break;
             }
         }
         return steps;
@@ -711,6 +736,15 @@ final class ActionPlanner {
         message.addProperty("role", role);
         message.addProperty("content", content);
         return message;
+    }
+
+    /** A bounded one-line excerpt of an error response body (control characters removed); empty without one. */
+    static String errorExcerpt(String body) {
+        if (body == null || body.isBlank()) {
+            return "";
+        }
+        String line = body.replaceAll("\\p{Cntrl}+", " ").strip();
+        return ": " + (line.length() <= ERROR_BODY_LIMIT ? line : line.substring(0, ERROR_BODY_LIMIT) + "...");
     }
 
     static String safeMessage(Throwable throwable) {

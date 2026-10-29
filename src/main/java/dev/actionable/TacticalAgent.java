@@ -38,7 +38,23 @@ final class TacticalAgent {
     private static final int SHRIEKER_RADIUS = 16;
     private static final long STALE_NANOS = 3_000_000_000L;
 
-    private record Answer(GemmaClient.Outcome outcome, long at, long latencyMs) { }
+    /** One Gemma reply, tagged with the TaskControl generation it was requested in. */
+    private record Answer(GemmaClient.Outcome outcome, long at, long latencyMs, long generation) { }
+
+    /**
+     * The request generation (TaskControl's). Deadline integration: tactical requests are not owned by
+     * TaskControl yet, but a reply from an older generation is never applied, and nothing here changes
+     * the generation or planner ownership.
+     */
+    private final java.util.function.LongSupplier generation;
+
+    TacticalAgent() {
+        this(() -> 0L);
+    }
+
+    TacticalAgent(java.util.function.LongSupplier generation) {
+        this.generation = java.util.Objects.requireNonNull(generation, "generation");
+    }
 
     private final GemmaClient gemma = new GemmaClient();
     private final AtomicReference<Answer> latest = new AtomicReference<>();
@@ -128,7 +144,7 @@ final class TacticalAgent {
         TacticalState state = snapshot(client, target);
         if (tick - lastPush >= PUSH_INTERVAL && !pending) {
             lastPush = tick;
-            push(state);
+            push(state, generation.getAsLong());
         }
         Tactic tactic = choose(state);
         if (leaving) {
@@ -173,6 +189,11 @@ final class TacticalAgent {
             hudSource = Source.PENDING;
             return TacticBook.enforce(state, TacticBook.defaultFor(state));
         }
+        if (answer.generation() != generation.getAsLong()) {
+            // Requested before the task or the engagement changed: stale, so the deterministic default applies.
+            hudSource = Source.DEFAULT;
+            return TacticBook.enforce(state, TacticBook.defaultFor(state));
+        }
         hudLatency = answer.latencyMs();
         if (!answer.outcome().ok()) {
             hudSource = Source.FALLBACK;
@@ -186,14 +207,18 @@ final class TacticalAgent {
         return TacticBook.enforce(state, answer.outcome().decision().tactic());
     }
 
-    private void push(TacticalState state) {
+    private void push(TacticalState state, long requestGeneration) {
+        if (requestGeneration != generation.getAsLong()) {
+            // Preflight: a request whose generation is already stale is never sent.
+            return;
+        }
         pending = true;
         long started = System.nanoTime();
         gemma.decide(state).whenComplete((outcome, error) -> {
             GemmaClient.Outcome result = error != null || outcome == null
                     ? new GemmaClient.Outcome(null, "client error") : outcome;
             long latency = (System.nanoTime() - started) / 1_000_000;
-            latest.set(new Answer(result, System.nanoTime(), latency));
+            latest.set(new Answer(result, System.nanoTime(), latency, requestGeneration));
             if (result.ok()) {
                 recordLatency(latency);
             } else {

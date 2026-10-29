@@ -39,10 +39,23 @@ public final class ActionableClient implements ClientModInitializer {
     private boolean enabled = true;
     private boolean debugEnabled;
     private boolean debugDetailed;
-    private boolean planning;
+    /** The one owner of model-request work (DIRECTOR, DECOMPOSITION, JUDGE, ACTION) and its generation. */
+    private final TaskControl taskControl = new TaskControl();
+    /**
+     * Deadline integration: every task end and replacement invalidates through this boundary once. Its
+     * slot claiming and pending replacement are not wired yet; see the deadline debt in the report.
+     */
+    private final TaskTransition transition = new TaskTransition(taskControl);
+    /** The latest Baritone cancel, requested or unknown; null when the running belief describes Baritone. */
+    private TaskTransition.CancelRecord cancelRecord;
+    /** True after a model use_block/menu action left a container screen open; closed when the task ends. */
+    private boolean agentMenuOpen;
+    /** Completion evidence, final-review retries and replan budget of the current task (see TaskCompletion). */
+    private final TaskCompletion.Tracker completion = new TaskCompletion.Tracker();
+    /** Tick of the latest placement request; its block is read back only in a later observation. */
+    private long lastPlacementTick = TaskCompletion.NO_PLACEMENT;
     private boolean baritoneCommandRunning;
     private String currentBaritoneCommand = "";
-    private long generation;
     private long clientTick;
     private long baritoneCommandStartedAt;
     private long lastBaritoneMovementAt;
@@ -69,15 +82,12 @@ public final class ActionableClient implements ClientModInitializer {
     private static final int TRAVEL_LEG = 500;
     private static final int GOAL_MEMORY = 20;
     private boolean autonomous;
-    private boolean choosingGoal;
     private boolean escaping;
     private boolean defending;
     private int ticksUntilGoal;
     private long taskStartedAtTick;
     private final java.util.ArrayDeque<String> achievedGoals = new java.util.ArrayDeque<>();
     private final java.util.ArrayDeque<String> attemptedGoals = new java.util.ArrayDeque<>();
-    private boolean decomposing;
-    private boolean judging;
     private boolean stepJudged;
     private final java.util.ArrayDeque<String> history = new java.util.ArrayDeque<>();
     private static final int AVOID_MEMORY = 4;
@@ -127,12 +137,13 @@ public final class ActionableClient implements ClientModInitializer {
     private int wanderAttempts;
     private int whiteFlagRestarts;
     private long nextTorchTick;
+    /**
+     * At the completion boundary: no step or model action runs until evidence, or the bounded final review when
+     * evidence cannot decide, settles the task.
+     */
     private boolean finalCheck;
-    /** Set when code (inventory/world facts) already confirmed the last step, so no model re-check is needed. */
-    private boolean codeVerified;
     /** Compass direction of the running travel leg, or empty/null when the running command is not one. */
     private String travelDirection;
-    private boolean finalChecked;
     /** 0 = not eating, 1 = waiting for Baritone to let go of the keys, 2 = eating. */
     private int eatPhase;
     private long eatStartedAt;
@@ -276,13 +287,26 @@ public final class ActionableClient implements ClientModInitializer {
                 ActionableLog.LOGGER.info("[Actionable] baritone_feedback {}", ActionableLog.text(text));
                 baritoneStatus = compact(text, 140);
                 lastResult = "Baritone feedback: " + baritoneStatus;
-                if (text.contains("Error") || text.contains("error")
+                if (TaskCompletion.mineNoPath(text)) {
+                    // Baritone gave the mine up. The idle that follows is not success: the step stays open, and
+                    // only the step's bounded re-send or a replan follows.
+                    errorCode = "MINE_FAILED_NO_PATH";
+                    lastError = baritoneStatus;
+                    baritoneCommandRunning = false;
+                    currentBaritoneCommand = "";
+                    lastResult = "MINE_FAILED_NO_PATH: Baritone found no path to the target and canceled the mine;"
+                            + " the step is not done. " + baritoneStatus;
+                    ActionableLog.LOGGER.info("[Actionable] mine_failed_no_path {}", ActionableLog.text(text));
+                    if (activeTask != null && !taskControl.busy()) {
+                        ticksUntilPlan = 0;
+                    }
+                } else if (text.contains("Error") || text.contains("error")
                         || text.contains("Unknown command") || text.contains("insufficient permissions")) {
                     errorCode = "BARITONE_COMMAND_REJECTED";
                     lastError = baritoneStatus;
                     baritoneCommandRunning = false;
                     lastResult = "Baritone rejected the last command: " + lastError;
-                    if (activeTask != null && !planning) {
+                    if (activeTask != null && !taskControl.busy()) {
                         ticksUntilPlan = 0;
                     }
                 }
@@ -294,8 +318,16 @@ public final class ActionableClient implements ClientModInitializer {
             if (tickDeath(client)) {
                 return;
             }
-            flushQueuedBaritone(client);
             updateBaritoneProgress(client);
+            // CLEANUP_FAILED is an execution barrier: the old task's state cannot be trusted, so the cleanup-only
+            // retry is the only task work, and the tick ends here even when that retry succeeds.
+            if (transition.cleanupFailed()) {
+                if (enabled && clientTick % 20 == 0) {
+                    retryFailedCleanup(client);
+                }
+                return;
+            }
+            flushQueuedBaritone(client);
             tickUnstick(client);
             tickJumpPlace(client);
             tickCraft(client);
@@ -335,18 +367,18 @@ public final class ActionableClient implements ClientModInitializer {
             if (enabled && autonomous && !escaping && clientTick % 20 == 0) {
                 String escape = dangerEscape(client);
                 if (escape != null) {
-                    stopBaritone(client);
+                    // startGoal's REFLEX_START transition sends the one Baritone cancel when it is believed running.
                     escaping = true;
                     retreating = false;
                     startGoal(client, "escape immediate danger", java.util.List.of(escape));
                 }
             }
-            if (enabled && autonomous && activeTask == null && !choosingGoal && !decomposing && !nightRoutine
+            if (enabled && autonomous && activeTask == null && !taskControl.busy() && !nightRoutine
                     && client.player != null && client.level != null && ticksUntilGoal-- <= 0) {
                 requestGoalSelection(client);
             }
             // Night, return-home and hunting are run by code; the model is not consulted while they run.
-            if (enabled && activeTask != null && !planning && !decomposing && !judging && (!nightRoutine || nightJob)
+            if (enabled && activeTask != null && !taskControl.busy() && (!nightRoutine || nightJob)
                     && !returningHome && pendingJumpPlace == null && pendingCraft == null && pendingHunt == null
                     && pendingBreak == null && pendingSmelt == null && pendingStairs == null && eatPhase == 0
                     && ticksUntilPlan-- <= 0) {
@@ -382,41 +414,31 @@ public final class ActionableClient implements ClientModInitializer {
             return;
         }
 
-        // A new /action is a clean slate: nothing from earlier tasks may leak into this one.
+        // A new /action is a clean slate: nothing from earlier tasks may leak into this one. One hard
+        // replacement invalidates the old task once (every in-flight model result becomes stale), requests a
+        // Baritone cancel whatever the running belief says, and clears the old task's local work and state.
+        if (!invalidateTask(client, TaskTransition.Kind.MANUAL_REPLACEMENT, "replaced by /action").clean()) {
+            tell(client, "Could not clear the previous task yet (cleanup failed); try /action again shortly.");
+            return;
+        }
         if (!awaitingRespawn) {
             deathPos = null;
         }
-        client.getConnection().sendChat("#stop");
-        baritoneCommandRunning = false;
-        currentBaritoneCommand = "";
-        pendingMine = null;
-        mineStart = null;
-        pendingCraft = null;
         achievedGoals.clear();
         attemptedGoals.clear();
         avoidAreas.clear();
-        choosingGoal = false;
-        decomposing = false;
-        judging = false;
         escaping = false;
         retreating = false;
-        planner.attachImage(null);
-        planner.cancelPending();
         finalCheck = false;
-        codeVerified = false;
-        finalChecked = false;
-        generation++;
         activeTask = prompt;
         taskOrigin = java.util.Objects.requireNonNull(client.player).blockPosition();
         lastAction = "";
         currentGoal = "Planning first step";
         lastResult = "Waiting for planner";
         baritoneStatus = "No response captured";
-        baritoneCommandRunning = false;
         pendingJumpPlace = null;
         errorCode = "none";
         lastError = "none";
-        planning = false;
         ticksUntilPlan = 0;
         taskSteps = java.util.List.of();
         currentStep = 0;
@@ -430,6 +452,170 @@ public final class ActionableClient implements ClientModInitializer {
         noteAttempt(prompt);
         tell(client, "Planning steps for: " + prompt);
         requestDecomposition(client);
+    }
+
+    /**
+     * Deadline integration's one task boundary: ends or replaces the task in the slot exactly once. The
+     * request generation advances first, so every in-flight model result is stale before any task field
+     * changes; then at most one Baritone cancel, the task-owned local work, and the task state. A failed
+     * cleanup is logged and leaves the CLEANUP_FAILED barrier up until the cleanup-only retry succeeds.
+     */
+    private TaskTransition.Report invalidateTask(Minecraft client, TaskTransition.Kind kind, String reason) {
+        TaskTransition.Report report;
+        try {
+            report = transition.invalidateTask(kind, reason, new ClientCleanup(client));
+        } catch (TaskTransition.CleanupFailedException failure) {
+            report = failure.report();
+            errorCode = "TASK_CLEANUP_FAILED";
+            lastError = "Cleanup of the previous task failed (" + failure.getCause().getClass().getSimpleName()
+                    + "); retrying";
+            ActionableLog.LOGGER.error("[Actionable] TASK_CLEANUP_FAILED: kind={} reason={} generation={}",
+                    kind, ActionableLog.text(reason), report.generation(), failure);
+        }
+        if (report.executorFailure() != null) {
+            ActionableLog.LOGGER.warn("[Actionable] executor_cancel_failed kind={} generation={}",
+                    kind, report.generation(), report.executorFailure());
+        }
+        ActionableLog.LOGGER.info("[Actionable] task_invalidated kind={} reason={} generation={} executor={}"
+                + " nested={} clean={}", kind, ActionableLog.text(reason), report.generation(), report.executor(),
+                report.nested(), report.clean());
+        return report;
+    }
+
+    /** The cleanup-only retry behind the CLEANUP_FAILED barrier: no reinvalidation, no executor cancel. */
+    private void retryFailedCleanup(Minecraft client) {
+        if (!transition.cleanupFailed()) {
+            return;
+        }
+        long generationBefore = taskControl.generation();
+        TaskTransition.CancelRecord cancelBefore = cancelRecord;
+        TaskTransition.Recovery recovery = transition.retryCleanup(new ClientCleanup(client));
+        if (taskControl.generation() != generationBefore || cancelRecord != cancelBefore) {
+            ActionableLog.LOGGER.error("[Actionable] TASK_CLEANUP_RETRY_INVARIANT: generation {} -> {}, cancel record changed={}",
+                    generationBefore, taskControl.generation(), cancelRecord != cancelBefore);
+        }
+        if (!recovery.clean()) {
+            if (recovery.failure() != null) {
+                ActionableLog.LOGGER.warn("[Actionable] task_cleanup_retry_failed generation={} cause={}",
+                        generationBefore, recovery.failure().getCause().getClass().getSimpleName());
+            }
+            return;
+        }
+        if (errorCode.equals("TASK_CLEANUP_FAILED")) {
+            errorCode = "none";
+            lastError = "none";
+        }
+        // The slot is clean and empty, so overlay flags set for a task that never installed must not linger.
+        escaping = false;
+        retreating = false;
+        returningHome = false;
+        nightJob = false;
+        lastResult = "Recovered from a failed task cleanup";
+        currentGoal = "Idle";
+        ActionableLog.LOGGER.info("[Actionable] task_cleanup_recovered generation={}", generationBefore);
+    }
+
+    /** ActionableClient's side of a task transition; TaskTransition calls each step once, in order. */
+    private final class ClientCleanup implements TaskTransition.Cleanup {
+        private final Minecraft client;
+
+        ClientCleanup(Minecraft client) {
+            this.client = client;
+        }
+
+        @Override
+        public TaskTransition.ExecutorView executorView() {
+            // Same running test the teammate stopBaritone used: the belief, or the live Baritone probe.
+            boolean believedRunning = baritoneCommandRunning
+                    || BaritoneProbe.query().map(BaritoneProbe.State::active).orElse(false);
+            return new TaskTransition.ExecutorView(believedRunning, baritoneLoaded(), client.getConnection() != null);
+        }
+
+        @Override
+        public void sendExecutorCancel() {
+            requestBaritoneCancel(java.util.Objects.requireNonNull(client.getConnection()));
+            lastCancelTick = clientTick;
+        }
+
+        @Override
+        public void markExecutorUnknown() {
+            markBaritoneUnknown();
+        }
+
+        @Override
+        public void clearLocalWork() {
+            // Plain field resets first: none of them can throw.
+            queuedBaritone = null;
+            pendingJumpPlace = null;
+            pendingMine = null;
+            mineStart = null;
+            pendingHunt = null;
+            // Eating is task-independent and may finish, but it never resumes the old task's Baritone command.
+            eatResume = null;
+            surfaceTarget = null;
+            travelDirection = null;
+            // A screenshot captured for the old task is never sent with the next one.
+            planner.attachImage(null);
+            // House-mine and furnace work; the executor cancel above already covers their Baritone use.
+            pendingStairs = null;
+            morningPending = false;
+            cancelSmelt(client);
+            if (agentMenuOpen) {
+                agentMenuOpen = false;
+                if (containerOpen(client)) {
+                    java.util.Objects.requireNonNull(client.player).closeContainer();
+                }
+            }
+            cancelBreak(client);
+            // Last: the craft cancel clicks inventory slots, so its failure cannot leave the other local work.
+            cancelCraft(client);
+        }
+
+        @Override
+        public void clearTaskState() {
+            // Overlay flags (escaping, retreating, returningHome, nightJob) stay with the callers, which set or
+            // clear them around the transition exactly as the teammate code did.
+            activeTask = null;
+            taskOrigin = null;
+            taskSteps = java.util.List.of();
+            currentStep = 0;
+            stepJudged = false;
+            stepActionTaken = false;
+            directStep = null;
+            replans = 0;
+            finalCheck = false;
+            completion.reset();
+            ticksUntilPlan = 0;
+        }
+    }
+
+    private void logRequestStarted(TaskControl.Request token) {
+        ActionableLog.LOGGER.info("[Actionable] model_request_owned stage={} request={} generation={}",
+                token.stage(), token.id(), token.generation());
+    }
+
+    private void rejectBusyRequest(TaskControl.Stage requested) {
+        ActionableLog.LOGGER.warn("[Actionable] MODEL_REQUEST_REJECTED_BUSY: requested={} active={} generation={}",
+                requested, taskControl.busyStage().map(Enum::name).orElse("none"), taskControl.generation());
+    }
+
+    private static void logDiscardedResult(TaskControl.Request token, TaskControl.Settlement settlement) {
+        ActionableLog.LOGGER.info("[Actionable] model_result_discarded stage={} request={} settlement={}",
+                token.stage(), token.id(), settlement);
+    }
+
+    /** HUD label for the model stage that owns the request slot. */
+    static String requestStageLabel(TaskControl.Stage stage) {
+        return switch (stage) {
+            case DIRECTOR -> "choosing goal";
+            case DECOMPOSITION -> "decomposing";
+            case JUDGE -> "judging";
+            case ACTION -> "planning";
+        };
+    }
+
+    private static boolean containerOpen(Minecraft client) {
+        return client.player != null && client.player.containerMenu != client.player.inventoryMenu;
     }
 
     private void requestGoalSelection(Minecraft client) {
@@ -482,16 +668,34 @@ public final class ActionableClient implements ClientModInitializer {
             return;
         }
 
-        long requestGeneration = ++generation;
-        choosingGoal = true;
-        currentGoal = "Choosing a goal";
-        planner.chooseGoal(synopsis, briefing, joined(achievedGoals), joined(attemptedGoals))
-                .whenComplete((choice, error) -> client.execute(() -> {
-                    if (requestGeneration != generation) {
+        java.util.Optional<TaskControl.Request> begun = taskControl.begin(TaskControl.Stage.DIRECTOR);
+        if (begun.isEmpty()) {
+            rejectBusyRequest(TaskControl.Stage.DIRECTOR);
+            ticksUntilGoal = 20;
+            return;
+        }
+        TaskControl.Request token = begun.get();
+        java.util.concurrent.CompletableFuture<ActionPlanner.GoalChoice> future;
+        try {
+            currentGoal = "Choosing a goal";
+            future = planner.chooseGoal(synopsis, briefing, joined(achievedGoals), joined(attemptedGoals),
+                    () -> taskControl.isGenerationCurrent(token));
+        } catch (RuntimeException failure) {
+            taskControl.settleIfOwner(token);
+            throw failure;
+        }
+        logRequestStarted(token);
+        future.whenComplete((choice, error) -> client.execute(() -> {
+                    TaskControl.Settlement settlement = taskControl.settleIfOwner(token);
+                    if (!settlement.applicable()) {
+                        logDiscardedResult(token, settlement);
                         return;
                     }
-                    choosingGoal = false;
                     if (!enabled || !autonomous || client.player == null || client.level == null) {
+                        return;
+                    }
+                    if (activeTask != null) {
+                        // Something else installed a task while the director was choosing; never overwrite it.
                         return;
                     }
                     String chosen = error == null && choice != null ? choice.goal().strip() : "";
@@ -740,7 +944,7 @@ public final class ActionableClient implements ClientModInitializer {
 
     /** Immediate defense does not wait for a model round trip or abandon the interrupted task. */
     private final MobFighter mobFighter = new MobFighter();
-    private final TacticalAgent tacticalAgent = new TacticalAgent();
+    private final TacticalAgent tacticalAgent = new TacticalAgent(taskControl::generation);
     private final Shelter shelter = new Shelter();
 
     private boolean tickShelter(Minecraft client) {
@@ -758,10 +962,8 @@ public final class ActionableClient implements ClientModInitializer {
                 return false;
             }
             shelter.begin(client, wanted, clientTick);
-            generation++;
-            planning = false;
-            judging = false;
-            choosingGoal = false;
+            // Request-only invalidation: in-flight model results are stale, the task itself is kept.
+            taskControl.invalidateRequests();
             pendingJumpPlace = null;
             cancelCraft(client);
             cancelBreak(client);
@@ -800,10 +1002,8 @@ public final class ActionableClient implements ClientModInitializer {
             if (!defending) {
                 defending = true;
                 ActionableLog.LOGGER.info("[Actionable] tactics_started task={}", ActionableLog.text(activeTask));
-                generation++;
-                planning = false;
-                judging = false;
-                choosingGoal = false;
+                // Request-only invalidation: in-flight model results are stale, the task itself is kept.
+                taskControl.invalidateRequests();
                 pendingJumpPlace = null;
                 cancelCraft(client);
                 cancelBreak(client);
@@ -849,18 +1049,16 @@ public final class ActionableClient implements ClientModInitializer {
             defending = true;
             ActionableLog.LOGGER.info("[Actionable] defense_started entity_id={} task={}",
                     target.getId(), ActionableLog.text(activeTask));
-            generation++;
-            planning = false;
-            judging = false;
-            choosingGoal = false;
+            boolean wasDecomposing = taskControl.busyStage()
+                    .filter(stage -> stage == TaskControl.Stage.DECOMPOSITION).isPresent();
+            // Request-only invalidation: in-flight model results are stale, the task itself is kept.
+            taskControl.invalidateRequests();
             errorCode = "none";
             lastError = "none";
-            if (decomposing) {
-                decomposing = false;
-                if (taskSteps.isEmpty() && activeTask != null) {
-                    taskSteps = java.util.List.of(activeTask);
-                    currentStep = 0;
-                }
+            if (wasDecomposing && taskSteps.isEmpty() && activeTask != null) {
+                // The discarded decomposition will never arrive: work on the task as one step.
+                taskSteps = java.util.List.of(activeTask);
+                currentStep = 0;
             }
             pendingJumpPlace = null;
             cancelCraft(client);
@@ -897,10 +1095,13 @@ public final class ActionableClient implements ClientModInitializer {
     }
 
     private void startGoal(Minecraft client, String goal, java.util.List<String> steps) {
-        generation++;
+        // The previous task (if any) ends once here, so its in-flight model results and local work cannot
+        // reach the code-started task. Callers set their own overlay flags (escaping, returningHome) first;
+        // the cleanup leaves those alone.
+        if (!invalidateTask(client, TaskTransition.Kind.REFLEX_START, goal).clean()) {
+            return;
+        }
         finalCheck = false;
-        codeVerified = false;
-        finalChecked = false;
         activeTask = goal;
         taskSteps = java.util.List.copyOf(steps);
         currentStep = 0;
@@ -916,7 +1117,6 @@ public final class ActionableClient implements ClientModInitializer {
         currentGoal = steps.isEmpty() ? goal : steps.get(0);
         errorCode = "none";
         lastError = "none";
-        planning = false;
         ticksUntilPlan = 0;
         tell(client, "Goal: " + goal);
         var connection = client.getConnection();
@@ -944,8 +1144,7 @@ public final class ActionableClient implements ClientModInitializer {
         taskSteps = java.util.List.of();
         currentStep = 0;
         finalCheck = false;
-        codeVerified = false;
-        finalChecked = false;
+        completion.reset();
         stepJudged = false;
         stepActionTaken = false;
         directStep = null;
@@ -962,29 +1161,21 @@ public final class ActionableClient implements ClientModInitializer {
         pendingJumpPlace = null;
         errorCode = "none";
         lastError = "none";
-        planning = false;
         ticksUntilPlan = 0;
         requestDecomposition(client);
     }
 
     private void abandonTask(Minecraft client, String reason) {
         tell(client, "Giving up on \"" + activeTask + "\" (" + reason + ").");
+        // One task end: stale model results, Baritone (when believed running), craft, hunt, break, smelt and
+        // house-mine work are all cleared by the boundary before the abandonment is reported.
+        invalidateTask(client, TaskTransition.Kind.TASK_ENDED, "abandoned: " + reason);
         lastResult = "Abandoned: " + reason;
         currentGoal = "Idle";
-        stopBaritone(client);
-        cancelCraft(client);
-        pendingHunt = null;
-        cancelBreak(client);
-        cancelHomeWork(client);
         nightJob = false;
         escaping = false;
         retreating = false;
         returningHome = false;
-        finalCheck = false;
-        codeVerified = false;
-        finalChecked = false;
-        activeTask = null;
-        taskSteps = java.util.List.of();
         ticksUntilGoal = 40;
     }
 
@@ -1045,15 +1236,10 @@ public final class ActionableClient implements ClientModInitializer {
         ContextCapture.clear();
         deathPos = null;
         awaitingRespawn = false;
-        planner.cancelPending();
-        generation++;
-        try {
-            cancelCraft(client);
-            cancelBreak(client);
-            cancelHomeWork(client);
-        } catch (RuntimeException e) {
-            ActionableLog.LOGGER.warn("[Actionable] reset_cancel_failed {}", ActionableLog.text(e.toString()));
-        }
+        // One session-end invalidation: in-flight model results become stale (queued ones are skipped by the
+        // planner's preflight, running ones are discarded at settlement) and task-owned work is cleared. A
+        // cleanup failure is logged and retried by the tick barrier instead of being swallowed here.
+        invalidateTask(client, TaskTransition.Kind.TASK_ENDED, "session reset");
         if (eatPhase != 0) {
             endEat(client, false);
         }
@@ -1070,10 +1256,6 @@ public final class ActionableClient implements ClientModInitializer {
         activeTask = null;
         taskSteps = java.util.List.of();
         currentStep = 0;
-        planning = false;
-        decomposing = false;
-        judging = false;
-        choosingGoal = false;
         escaping = false;
         retreating = false;
         defending = false;
@@ -1085,8 +1267,6 @@ public final class ActionableClient implements ClientModInitializer {
         morningPending = false;
         autonomous = false;
         finalCheck = false;
-        codeVerified = false;
-        finalChecked = false;
         home = null;
         homeWorld = null;
         WorldProbe.home = null;
@@ -1175,14 +1355,29 @@ public final class ActionableClient implements ClientModInitializer {
             requestNextPlan(client);
             return;
         }
-        long requestGeneration = generation;
-        decomposing = true;
-        currentGoal = "Breaking the task into steps";
-        planner.decompose(activeTask, synopsis, briefing(client, synopsis)).whenComplete((steps, error) -> client.execute(() -> {
-            if (requestGeneration != generation) {
+        java.util.Optional<TaskControl.Request> begun = taskControl.begin(TaskControl.Stage.DECOMPOSITION);
+        if (begun.isEmpty()) {
+            rejectBusyRequest(TaskControl.Stage.DECOMPOSITION);
+            ticksUntilPlan = 0;
+            return;
+        }
+        TaskControl.Request token = begun.get();
+        java.util.concurrent.CompletableFuture<java.util.List<String>> future;
+        try {
+            currentGoal = "Breaking the task into steps";
+            future = planner.decompose(activeTask, synopsis, briefing(client, synopsis),
+                    () -> taskControl.isGenerationCurrent(token));
+        } catch (RuntimeException failure) {
+            taskControl.settleIfOwner(token);
+            throw failure;
+        }
+        logRequestStarted(token);
+        future.whenComplete((steps, error) -> client.execute(() -> {
+            TaskControl.Settlement settlement = taskControl.settleIfOwner(token);
+            if (!settlement.applicable()) {
+                logDiscardedResult(token, settlement);
                 return;
             }
-            decomposing = false;
             if (!enabled || activeTask == null || client.player == null) {
                 return;
             }
@@ -1195,7 +1390,10 @@ public final class ActionableClient implements ClientModInitializer {
                 }
                 tell(client, "Could not split the task; working on it directly.");
             } else {
-                taskSteps = ProgressPlanner.normalizeSteps(steps);
+                java.util.List<String> normalized = ProgressPlanner.normalizeSteps(steps);
+                // Model-written plans stay bounded even if normalization ever changes shape.
+                taskSteps = normalized.size() <= ActionPlanner.MAX_STEPS ? normalized
+                        : java.util.List.copyOf(normalized.subList(0, ActionPlanner.MAX_STEPS));
                 announcePlan(client);
             }
             currentStep = 0;
@@ -1215,21 +1413,38 @@ public final class ActionableClient implements ClientModInitializer {
     }
 
     private void requestStepCheck(Minecraft client) {
-        long requestGeneration = generation;
-        judging = true;
-        String objective = taskSteps.get(currentStep);
-        String inventory = inventoryOf(WorldSynopsis.capture(client));
-        planner.checkStep(objective, inventory, historyText()).whenComplete((done, error) -> client.execute(() -> {
-            if (requestGeneration != generation) {
+        java.util.Optional<TaskControl.Request> begun = taskControl.begin(TaskControl.Stage.JUDGE);
+        if (begun.isEmpty()) {
+            rejectBusyRequest(TaskControl.Stage.JUDGE);
+            ticksUntilPlan = 20;
+            return;
+        }
+        TaskControl.Request token = begun.get();
+        String objective;
+        java.util.concurrent.CompletableFuture<Boolean> future;
+        try {
+            objective = taskSteps.get(currentStep);
+            String inventory = inventoryOf(WorldSynopsis.capture(client));
+            future = planner.checkStep(objective, inventory, historyText(), () -> taskControl.isGenerationCurrent(token));
+        } catch (RuntimeException failure) {
+            taskControl.settleIfOwner(token);
+            throw failure;
+        }
+        logRequestStarted(token);
+        future.whenComplete((done, error) -> client.execute(() -> {
+            TaskControl.Settlement settlement = taskControl.settleIfOwner(token);
+            if (!settlement.applicable()) {
+                logDiscardedResult(token, settlement);
                 return;
             }
-            judging = false;
             if (!enabled || activeTask == null || client.player == null) {
                 return;
             }
-            // A failed verdict must not stall the task; fall through to normal planning.
+            // A failed verdict must not stall the task; fall through to normal planning. A "done" verdict that
+            // the step's observable evidence contradicts is not accepted either.
             stepJudged = true;
-            if (error == null && Boolean.TRUE.equals(done)) {
+            if (error == null && Boolean.TRUE.equals(done)
+                    && TaskCompletion.claimAccepted(stepAssessment(client, objective).verdict())) {
                 advanceStep(client, objective);
                 return;
             }
@@ -1238,16 +1453,32 @@ public final class ActionableClient implements ClientModInitializer {
         }));
     }
 
+    /**
+     * The model claimed a step done but its evidence says otherwise (for example "mine 1 crafting_table" after
+     * Baritone found no path): the step stays open and the claim's action is not run. When the task's own
+     * end state already exists, the completion boundary finishes it instead.
+     */
+    private void rejectStepClaim(Minecraft client, String step, TaskCompletion.Assessment evidence) {
+        ActionableLog.LOGGER.info("[Actionable] step_claim_rejected step={} evidence={}", ActionableLog.text(step),
+                ActionableLog.text(evidence.evidence()));
+        if (taskAssessment(client).verdict() == TaskCompletion.Verdict.SATISFIED) {
+            reachCompletionBoundary(client, "Task objective observed; step not confirmed: " + step);
+            return;
+        }
+        lastAction = "step_complete";
+        lastResult = "STEP_CLAIM_REJECTED: \"" + compact(step, 60) + "\" is not done (" + evidence.evidence()
+                + "); keep working on this step";
+        remember(lastAction, lastResult);
+        ticksUntilPlan = 20;
+    }
+
     private void advanceStep(Minecraft client, String finished) {
         remember("finished step " + (currentStep + 1), finished);
         if (currentStep >= taskSteps.size() - 1) {
-            var connection = client.getConnection();
-            if (connection != null) {
-                finishTask(client, connection, "Final plan step finished: " + finished);
-            }
+            // Visiting every step proves nothing about the task itself: the boundary checks the evidence.
+            reachCompletionBoundary(client, "Final plan step finished: " + finished);
             return;
         }
-        codeVerified = false;
         stopBaritone(client);
         currentStep++;
         stepJudged = false;
@@ -1321,54 +1552,216 @@ public final class ActionableClient implements ClientModInitializer {
         return text.toString();
     }
 
+    /** Finishes the task. Reached only from the completion boundary, after evidence or the final review decided. */
     private void finishTask(Minecraft client, net.minecraft.client.multiplayer.ClientPacketListener connection,
             String reason) {
-        boolean codeRun = nightJob || escaping || nightRoutine || returningHome || pendingStairs != null
-                || client.player == null;
-        if (!finalCheck && !finalChecked && !codeVerified && !codeRun && activeTask != null) {
-            beginFinalCheck(client, reason);
-            return;
-        }
-        finalCheck = false;
-        finalChecked = false;
-        codeVerified = false;
+        ActionableLog.LOGGER.info("[Actionable] task_finished task={} reason={}", ActionableLog.text(activeTask),
+                ActionableLog.text(reason));
         tell(client, "Task complete.");
-        connection.sendChat("#cancel");
-        baritoneCommandRunning = false;
-        currentBaritoneCommand = "";
+        String finished = activeTask;
+        boolean wasNightJob = nightJob;
+        // TASK_FINISHED keeps the unconditional cancel the completion always sent, now recorded as
+        // cancel_requested, and clears the finished task's model ownership, local work and state once.
+        invalidateTask(client, TaskTransition.Kind.TASK_FINISHED, reason);
         lastResult = reason;
         currentGoal = "Complete";
-        if (!nightJob) {
-            noteAchieved(activeTask);
+        if (!wasNightJob) {
+            noteAchieved(finished);
         }
         nightJob = false;
         escaping = false;
         retreating = false;
-        mineStart = null;
-        pendingMine = null;
-        activeTask = null;
-        taskSteps = java.util.List.of();
         ticksUntilGoal = 60;
     }
 
-    /** Before a task counts as done, the model must look at the world once more and confirm the result. */
-    private void beginFinalCheck(Minecraft client, String reason) {
+    /**
+     * Stops at the completion boundary: no plan step or model action runs until the task's own evidence (or, when
+     * evidence cannot decide, the bounded final review) settles it. Entered when the last plan step is done or a
+     * model claims the task complete.
+     */
+    private void reachCompletionBoundary(Minecraft client, String reason) {
         finalCheck = true;
-        finalChecked = true;
+        completion.enter(reason);
         stopBaritone(client);
-        lastAction = "final_check";
-        lastResult = "FINAL_CHECK: (" + compact(reason, 80) + ") Before finishing, verify the ORIGINAL task \""
-                + compact(activeTask, 200) + "\" against the inventory and world synopsis now (and the screenshot"
-                + " attached if present). Return complete=true only if its end state really exists; otherwise"
-                + " continue with the missing work.";
+        if (agentMenuOpen) {
+            // Nothing at the boundary would close a model-opened menu, and the evidence check waits for it.
+            agentMenuOpen = false;
+            if (containerOpen(client)) {
+                java.util.Objects.requireNonNull(client.player).closeContainer();
+            }
+        }
+        currentGoal = "Checking the task is done";
+        ActionableLog.LOGGER.info("[Actionable] completion_boundary task={} reason={}", ActionableLog.text(activeTask),
+                ActionableLog.text(reason));
+        ticksUntilPlan = 1;
+    }
+
+    /** Code-run jobs (night work, reflexes, the house mine) never had a model review; their plans are their end. */
+    private boolean codeRunTask() {
+        return nightJob || escaping || nightRoutine || returningHome || pendingStairs != null;
+    }
+
+    /** Evidence is read at the boundary only while nothing the task started can still change it. */
+    private boolean completionSettled(Minecraft client) {
+        return pendingCraft == null && pendingHunt == null && pendingBreak == null && pendingSmelt == null
+                && pendingStairs == null && pendingJumpPlace == null && pendingMine == null && queuedBaritone == null
+                && eatPhase == 0 && !agentMenuOpen && !baritoneBusy(client) && !transition.cleanupFailed()
+                && TaskCompletion.placementSettled(clientTick, lastPlacementTick);
+    }
+
+    /**
+     * The completion boundary, run from requestNextPlan. True only when the bounded final review is due and its
+     * prompt is ready, so the caller sends it; every other outcome is handled here and never reaches action
+     * planning.
+     */
+    private boolean completionReviewDue(Minecraft client) {
+        if (!completionSettled(client)) {
+            if (baritoneBusy(client) && clientTick - lastCancelTick > 100) {
+                stopBaritone(client);
+            }
+            ticksUntilPlan = 5;
+            return false;
+        }
+        TaskCompletion.Assessment evidence = taskAssessment(client);
+        TaskCompletion.Decision decision = completion.decide(evidence.verdict(), codeRunTask(), clientTick);
+        if (decision != TaskCompletion.Decision.REVIEW) {
+            applyCompletion(client, evidence, decision);
+            return false;
+        }
+        if (!completion.reviewPromptReady()) {
+            beginFinalCheck(client, evidence);
+            return false;
+        }
+        // Baritone or game feedback may have replaced the last result since the prompt was prepared.
+        setFinalCheckPrompt(evidence);
+        ActionableLog.LOGGER.info("[Actionable] final_review_sent task={} attempt={}/{} evidence={}",
+                ActionableLog.text(activeTask), completion.reviewFailures() + 1, TaskCompletion.MAX_FINAL_REVIEW_ATTEMPTS,
+                ActionableLog.text(evidence.evidence()));
+        return true;
+    }
+
+    /** Acts on a boundary decision other than REVIEW. */
+    private void applyCompletion(Minecraft client, TaskCompletion.Assessment evidence,
+            TaskCompletion.Decision decision) {
+        if (decision != TaskCompletion.Decision.HOLD) {
+            ActionableLog.LOGGER.info("[Actionable] task_completion task={} verdict={} decision={} evidence={}",
+                    ActionableLog.text(activeTask), evidence.verdict(), decision, ActionableLog.text(evidence.evidence()));
+        }
+        switch (decision) {
+            case FINISH -> finishTask(client, java.util.Objects.requireNonNull(client.getConnection()),
+                    completion.reason() + " (" + evidence.evidence() + ")");
+            case REPLAN -> replanAfterMismatch(client, evidence);
+            case END -> abandonTask(client, "COMPLETION_MISMATCH: " + compact(evidence.evidence(), 80));
+            case HOLD -> holdAtBoundary(client, evidence);
+            case REVIEW -> throw new IllegalStateException("requestNextPlan sends the final review");
+        }
+    }
+
+    /** Stays at the boundary: waits for a review retry, or exposes a spent review or replan budget once. */
+    private void holdAtBoundary(Minecraft client, TaskCompletion.Assessment evidence) {
+        boolean mismatch = evidence.verdict() == TaskCompletion.Verdict.NOT_SATISFIED;
+        if (!mismatch && !completion.reviewExhausted()) {
+            ticksUntilPlan = (int) Math.max(1, completion.reviewNotBefore() - clientTick);
+            return;
+        }
+        String code = mismatch ? "COMPLETION_MISMATCH_EXHAUSTED" : "FINAL_REVIEW_EXHAUSTED";
+        if (completion.expose(code)) {
+            errorCode = code;
+            lastError = compact(evidence.evidence(), 140);
+            lastResult = code + ": the task stays open and incomplete (" + lastError + ")";
+            tell(client, "Task not confirmed [" + code + "]: " + lastError);
+            ActionableLog.LOGGER.info("[Actionable] completion_hold task={} code={} evidence={}",
+                    ActionableLog.text(activeTask), code, ActionableLog.text(evidence.evidence()));
+        }
+        // Only deterministic rechecks follow; they still finish the task if its evidence appears.
+        ticksUntilPlan = 200;
+    }
+
+    /** The plan ended but the task is observably not done: keep the task and rebuild its plan, within budget. */
+    private void replanAfterMismatch(Minecraft client, TaskCompletion.Assessment evidence) {
+        completion.replanned();
+        errorCode = "COMPLETION_MISMATCH";
+        lastError = compact(evidence.evidence(), 140);
+        lastAction = "completion_check";
+        lastResult = "COMPLETION_MISMATCH: the task is not done yet (" + lastError + "); re-planning "
+                + completion.replans() + "/" + TaskCompletion.MAX_COMPLETION_REPLANS;
+        remember(lastAction, lastResult);
+        tell(client, "Task not done yet [COMPLETION_MISMATCH]: " + lastError + "; re-planning.");
+        finalCheck = false;
+        taskSteps = java.util.List.of();
+        currentStep = 0;
+        stepJudged = false;
+        stepActionTaken = false;
+        directStep = null;
+        requestDecomposition(client);
+    }
+
+    /**
+     * A final review produced no decision (HTTP, timeout, transport, parse or provider failure). The task stays at
+     * the completion boundary: no action is dispatched and action planning does not resume. Evidence is checked
+     * again before the bounded retry.
+     */
+    private void finalReviewFailed(Minecraft client, String code, String detail) {
+        completion.reviewFailed(clientTick);
+        errorCode = code;
+        lastError = compact(detail, 140);
+        lastResult = code + ": " + lastError;
+        ActionableLog.LOGGER.info("[Actionable] final_review_failed task={} code={} attempt={}/{} detail={}",
+                ActionableLog.text(activeTask), code, completion.reviewFailures(),
+                TaskCompletion.MAX_FINAL_REVIEW_ATTEMPTS, ActionableLog.text(lastError));
+        tell(client, "Final review failed [" + code + "] (" + completion.reviewFailures() + "/"
+                + TaskCompletion.MAX_FINAL_REVIEW_ATTEMPTS + "); the task stays open: " + lastError);
+        ticksUntilPlan = TaskCompletion.FINAL_REVIEW_RETRY_TICKS;
+    }
+
+    /** The task's verdict from the inventory, the house and the world; UNKNOWN when they cannot decide. */
+    private TaskCompletion.Assessment taskAssessment(Minecraft client) {
+        return TaskCompletion.assess(activeTask, completionObservation(client), completion.taskBaseline());
+    }
+
+    private TaskCompletion.Assessment stepAssessment(Minecraft client, String step) {
+        return TaskCompletion.assess(step, completionObservation(client), completion.stepBaseline(currentStep, step));
+    }
+
+    private TaskCompletion.Observation completionObservation(Minecraft client) {
+        var player = java.util.Objects.requireNonNull(client.player);
+        var level = java.util.Objects.requireNonNull(client.level);
+        ProgressPlanner.Facts facts = facts(client);
+        boolean homeLoaded = home != null && level.hasChunk(home[0] >> 4, home[2] >> 4);
+        BlockPos feet = player.blockPosition();
+        return new TaskCompletion.Observation(clientTick, WorldProbe.inventory(player), facts, homeLoaded,
+                homeLoaded ? WorldProbe.houseCompletion(level, home) : null, tableNearby(client), feet.getX(),
+                feet.getY(), feet.getZ(), String.valueOf(level.dimension().identifier()),
+                (x, y, z) -> level.hasChunk(x >> 4, z >> 4) ? BuiltInRegistries.BLOCK.getKey(
+                        level.getBlockState(new BlockPos(x, y, z)).getBlock()).toString() : null,
+                lastPlacementTick, completion.hasSmelted());
+    }
+
+    /**
+     * Evidence cannot decide: before the task counts as done, the model looks at the world once more. Each attempt
+     * gets a fresh screenshot; the request goes out on the next planning round.
+     */
+    private void beginFinalCheck(Minecraft client, TaskCompletion.Assessment evidence) {
+        completion.reviewPromptPrepared();
+        setFinalCheckPrompt(evidence);
         tell(client, "Final check before finishing: " + compact(activeTask, 60));
-        long shotGeneration = generation;
+        long shotGeneration = taskControl.generation();
         Screenshots.capture(client, debugEnabled, image -> {
-            if (shotGeneration == generation && image != null) {
+            if (shotGeneration == taskControl.generation() && image != null) {
                 planner.attachImage(image);
             }
         });
         ticksUntilPlan = 15;
+    }
+
+    /** The review instruction the model sees as the last result; set again just before each review is sent. */
+    private void setFinalCheckPrompt(TaskCompletion.Assessment evidence) {
+        lastAction = "final_check";
+        lastResult = "FINAL_CHECK: (" + compact(completion.reason(), 80) + "; code could not decide: "
+                + compact(evidence.evidence(), 60) + ") Before finishing, verify the ORIGINAL task \""
+                + compact(activeTask, 200) + "\" against the inventory and world synopsis now (and the screenshot"
+                + " attached if present). Return complete=true only if its end state really exists; otherwise"
+                + " continue with the missing work.";
     }
 
     private void requestNextPlan(Minecraft client) {
@@ -1381,13 +1774,18 @@ public final class ActionableClient implements ClientModInitializer {
             ticksUntilPlan = 60;
             return;
         }
+        if (finalCheck && !completionReviewDue(client)) {
+            // At the completion boundary only evidence, or a due final review, may act; nothing is planned.
+            return;
+        }
+        completion.noteTaskStart(activeTask, WorldProbe.inventory(client.player));
         if (useSteps) {
             // Quantity, house and bed steps are judged from the inventory and world, without a model call.
             String step = taskSteps.get(currentStep);
+            completion.noteStepStart(currentStep, step, WorldProbe.inventory(client.player));
             java.util.Optional<Boolean> done = ProgressPlanner.stepSatisfied(step,
                     WorldProbe.inventory(client.player), tableNearby(client), facts(client));
             if (done.orElse(false)) {
-                codeVerified = true;
                 advanceStep(client, step);
                 return;
             }
@@ -1409,31 +1807,61 @@ public final class ActionableClient implements ClientModInitializer {
         if (useSteps && directStep != null && continueDirectStep(client)) {
             return;
         }
-        long requestGeneration = generation;
-        planning = true;
-        String synopsis = WorldSynopsis.capture(client) + "; " + baritoneProgress(client)
-                + (deathPos == null ? "" : "; " + deathContext());
-        String taskWithOrigin = activeTask + "\nTask prompt origin xyz: "
-                + (taskOrigin == null ? "unknown" : taskOrigin.getX() + "," + taskOrigin.getY() + "," + taskOrigin.getZ());
-        planner.plan(taskWithOrigin, synopsis, lastAction, lastResult, planContext(), historyText())
-                .whenComplete((plan, error) -> client.execute(() -> {
-            if (requestGeneration != generation) {
+        java.util.Optional<TaskControl.Request> begun = taskControl.begin(TaskControl.Stage.ACTION);
+        if (begun.isEmpty()) {
+            rejectBusyRequest(TaskControl.Stage.ACTION);
+            ticksUntilPlan = 20;
+            return;
+        }
+        TaskControl.Request token = begun.get();
+        // Whether this request is the completion boundary's final review; its answer is handled as one.
+        boolean review = finalCheck;
+        java.util.concurrent.CompletableFuture<ActionPlanner.ActionPlan> future;
+        try {
+            String synopsis = WorldSynopsis.capture(client) + "; " + baritoneProgress(client)
+                    + (deathPos == null ? "" : "; " + deathContext());
+            String taskWithOrigin = activeTask + "\nTask prompt origin xyz: "
+                    + (taskOrigin == null ? "unknown" : taskOrigin.getX() + "," + taskOrigin.getY() + "," + taskOrigin.getZ());
+            future = planner.plan(taskWithOrigin, synopsis, lastAction, lastResult, planContext(), historyText(),
+                    () -> taskControl.isGenerationCurrent(token));
+        } catch (RuntimeException failure) {
+            taskControl.settleIfOwner(token);
+            throw failure;
+        }
+        logRequestStarted(token);
+        future.whenComplete((plan, error) -> client.execute(() -> {
+            TaskControl.Settlement settlement = taskControl.settleIfOwner(token);
+            if (!settlement.applicable()) {
+                logDiscardedResult(token, settlement);
                 return;
             }
-            planning = false;
             if (!enabled || client.player == null) {
                 return;
             }
             var connection = client.getConnection();
             if (client.level == null || connection == null) {
-                activeTask = null;
+                invalidateTask(client, TaskTransition.Kind.TASK_ENDED, "game session ended");
                 errorCode = "GAME_SESSION_ENDED";
                 lastError = "World or server connection ended while waiting for a plan";
                 lastResult = lastError;
                 tell(client, "Action stopped [" + errorCode + "]: " + lastError);
                 return;
             }
+            if (review != finalCheck) {
+                // The completion boundary was entered (or left at a death) while this request was out: its answer
+                // was asked for a state that no longer exists, so evidence decides instead.
+                ActionableLog.LOGGER.info("[Actionable] completion_result_dropped review={} boundary={}", review,
+                        finalCheck);
+                ticksUntilPlan = 1;
+                return;
+            }
             if (error != null) {
+                if (review) {
+                    // A failed final review is not a planning failure: the task stays at the completion boundary,
+                    // and nothing reopens action planning or dispatches an action.
+                    finalReviewFailed(client, TaskCompletion.reviewFailureCode(error), ActionPlanner.safeMessage(error));
+                    return;
+                }
                 errorCode = plannerErrorCode(error);
                 lastError = compact(ActionPlanner.safeMessage(error), 140);
                 lastResult = errorCode + ": " + lastError;
@@ -1446,17 +1874,37 @@ public final class ActionableClient implements ClientModInitializer {
             currentGoal = plan.goal();
             tell(client, "Plan: " + plan.summary());
             if (plan.complete()) {
-                finishTask(client, connection, "Planner marked the task complete");
+                if (!review) {
+                    // A completion claim is only a claim: the boundary decides it from evidence first.
+                    reachCompletionBoundary(client, "Planner marked the task complete");
+                    return;
+                }
+                TaskCompletion.Assessment confirmed = taskAssessment(client);
+                if (confirmed.verdict() == TaskCompletion.Verdict.NOT_SATISFIED) {
+                    applyCompletion(client, confirmed, completion.decide(confirmed.verdict(), codeRunTask(), clientTick));
+                    return;
+                }
+                finishTask(client, connection, "Final review confirmed the task (" + confirmed.evidence() + ")");
                 return;
             }
-            if (finalCheck) {
+            if (review) {
+                if (plan.action().isEmpty()) {
+                    finalReviewFailed(client, "FINAL_REVIEW_NO_DECISION", plan.summary());
+                    return;
+                }
                 // The model found work left to do: continue freely on the original task.
+                completion.reviewAnswered();
                 finalCheck = false;
                 taskSteps = java.util.List.of();
                 currentStep = 0;
             } else if (plan.stepComplete() && !taskSteps.isEmpty()) {
-                codeVerified = false;
-                advanceStep(client, taskSteps.get(currentStep));
+                String claimed = taskSteps.get(currentStep);
+                TaskCompletion.Assessment evidence = stepAssessment(client, claimed);
+                if (TaskCompletion.claimAccepted(evidence.verdict())) {
+                    advanceStep(client, claimed);
+                    return;
+                }
+                rejectStepClaim(client, claimed, evidence);
                 return;
             }
             if (plan.action().isEmpty()) {
@@ -1536,6 +1984,8 @@ public final class ActionableClient implements ClientModInitializer {
                     stopBaritone(client);
                     lastAction = "use_block " + action.x() + "," + action.y() + "," + action.z();
                     lastResult = MenuActions.useBlock(client, action.x(), action.y(), action.z());
+                    // A screen opened by the model's own use_block is closed when the task ends.
+                    agentMenuOpen = agentMenuOpen || containerOpen(client);
                     reportBlockResult(client);
                     ticksUntilPlan = 10;
                 }
@@ -1543,15 +1993,18 @@ public final class ActionableClient implements ClientModInitializer {
                     lastAction = "menu " + action.command() + (action.x() >= 0 ? " " + action.x() : "")
                             + (action.y() >= 0 ? "->" + action.y() : "");
                     lastResult = MenuActions.menu(client, action.command(), action.x(), action.y());
+                    if (!containerOpen(client)) {
+                        agentMenuOpen = false;
+                    }
                     reportBlockResult(client);
                     ticksUntilPlan = 10;
                 }
                 case "screenshot" -> {
                     lastAction = "screenshot";
                     lastResult = "capturing screenshot; the image is attached to your next turn";
-                    long shotGeneration = generation;
+                    long shotGeneration = taskControl.generation();
                     Screenshots.capture(client, debugEnabled, image -> {
-                        if (shotGeneration == generation && image != null) {
+                        if (shotGeneration == taskControl.generation() && image != null) {
                             planner.attachImage(image);
                         }
                     });
@@ -2263,10 +2716,8 @@ public final class ActionableClient implements ClientModInitializer {
                     morningPending = true;
                     return;
                 }
-                activeTask = null;
-                taskSteps = java.util.List.of();
+                invalidateTask(client, TaskTransition.Kind.TASK_ENDED, "night routine: morning");
                 currentGoal = "Idle";
-                stopBaritone(client);
                 tell(client, "Morning: back to work.");
                 ticksUntilGoal = 20;
             }
@@ -2289,21 +2740,17 @@ public final class ActionableClient implements ClientModInitializer {
         if (!nightRoutine) {
             nightRoutine = true;
             nightJob = false;
-            cancelCraft(client);
-            cancelBreak(client);
-            pendingHunt = null;
+            // The night routine takes over from whatever task was running (teammate behavior, kept): one
+            // task end makes its model results stale and clears its craft, break and hunt work.
+            invalidateTask(client, TaskTransition.Kind.TASK_ENDED, "night routine started");
             returningHome = false;
-            stopBaritone(client);
-            activeTask = null;
-            taskSteps = java.util.List.of();
             ActionableLog.LOGGER.info("[Actionable] night_routine bed={}", bed != null);
         }
         if (bed != null) {
             if (nightJob && pendingStairs == null && pendingSmelt == null) {
                 // A bed exists now (perhaps just placed): stop working and sleep.
+                invalidateTask(client, TaskTransition.Kind.TASK_ENDED, "night job ended: bed available");
                 nightJob = false;
-                activeTask = null;
-                taskSteps = java.util.List.of();
             }
             if (nightJob) {
                 return;
@@ -2555,17 +3002,34 @@ public final class ActionableClient implements ClientModInitializer {
         if (bestAnchor == null) {
             return;
         }
-        int slot = Hotbar.bring(client, torch);
-        if (slot < 0) {
+        // The anchor was chosen above, before anything changed; the torch reaches the hand only through a
+        // verified preparation, and nothing else held is ever placed in its stead.
+        PlacementPreparation.Preparation preparation = placementPreparation(player, torch);
+        if (preparation.status().isFailure()) {
             return;
         }
-        int previous = player.getInventory().getSelectedSlot();
-        player.getInventory().setSelectedSlot(slot);
-        Vec3 hit = Vec3.atCenterOf(bestAnchor).add(bestFace.getStepX() * 0.5, bestFace.getStepY() * 0.5,
-                bestFace.getStepZ() * 0.5);
-        gameMode.useItemOn(player, InteractionHand.MAIN_HAND, new BlockHitResult(hit, bestFace, bestAnchor, false));
-        player.getInventory().setSelectedSlot(previous);
-        ActionableLog.LOGGER.info("[Actionable] auto_torch light={} anchor={}", here, bestAnchor.toShortString());
+        var inventory = player.getInventory();
+        int previous = inventory.getSelectedSlot();
+        if (preparation.status().requiresSwap()) {
+            // SWAP expects the source menu-slot index followed by the hotbar button index.
+            gameMode.handleContainerInput(player.containerMenu.containerId, preparation.sourceMenuSlot(),
+                    preparation.selectedHotbarIndex(), ContainerInput.SWAP, player);
+        }
+        inventory.setSelectedSlot(preparation.selectedHotbarIndex());
+        PlacementPreparation.Status verified = PlacementPreparation.verify(preparation,
+                holds(inventory.getItem(preparation.selectedHotbarIndex()), torch),
+                inventory.getSelectedSlot() == preparation.selectedHotbarIndex(),
+                holds(player.getItemInHand(InteractionHand.MAIN_HAND), torch));
+        if (verified == PlacementPreparation.Status.READY) {
+            Vec3 hit = Vec3.atCenterOf(bestAnchor).add(bestFace.getStepX() * 0.5, bestFace.getStepY() * 0.5,
+                    bestFace.getStepZ() * 0.5);
+            gameMode.useItemOn(player, InteractionHand.MAIN_HAND, new BlockHitResult(hit, bestFace, bestAnchor, false));
+            ActionableLog.LOGGER.info("[Actionable] auto_torch light={} anchor={}", here, bestAnchor.toShortString());
+        } else {
+            ActionableLog.LOGGER.info("[Actionable] auto_torch_skipped {}",
+                    ActionableLog.text(PlacementPreparation.failureResult(verified, "torch")));
+        }
+        inventory.setSelectedSlot(previous);
     }
 
     private void arrangeHotbar(Minecraft client) {
@@ -2621,7 +3085,9 @@ public final class ActionableClient implements ClientModInitializer {
         remember(lastAction, lastResult);
         ActionableLog.LOGGER.info("[Actionable] smelt {}", ActionableLog.text(result));
         furnaceReadyAt = 0;
-        if (!result.startsWith("SMELTED")) {
+        if (result.startsWith("SMELTED")) {
+            completion.smelted();
+        } else {
             // No fuel or the furnace would not open: do something else for a while.
             smeltCooldownUntil = clientTick + 2400;
         }
@@ -2654,8 +3120,7 @@ public final class ActionableClient implements ClientModInitializer {
         ActionableLog.LOGGER.info("[Actionable] house_mine {}", ActionableLog.text(result));
         if (morningPending) {
             morningPending = false;
-            activeTask = null;
-            taskSteps = java.util.List.of();
+            invalidateTask(client, TaskTransition.Kind.TASK_ENDED, "house mine: morning");
             currentGoal = "Idle";
             tell(client, "Morning: out of the mine, back to work.");
             ticksUntilGoal = 20;
@@ -2665,8 +3130,7 @@ public final class ActionableClient implements ClientModInitializer {
                 || result.startsWith("MINE_STOPPED_TIMEOUT")) {
             // Rest from the mine for two minutes; other home jobs (or waiting) come first.
             mineRestUntil = clientTick + 2400;
-            activeTask = null;
-            taskSteps = java.util.List.of();
+            invalidateTask(client, TaskTransition.Kind.TASK_ENDED, "house mine: " + compact(result, 60));
             nightJob = false;
             return;
         }
@@ -2715,11 +3179,9 @@ public final class ActionableClient implements ClientModInitializer {
             }
             if (geared || !HomeRange.outside(anchor, false, player.getBlockX(), player.getBlockY(),
                     player.getBlockZ(), -8)) {
+                invalidateTask(client, TaskTransition.Kind.TASK_ENDED, "back near home");
                 returningHome = false;
-                activeTask = null;
-                taskSteps = java.util.List.of();
                 currentGoal = "Idle";
-                stopBaritone(client);
                 tell(client, "Back near home.");
                 ticksUntilGoal = 20;
             }
@@ -2738,9 +3200,7 @@ public final class ActionableClient implements ClientModInitializer {
         }
         ActionableLog.LOGGER.info("[Actionable] home_leash distance={}",
                 Math.round(HomeRange.distance(anchor, player.getBlockX(), player.getBlockZ())));
-        cancelCraft(client);
-        pendingHunt = null;
-        stopBaritone(client);
+        // startGoal's REFLEX_START transition clears the craft and hunt and sends the one Baritone cancel.
         returningHome = true;
         startGoal(client, "return home", java.util.List.of("goto " + anchor[0] + " " + anchor[1] + " " + anchor[2]));
         goalReason = "too far from home without a stone pickaxe and a stone sword";
@@ -2778,6 +3238,12 @@ public final class ActionableClient implements ClientModInitializer {
             ActionableLog.LOGGER.info("[Actionable] direct_step_handover step={} progress={}",
                     ActionableLog.text(step), progress);
             directStep = null;
+            if (taskAssessment(client).verdict() == TaskCompletion.Verdict.SATISFIED) {
+                // Code gave up on a step after the task's own end state already exists (the table pickup after a
+                // crafted tool found no path): evidence finishes the task instead of handing the step to the model.
+                reachCompletionBoundary(client, "Task objective observed; step handed over: " + step);
+                return true;
+            }
             return false;
         }
         directResends++;
@@ -3091,10 +3557,8 @@ public final class ActionableClient implements ClientModInitializer {
             if (!safety.underground() || safety.light() > 7) {
                 tell(client, "Back in a safe, lit area.");
                 remember("retreat", "Reached safety at " + x + "," + y + "," + z);
-                stopBaritone(client);
+                invalidateTask(client, TaskTransition.Kind.TASK_ENDED, "retreat reached safety");
                 retreating = false;
-                activeTask = null;
-                taskSteps = java.util.List.of();
                 lastResult = "Retreated from a dark area without cave gear";
                 currentGoal = "Idle";
                 ticksUntilGoal = 40;
@@ -3105,7 +3569,7 @@ public final class ActionableClient implements ClientModInitializer {
 
     /** Advances as soon as the inventory shows the current step is done, instead of at the next plan. */
     private void tickStepCheck(Minecraft client) {
-        if (!enabled || activeTask == null || taskSteps.isEmpty() || finalCheck || planning || judging || decomposing
+        if (!enabled || activeTask == null || taskSteps.isEmpty() || finalCheck || taskControl.busy()
                 || pendingCraft != null || pendingJumpPlace != null || client.player == null
                 || clientTick % 20 != 0) {
             return;
@@ -3157,16 +3621,15 @@ public final class ActionableClient implements ClientModInitializer {
         if (!enabled) {
             history.clear();
         }
-        generation++;
-        planning = false;
+        // Pause keeps the task (teammate behavior); request-only invalidation makes in-flight results stale.
+        taskControl.invalidateRequests();
         cancelCraft(client);
         cancelBreak(client);
         cancelHomeWork(client);
         tell(client, "Actionable " + (enabled ? "enabled." : "disabled."));
         var connection = client.getConnection();
-        if (!enabled && client.player != null && connection != null
-                && FabricLoader.getInstance().isModLoaded("baritone")) {
-            connection.sendChat("#cancel");
+        if (!enabled && client.player != null && connection != null && baritoneLoaded()) {
+            requestBaritoneCancel(connection);
             lastResult = "Baritone cancellation requested";
         }
     }
@@ -3192,6 +3655,9 @@ public final class ActionableClient implements ClientModInitializer {
         }
         if (!awaitingRespawn) {
             awaitingRespawn = true;
+            // Death leaves the completion boundary; evidence, review retries and replans start again after it.
+            finalCheck = false;
+            completion.reset();
             deathSeenAt = clientTick;
             deathRecoveryUntil = clientTick + DEATH_RECOVERY_TICKS;
             deathPos = new int[] {player.getBlockX(), player.getBlockY(), player.getBlockZ()};
@@ -3225,7 +3691,7 @@ public final class ActionableClient implements ClientModInitializer {
         if (activeTask == null && autonomous && clientTick - deathSeenAt > 60) {
             // No model session to ask: respawn and let goal selection pick the recovery up.
             respawn(client);
-        } else if (activeTask != null && !planning && !decomposing && !judging && ticksUntilPlan-- <= 0) {
+        } else if (activeTask != null && !taskControl.busy() && ticksUntilPlan-- <= 0) {
             requestNextPlan(client);
         }
         return true;
@@ -3267,7 +3733,8 @@ public final class ActionableClient implements ClientModInitializer {
         String command = queuedBaritone;
         queuedBaritone = null;
         var connection = client.getConnection();
-        if (connection != null && client.player != null && enabled) {
+        // Without Baritone a queued "#..." command would be ordinary public chat: never send it.
+        if (connection != null && client.player != null && enabled && baritoneLoaded()) {
             connection.sendChat(command);
         }
     }
@@ -3275,6 +3742,28 @@ public final class ActionableClient implements ClientModInitializer {
     private void executeBaritone(Minecraft client,
                                  net.minecraft.client.multiplayer.ClientPacketListener connection,
                                  String command) {
+        if (!baritoneLoaded()) {
+            // Without Baritone every "#..." line would be sent to the server as public chat.
+            lastAction = command;
+            lastResult = "BARITONE_UNAVAILABLE: Baritone is not loaded, so the command was not sent";
+            errorCode = "BARITONE_UNAVAILABLE";
+            lastError = lastResult;
+            tell(client, lastResult);
+            return;
+        }
+        if (command.equals("cancel")) {
+            // A model- or code-issued cancel is recorded as requested, never as confirmed.
+            requestBaritoneCancel(connection);
+            lastCancelTick = clientTick;
+            queuedBaritone = null;
+            lastAction = command;
+            travelDirection = null;
+            pendingMine = null;
+            mineStart = null;
+            lastResult = "Baritone cancellation requested";
+            tell(client, "Baritone: cancel");
+            return;
+        }
         if (!baritoneConfigured) {
             // Baritone resets its settings each launch; make swimming expensive so it prefers land routes
             // and land-reachable blocks, and let it build from the whole inventory.
@@ -3291,37 +3780,36 @@ public final class ActionableClient implements ClientModInitializer {
             tell(client, "Keeping Baritone task running: " + command);
             return;
         }
-        if (!command.equals("cancel") && (baritoneCommandRunning
-                || BaritoneProbe.query().map(BaritoneProbe.State::active).orElse(false))) {
+        String previousCommand = currentBaritoneCommand;
+        if (baritoneCommandRunning || BaritoneProbe.query().map(BaritoneProbe.State::active).orElse(false)) {
             // A running mine does not always yield to a new goto; cancel it explicitly first.
-            connection.sendChat("#cancel");
+            requestBaritoneCancel(connection);
             lastCancelTick = clientTick;
-            if (!command.equals("cancel")) {
-                // Baritone drops a command sent in the same instant as #cancel; give it a few ticks.
-                queuedBaritone = "#" + command;
-                queuedBaritoneAt = clientTick + BARITONE_CANCEL_TICKS;
-            }
-        } else if (!command.equals("cancel") && clientTick - lastCancelTick < BARITONE_CANCEL_TICKS) {
+            // Baritone drops a command sent in the same instant as #cancel; give it a few ticks.
+            queuedBaritone = "#" + command;
+            queuedBaritoneAt = clientTick + BARITONE_CANCEL_TICKS;
+        } else if (clientTick - lastCancelTick < BARITONE_CANCEL_TICKS) {
             queuedBaritone = "#" + command;
             queuedBaritoneAt = lastCancelTick + BARITONE_CANCEL_TICKS;
         } else {
             queuedBaritone = null;
             connection.sendChat("#" + command);
         }
+        // Reset rule: Baritone runs the new command in place of the old one, so the running belief describes
+        // it again and an earlier cancel record no longer applies.
+        cancelRecord = TaskTransition.afterCommand(command, previousCommand, clientTick);
         lastAction = command;
         travelDirection = null;
         pendingMine = null;
         mineStart = null;
-        baritoneCommandRunning = !command.equals("cancel");
-        currentBaritoneCommand = baritoneCommandRunning ? command : "";
+        baritoneCommandRunning = true;
+        currentBaritoneCommand = command;
         BlockPos position = client.player == null ? null : client.player.blockPosition();
         baritoneStartPosition = position;
         lastBaritonePosition = position;
         baritoneCommandStartedAt = clientTick;
         lastBaritoneMovementAt = clientTick;
-        lastResult = baritoneCommandRunning
-                ? "Started Baritone command; " + baritoneProgress(client)
-                : "Baritone cancellation requested";
+        lastResult = "Started Baritone command; " + baritoneProgress(client);
         tell(client, "Baritone: " + command);
     }
 
@@ -3362,12 +3850,34 @@ public final class ActionableClient implements ClientModInitializer {
             return;
         }
         var connection = client.getConnection();
-        if (connection != null) {
-            connection.sendChat("#cancel");
+        if (connection != null && baritoneLoaded()) {
+            requestBaritoneCancel(connection);
             lastCancelTick = clientTick;
+        } else {
+            // A cancel was needed but could not be sent: the executor state is unknown, never idle.
+            markBaritoneUnknown();
         }
+    }
+
+    /**
+     * The one place a Baritone cancel is sent. It records the request (cancel_requested), never a
+     * confirmation: Actionable has no authoritative Baritone cancellation event.
+     */
+    private void requestBaritoneCancel(net.minecraft.client.multiplayer.ClientPacketListener connection) {
+        connection.sendChat("#cancel");
+        cancelRecord = TaskTransition.cancelRequested(currentBaritoneCommand, clientTick);
         baritoneCommandRunning = false;
         currentBaritoneCommand = "";
+    }
+
+    private void markBaritoneUnknown() {
+        cancelRecord = TaskTransition.cancelUnknown(currentBaritoneCommand, clientTick);
+        baritoneCommandRunning = false;
+        currentBaritoneCommand = "";
+    }
+
+    private static boolean baritoneLoaded() {
+        return FabricLoader.getInstance().isModLoaded("baritone");
     }
 
     private void updateBaritoneProgress(Minecraft client) {
@@ -3401,7 +3911,7 @@ public final class ActionableClient implements ClientModInitializer {
                             + " blocks from here, or pick another); otherwise act on what you found.";
                 }
                 travelDirection = null;
-                if (activeTask != null && !planning) {
+                if (activeTask != null && !taskControl.busy()) {
                     ticksUntilPlan = 0;
                 }
             }
@@ -3415,6 +3925,12 @@ public final class ActionableClient implements ClientModInitializer {
     }
 
     private String baritoneProgress(Minecraft client) {
+        if (cancelRecord != null) {
+            // A requested or unknown cancel outranks the running belief and never reads as idle or cancelled;
+            // the live probe stays alongside as separate, unvalidated evidence.
+            return TaskTransition.executorStatus(cancelRecord, baritoneCommandRunning, "", clientTick)
+                    + "," + baritoneLiveState();
+        }
         if (!baritoneCommandRunning) {
             return "baritone_task=idle," + baritoneLiveState();
         }
@@ -3594,12 +4110,15 @@ public final class ActionableClient implements ClientModInitializer {
             return "BLOCK_PLACE_FAILED_NO_HEADROOM: block above target " + target + " is "
                     + BuiltInRegistries.BLOCK.getKey(headroomState.getBlock());
         }
-        int hotbarSlot = Hotbar.bring(client, blockItem);
-        if (hotbarSlot < 0) {
-            return "BLOCK_PLACE_FAILED_MATERIAL_MISSING: " + action.block()
-                    + " is not in inventory; gather required materials before placing";
+        var inventory = player.getInventory();
+        PlacementPreparation.Preparation preparation = placementPreparation(player, blockItem);
+        if (preparation.status().isFailure()) {
+            return PlacementPreparation.failureResult(preparation.status(), action.block());
         }
 
+        // Support depends only on block states and reach, so every candidate is found before the
+        // inventory changes. There is at most one candidate per direction.
+        java.util.List<BlockHitResult> supportHits = new java.util.ArrayList<>(Direction.values().length);
         for (Direction offset : Direction.values()) {
             BlockPos supportPos = target.relative(offset);
             Direction clickedFace = offset.getOpposite();
@@ -3614,16 +4133,87 @@ public final class ActionableClient implements ClientModInitializer {
             if (player.distanceToSqr(hitLocation) > 20.25) {
                 continue;
             }
+            supportHits.add(new BlockHitResult(hitLocation, clickedFace, supportPos, false));
+        }
+        if (supportHits.isEmpty()) {
+            return "BLOCK_PLACE_FAILED_NO_SUPPORT: no reachable usable support block adjacent to " + target;
+        }
 
-            player.getInventory().setSelectedSlot(hotbarSlot);
-            player.lookAt(EntityAnchorArgument.Anchor.EYES, hitLocation);
-            BlockHitResult hit = new BlockHitResult(hitLocation, clickedFace, supportPos, false);
-            InteractionResult result = gameMode.useItemOn(player, InteractionHand.MAIN_HAND, hit);
+        if (preparation.status().requiresSwap()) {
+            int containerId = player.containerMenu.containerId;
+            // SWAP expects the source menu-slot index followed by the hotbar button index.
+            gameMode.handleContainerInput(containerId, preparation.sourceMenuSlot(),
+                    preparation.selectedHotbarIndex(), ContainerInput.SWAP, player);
+        }
+        inventory.setSelectedSlot(preparation.selectedHotbarIndex());
+        // The client applies SWAP to its own inventory before sending the packet, so this reads the
+        // outcome. Only an item match is checked; component-specific blocks are outside current support.
+        PlacementPreparation.Status verified = PlacementPreparation.verify(preparation,
+                holds(inventory.getItem(preparation.selectedHotbarIndex()), blockItem),
+                inventory.getSelectedSlot() == preparation.selectedHotbarIndex(),
+                holds(player.getItemInHand(InteractionHand.MAIN_HAND), blockItem));
+        if (verified != PlacementPreparation.Status.READY) {
+            return PlacementPreparation.failureResult(verified, action.block());
+        }
+        // A request is not a placement: completion reads the target only in a later observation.
+        lastPlacementTick = clientTick;
+
+        for (BlockHitResult supportHit : supportHits) {
+            player.lookAt(EntityAnchorArgument.Anchor.EYES, supportHit.getLocation());
+            InteractionResult result = gameMode.useItemOn(player, InteractionHand.MAIN_HAND, supportHit);
             if (result.consumesAction()) {
-                return "placement request sent for " + action.block() + " at " + target;
+                return PlacementPreparation.placementIssued(action.block(), String.valueOf(target));
             }
         }
-        return "BLOCK_PLACE_FAILED_NO_SUPPORT: no reachable usable support block adjacent to " + target;
+        // Support existed but no attempt was consumed on the client; what the server did is not known here.
+        return "BLOCK_PLACE_FAILED_INTERACTION_NOT_ACCEPTED: no valid support interaction was consumed for "
+                + action.block() + " at " + target;
+    }
+
+    /**
+     * Decides, without changing anything, how {@code item} gets into the hand (EXEC-007). A block only in
+     * the main inventory is swapped into a free utility slot (the hotbar layout keeps tools, food and the
+     * weapon in their slots), and PlacementPreparation makes and later verifies that decision. A failed
+     * decision never falls back to whatever is already held.
+     */
+    private static PlacementPreparation.Preparation placementPreparation(
+            net.minecraft.world.entity.player.Player player, Item item) {
+        var inventory = player.getInventory();
+        int selectedHotbarIndex = inventory.getSelectedSlot();
+        boolean selectedHoldsBlock = PlacementPreparation.isHotbarIndex(selectedHotbarIndex)
+                && holds(inventory.getItem(selectedHotbarIndex), item);
+        int hotbarIndexHoldingBlock = PlacementPreparation.NONE;
+        int sourceInventoryIndex = PlacementPreparation.NONE;
+        if (!selectedHoldsBlock) {
+            for (int hotbarIndex = 0; hotbarIndex < PlacementPreparation.HOTBAR_SIZE; hotbarIndex++) {
+                if (holds(inventory.getItem(hotbarIndex), item)) {
+                    hotbarIndexHoldingBlock = hotbarIndex;
+                    break;
+                }
+            }
+        }
+        if (!selectedHoldsBlock && hotbarIndexHoldingBlock == PlacementPreparation.NONE) {
+            for (int inventoryIndex = PlacementPreparation.FIRST_MAIN_INVENTORY_INDEX;
+                 inventoryIndex <= PlacementPreparation.LAST_MAIN_INVENTORY_INDEX; inventoryIndex++) {
+                if (holds(inventory.getItem(inventoryIndex), item)) {
+                    sourceInventoryIndex = inventoryIndex;
+                    break;
+                }
+            }
+        }
+        boolean inventoryMenuOpen = player.containerMenu == player.inventoryMenu;
+        PlacementPreparation.Preparation preparation = PlacementPreparation.prepare(selectedHotbarIndex,
+                selectedHoldsBlock, hotbarIndexHoldingBlock, sourceInventoryIndex, inventoryMenuOpen);
+        if (preparation.status().requiresSwap()) {
+            // The same decision, aimed at a free utility slot rather than the selected tool's slot.
+            preparation = PlacementPreparation.prepare(Hotbar.freeSlot(player), false, PlacementPreparation.NONE,
+                    sourceInventoryIndex, inventoryMenuOpen);
+        }
+        return preparation;
+    }
+
+    private static boolean holds(ItemStack stack, Item item) {
+        return !stack.isEmpty() && stack.is(item);
     }
 
     private void renderDebugSidebar(Minecraft client, net.minecraft.client.gui.GuiGraphicsExtractor graphics) {
@@ -3631,9 +4221,10 @@ public final class ActionableClient implements ClientModInitializer {
             return;
         }
         int maxTextWidth = DEBUG_PANEL_WIDTH - 12;
-        String state = (!enabled ? "paused" : defending ? "defending" : choosingGoal ? "choosing goal"
-                : decomposing ? "decomposing"
-                : planning ? "planning" : activeTask == null ? "idle" : "active")
+        String state = (!enabled ? "paused" : defending ? "defending"
+                : transition.cleanupFailed() ? "cleanup failed (retrying)"
+                : taskControl.busyStage().map(ActionableClient::requestStageLabel)
+                        .orElse(activeTask == null ? "idle" : "active"))
                 + (autonomous ? " [auto]" : " [manual]");
         String step = "Step: " + (taskSteps.isEmpty() ? "no plan"
                 : (currentStep + 1) + "/" + taskSteps.size() + " " + taskSteps.get(currentStep));

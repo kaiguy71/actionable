@@ -59,3 +59,17 @@ current command; the active task resumes when Actionable is enabled again.
 
 ## Contributors
 Kai Battistoni, Chayse Collins, Abram Eastham, Ethan Claybourn, Joey Ruffing, with help from ChatGPT and Claude Code
+
+### Side-by-side model testing
+
+Use separate game directories for Claude and Gemma, each with its own saves, options and logs.
+Set `-Dactionable.background=true` in both profiles to allow melee defense while the window is
+unfocused. Set `pauseOnLostFocus:false`, `fullscreen:false`, and `inactivityFpsLimit:"minimized"` in each
+profile's `options.txt` while Minecraft is closed. Keep both windows visible; minimizing can still
+throttle rendering. Open menus and explicit game pauses block melee attacks; Ctrl+` still disables
+Actionable. Background mode is opt-in and does not change target, reach, cooldown or health checks.
+
+For a comparison, create separate worlds with the same seed and game settings. Never share a live
+world directory. Both clients keep independent action histories; the Gemma client uses the Windows
+Ollama server and the Claude client uses the Claude CLI. Watch each profile's `logs/latest.log` for
+`model_request`, `model_response_body`, and `model_failure`, and verify the provider in each log.

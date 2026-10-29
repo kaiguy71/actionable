@@ -99,7 +99,7 @@ final class Recovery {
             return 20;
         }
         return switch (actionType) {
-            case "attack", "craft" -> 20;
+            case "attack", "craft", "equip" -> 20;
             case "lookup" -> 1;
             case "place_block", "jump_place" -> 10;
             default -> 200;

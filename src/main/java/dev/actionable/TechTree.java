@@ -89,10 +89,13 @@ final class TechTree {
             new Source("minecraft:raw_gold", "minecraft:gold_ore", Tier.IRON),
             new Source("minecraft:redstone", "minecraft:redstone_ore", Tier.IRON),
             new Source("minecraft:diamond", "minecraft:diamond_ore", Tier.IRON),
+            new Source("minecraft:diamond", "minecraft:deepslate_diamond_ore", Tier.IRON),
+            new Source("minecraft:obsidian", "minecraft:obsidian", Tier.DIAMOND),
             new Source("minecraft:dirt", "minecraft:dirt", Tier.NONE),
             new Source("minecraft:dirt", "minecraft:grass_block", Tier.NONE),
             new Source("minecraft:sand", "minecraft:sand", Tier.NONE),
             new Source("minecraft:gravel", "minecraft:gravel", Tier.NONE),
+            new Source("minecraft:flint", "minecraft:gravel", Tier.NONE),
             // Placed workstations drop themselves, so mining one picks it back up.
             new Source(CRAFTING_TABLE, CRAFTING_TABLE, Tier.NONE),
             new Source("minecraft:chest", "minecraft:chest", Tier.NONE),
@@ -116,11 +119,27 @@ final class TechTree {
         // A bed needs three wool of one colour; white is by far the most common sheep.
         recipe(WHITE_BED, 1, List.of("WWW", "PPP"), 'W', WHITE_WOOL, 'P', PLANKS);
 
+        for (String material : List.of("iron", "diamond")) {
+            String input = material.equals("iron") ? "minecraft:iron_ingot" : "minecraft:diamond";
+            recipe("minecraft:" + material + "_pickaxe", 1, List.of("MMM", " S ", " S "), 'M', input, 'S', "minecraft:stick");
+            recipe("minecraft:" + material + "_axe", 1, List.of("MM", "MS", " S"), 'M', input, 'S', "minecraft:stick");
+            recipe("minecraft:" + material + "_sword", 1, List.of("M", "M", "S"), 'M', input, 'S', "minecraft:stick");
+            recipe("minecraft:" + material + "_shovel", 1, List.of("M", "S", "S"), 'M', input, 'S', "minecraft:stick");
+            recipe("minecraft:" + material + "_helmet", 1, List.of("MMM", "M M"), 'M', input);
+            recipe("minecraft:" + material + "_chestplate", 1, List.of("M M", "MMM", "MMM"), 'M', input);
+            recipe("minecraft:" + material + "_leggings", 1, List.of("MMM", "M M", "M M"), 'M', input);
+            recipe("minecraft:" + material + "_boots", 1, List.of("M M", "M M"), 'M', input);
+        }
+        recipe("minecraft:bucket", 1, List.of("I I", " I "), 'I', "minecraft:iron_ingot");
+        recipe("minecraft:flint_and_steel", 1, List.of("I ", " F"), 'I', "minecraft:iron_ingot", 'F', "minecraft:flint");
+        recipe("minecraft:shield", 1, List.of("PIP", "PPP", " P "), 'P', PLANKS, 'I', "minecraft:iron_ingot");
+        recipe("minecraft:golden_boots", 1, List.of("G G", "G G"), 'G', "minecraft:gold_ingot");
+
         USES.put(LOGS, "craft into planks (1 log -> 4 planks); every wooden item starts here");
         USES.put(PLANKS, "crafting table (4), sticks (2 -> 4), wooden tools (3 per pickaxe), chest (8)");
         USES.put("minecraft:stick", "handles for every tool, and torches");
         USES.put(CRAFTING_TABLE, "place it to unlock 3x3 recipes: pickaxes, axes, swords, furnace, chest;"
-                + " reusable: mine the placed table (by hand is fine) to carry it, and never craft a second one");
+                + " reusable: walk to the placed table and leave it standing after crafting; never craft a second one");
         USES.put("minecraft:wooden_pickaxe", "mines stone (drops cobblestone) and coal ore");
         USES.put("minecraft:stone_pickaxe", "mines iron, copper and lapis ore, and stone faster");
         USES.put("minecraft:wooden_sword", "melee weapon for nights and caves");
@@ -130,10 +149,18 @@ final class TechTree {
         USES.put("minecraft:cobblestone", "stone tools (3 per pickaxe, 2 per sword) and furnace (8)");
         USES.put("minecraft:cobbled_deepslate", "same uses as cobblestone: stone tools and furnace");
         USES.put(COALS, "torches (1 coal + 1 stick -> 4 torches) and furnace fuel");
-        USES.put("minecraft:torch", "lights caves so you can see and mobs stop spawning; needed before going underground");
-        USES.put("minecraft:furnace", "smelts raw iron into ingots (smelting is not automated yet)");
+        USES.put("minecraft:torch", "lights caves so you can see and mobs stop spawning; recommended for underground work");
+        USES.put("minecraft:furnace", "smelts raw ore and cooks food through the smelt in house furnace goal");
         USES.put("minecraft:chest", "stores spare items");
-        USES.put("minecraft:raw_iron", "smelt into iron ingots for iron tools and armor (smelting not automated yet)");
+        USES.put("minecraft:raw_iron", "smelt into iron ingots with the house furnace; craft iron tools, armor, shield, bucket and flint and steel");
+        USES.put("minecraft:iron_pickaxe", "mines diamond ore; use three diamonds for a diamond pickaxe");
+        USES.put("minecraft:diamond_pickaxe", "required to harvest obsidian for the Nether portal");
+        USES.put("minecraft:bucket", "use_item at a water source to fill; place water next to lava sources to make obsidian");
+        USES.put("minecraft:obsidian", "10 blocks make a cornerless 4-wide by 5-high portal frame, with a 2x3 empty interior; crying obsidian does not work");
+        USES.put("minecraft:flint", "gravel sometimes drops flint; break individual gravel blocks until one drops");
+        USES.put("minecraft:flint_and_steel", "use_item on the top of an obsidian base block to ignite a complete portal; observe portal blocks before entering");
+        USES.put("minecraft:shield", "equip to offhand; active blocking is not automated");
+        USES.put("minecraft:golden_boots", "wear in the Nether to avoid provoking ordinary piglins; not protection from piglin brutes");
         USES.put("minecraft:dirt", "cheap filler block for pillaring up or blocking holes");
         USES.put(WHITE_WOOL, "3 white wool + 3 planks make a bed (from killing white sheep)");
         USES.put(WHITE_BED, "place it inside the house and sleep at night to skip the night and set respawn");
@@ -292,6 +319,10 @@ final class TechTree {
     static boolean isWeapon(String item) {
         String path = item.substring(item.indexOf(':') + 1);
         return path.endsWith("_sword") || path.endsWith("_axe") || path.equals("mace") || path.equals("trident");
+    }
+
+    static boolean isBed(String item) {
+        return item.startsWith("minecraft:") && item.endsWith("_bed");
     }
 
     static boolean isDoor(String item) {

@@ -1,6 +1,7 @@
 package dev.actionable;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -10,6 +11,23 @@ import java.util.Optional;
 import org.junit.jupiter.api.Test;
 
 class ActionPlannerTest {
+    @Test
+    void everyPlanningStageStartsWithNetherObjective() {
+        for (String stage : new String[] {"director", "decomposition", "action", "judge"}) {
+            String prompt = ActionPlanner.systemPrompt(stage);
+            assertTrue(prompt.startsWith("GET TO THE NETHER!!!\n\nYou "), stage);
+            assertTrue(prompt.contains("Return only JSON"), stage);
+        }
+    }
+
+    @Test
+    void promptsDescribeHomeRangeAndTravel() {
+        assertTrue(ActionPlanner.systemPrompt("action").contains("Home range: until you hold a stone pickaxe"));
+        assertTrue(ActionPlanner.systemPrompt("action").contains("Travel (long-distance search)"));
+        var movement = action("{\"type\":\"baritone\",\"command\":\"goto 1000 70 -1000\"}");
+        assertEquals("goto 1000 70 -1000", movement.command());
+    }
+
     private static ActionPlanner.PlannedAction action(String json) {
         return ActionPlanner.parsePlan("{\"summary\":\"s\",\"goal\":\"g\",\"complete\":false,\"action\":" + json + "}")
                 .action().orElseThrow();
@@ -66,6 +84,18 @@ class ActionPlannerTest {
             if (step.startsWith("mine ")) {
                 assertEquals(Optional.of(step), ActionPlanner.validateCommand(step));
             }
+        }
+    }
+
+    @Test
+    void exploreIsNotACommandAndDiamondMiningIs() {
+        assertEquals(Optional.empty(), ActionPlanner.validateCommand("explore"));
+        assertEquals(Optional.empty(), ActionPlanner.validateCommand("Explore"));
+        assertEquals(Optional.of("mine 3 minecraft:diamond"), ActionPlanner.validateCommand("mine 3 minecraft:diamond"));
+        for (String stage : new String[] {"director", "decomposition", "action"}) {
+            String prompt = ActionPlanner.systemPrompt(stage).toLowerCase(java.util.Locale.ROOT);
+            assertFalse(prompt.contains("- explore:") || prompt.contains("goto, explore") || prompt.contains("\"explore\""),
+                    stage + " prompt still offers explore");
         }
     }
 

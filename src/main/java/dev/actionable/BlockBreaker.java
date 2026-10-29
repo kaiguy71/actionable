@@ -55,6 +55,12 @@ final class BlockBreaker {
         return block + " at " + target.getX() + "," + target.getY() + "," + target.getZ();
     }
 
+    java.util.Optional<String> workEvidence(Minecraft client, String result) {
+        return result.equals("BROKE: " + describe()) && client.level != null
+                && client.level.getBlockState(target).isAir()
+                ? java.util.Optional.of(describe() + " started=" + startedAt) : java.util.Optional.empty();
+    }
+
     /** Advances by one tick; returns null while working, otherwise the final result. */
     String tick(Minecraft client, long tick, Consumer<String> walk, Runnable stop) {
         LocalPlayer player = client.player;

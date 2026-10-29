@@ -45,6 +45,10 @@ final class FurnacePlan {
         return INPUTS.stream().filter(entry -> entry[0].equals(input)).map(entry -> entry[1]).findFirst();
     }
 
+    static Optional<String> inputFor(String result) {
+        return INPUTS.stream().filter(entry -> entry[1].equals(result)).map(entry -> entry[0]).findFirst();
+    }
+
     static Optional<Load> choose(Map<String, Integer> inventory) {
         String input = null;
         int held = 0;

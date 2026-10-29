@@ -11,12 +11,31 @@ import org.junit.jupiter.api.Test;
 
 class ActionableFeaturesTest {
     @Test
-    void repeatedStepsCollapseToLargestTotal() {
+    void adjacentRepeatedStepsCollapseWhileLaterResourceBatchesRemain() {
         List<String> steps = ProgressPlanner.normalizeSteps(List.of(
                 "mine 2 minecraft:spruce_log", "mine 2 spruce_log", "mine 18 minecraft:birch_log",
                 "craft 4 minecraft:birch_planks", "mine 6 spruce_log"));
-        assertEquals(List.of("mine 6 minecraft:spruce_log", "mine 18 minecraft:birch_log",
-                "craft 4 minecraft:birch_planks"), steps);
+        assertEquals(List.of("mine 2 minecraft:spruce_log", "mine 18 minecraft:birch_log",
+                "craft 4 minecraft:birch_planks", "mine 6 minecraft:spruce_log"), steps);
+    }
+
+    @Test
+    void localQuantityCapsComposeWithUpstreamStepDeduplication() {
+        var steps = ProgressPlanner.normalizeSteps(PlanSanity.sanitizeSteps(List.of(
+                "mine 500 minecraft:oak_log", "craft 4 minecraft:oak_planks",
+                "mine 12 minecraft:oak_log", "smelt iron", "trade with a villager")));
+        assertEquals(List.of("mine 64 minecraft:oak_log", "craft 4 minecraft:oak_planks",
+                "mine 12 minecraft:oak_log", "smelt iron", "trade with a villager"), steps);
+    }
+
+    @Test
+    void actionSchemaIncludesEquipmentAndUpstreamInteractions() {
+        var types = JsonParser.parseString(PlannerSchema.forStage("action")).getAsJsonObject()
+                .getAsJsonObject("properties").getAsJsonObject("action")
+                .getAsJsonObject("properties").getAsJsonObject("type").getAsJsonArray("enum");
+        for (String type : List.of("equip", "craft", "use_block", "menu", "screenshot", "break_block")) {
+            assertTrue(types.asList().stream().anyMatch(value -> value.getAsString().equals(type)), type);
+        }
     }
 
     @Test

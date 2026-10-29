@@ -21,8 +21,11 @@ final class ProgressPlanner {
     static final String PLACE_TABLE_IN_HOUSE = "place " + TechTree.CRAFTING_TABLE + " in house";
     static final String PLACE_DOOR = "place door in house";
     static final String GO_HOME = "go to house";
+    static final String GO_TABLE = "go to crafting table";
     static final String LAY_FLOOR = "lay house floor";
     static final String GATHER_FOOD = "gather food";
+    /** The goal when no milestone is left: there is always something to do, and diamonds lead onward. */
+    static final String FALLBACK_GOAL = "mine 3 minecraft:diamond";
     private static final Pattern HOUSE_MINE = Pattern.compile("^dig house mine for (\\d{1,4}) ([a-z0-9_.-]+:[a-z0-9_./-]+)$");
     /** Planks kept for filling holes and water in the floor; the floor has 11 cells. */
     static final int FLOOR_PLANKS = 12;
@@ -35,7 +38,11 @@ final class ProgressPlanner {
 
     /** Progress that lives in the world rather than the inventory. */
     record Facts(boolean houseBuilt, boolean bedPlaced, boolean tableInHouse, boolean doorPlaced, boolean atHome,
-            boolean floorReady, boolean furnaceInHouse, boolean mineFinished) {
+            boolean floorReady, boolean furnaceInHouse, boolean mineFinished, boolean inNether) {
+        Facts(boolean houseBuilt, boolean bedPlaced, boolean tableInHouse, boolean doorPlaced, boolean atHome,
+                boolean floorReady, boolean furnaceInHouse, boolean mineFinished) {
+            this(houseBuilt, bedPlaced, tableInHouse, doorPlaced, atHome, floorReady, furnaceInHouse, mineFinished, false);
+        }
         static final Facts NONE = new Facts(false, false, false, false, false, false, false, false);
 
         Facts(boolean houseBuilt, boolean bedPlaced) {
@@ -54,7 +61,7 @@ final class ProgressPlanner {
     }
 
     /** HOLD milestones are inventory targets; the others are checked in the world. */
-    enum Kind { HOLD, STOCK, HOUSE, FLOOR, TABLE, DOOR, BED, FOOD, FURNACE }
+    enum Kind { HOLD, STOCK, HOUSE, FLOOR, TABLE, DOOR, BED, FOOD, FURNACE, NETHER }
 
     record Milestone(String item, int count, String why, Kind kind) {
         Milestone(String item, int count, String why) {
@@ -71,7 +78,9 @@ final class ProgressPlanner {
                 case BED -> PLACE_BED;
                 case FOOD -> GATHER_FOOD;
                 case FURNACE -> NeedsPlanner.PLACE_FURNACE;
-                case HOLD, STOCK -> TechTree.recipeFor(item).isPresent() ? "craft " + count + " " + item
+                case NETHER -> NetherProgress.ENTER;
+                case HOLD, STOCK -> item.equals("minecraft:water_bucket") ? "fill water bucket"
+                        : TechTree.recipeFor(item).isPresent() ? "craft " + count + " " + item
                         : TechTree.huntedFrom(item).isPresent() ? "hunt " + count + " " + item
                         : "mine " + count + " " + TechTree.blockToMine(item);
             };
@@ -159,6 +168,9 @@ final class ProgressPlanner {
             case FURNACE -> {
                 return facts.furnaceInHouse();
             }
+            case NETHER -> {
+                return facts.inNether();
+            }
             default -> {
             }
         }
@@ -176,8 +188,16 @@ final class ProgressPlanner {
             int planks = TechTree.count(inventory, TechTree.LOGS) * 4 + TechTree.count(inventory, TechTree.PLANKS);
             return facts.houseBuilt() || planks >= milestone.count() * 4;
         }
+        if (milestone.item().equals("minecraft:raw_iron")) {
+            return NetherProgress.ironProgress(inventory) >= milestone.count();
+        }
+        if (milestone.item().equals("minecraft:bucket")) {
+            return inventory.getOrDefault("minecraft:bucket", 0) + inventory.getOrDefault("minecraft:water_bucket", 0)
+                    + inventory.getOrDefault("minecraft:lava_bucket", 0) >= milestone.count();
+        }
         if (milestone.item().equals(TechTree.WHITE_WOOL)) {
-            return facts.bedPlaced() || inventory.getOrDefault(TechTree.WHITE_BED, 0) > 0
+            // A bed already in hand (picked back up after being moved) means no more wool is needed.
+            return facts.bedPlaced() || inventory.keySet().stream().anyMatch(TechTree::isBed)
                     || TechTree.held(inventory, milestone.item()) >= milestone.count();
         }
         TechTree.Tier pickaxe = TechTree.tierOf(milestone.item());
@@ -185,10 +205,10 @@ final class ProgressPlanner {
             return TechTree.pickaxeTier(inventory).compareTo(pickaxe) >= 0;
         }
         if (milestone.item().endsWith("_sword")) {
-            boolean anySword = milestone.item().equals("minecraft:wooden_sword");
+            TechTree.Tier needed = TechTree.tierOf(milestone.item().replace("_sword", "_pickaxe"));
             return inventory.entrySet().stream().anyMatch(entry -> entry.getValue() > 0
                     && entry.getKey().endsWith("_sword")
-                    && (anySword || !entry.getKey().equals("minecraft:wooden_sword")));
+                    && TechTree.tierOf(entry.getKey().replace("_sword", "_pickaxe")).compareTo(needed) >= 0);
         }
         return TechTree.held(inventory, milestone.item()) >= milestone.count();
     }
@@ -198,7 +218,9 @@ final class ProgressPlanner {
     }
 
     static Optional<Milestone> nextMilestone(Map<String, Integer> inventory, Facts facts) {
-        return ordered(inventory).stream().filter(milestone -> !satisfied(milestone, inventory, facts)).findFirst();
+        if (facts.inNether()) return Optional.empty();
+        return ordered(inventory).stream().filter(milestone -> !satisfied(milestone, inventory, facts)).findFirst()
+                .or(() -> NetherProgress.next(inventory));
     }
 
     /**
@@ -320,18 +342,18 @@ final class ProgressPlanner {
             "^(mine|craft|get|gather|collect|obtain)\\s+(\\d{1,4})\\s+(?:minecraft:)?([a-z0-9_]+)\\b(.*)");
 
     /**
-     * Cleans model-written steps: bare item ids gain the namespace, and repeated steps for the same
-     * verb and item collapse into one with the largest total. Step quantities are totals to hold, so
+     * Cleans model-written steps: bare item ids gain the namespace, and adjacent steps for the same
+     * verb and item collapse into one with the largest total. Later repeats remain because an
+     * intervening craft may have consumed the first batch. Step quantities are totals to hold, so
      * eight "mine 2 spruce_log" steps mean "hold 2", never 16.
      */
     static List<String> normalizeSteps(List<String> steps) {
-        java.util.Map<String, Integer> firstIndex = new java.util.LinkedHashMap<>();
-        List<String> out = new java.util.ArrayList<>();
+        List<String> out = new ArrayList<>();
         for (String raw : steps) {
             String step = raw.strip();
             Matcher matcher = LOOSE_STEP.matcher(step.toLowerCase(Locale.ROOT));
             if (!matcher.matches()) {
-                if (out.stream().noneMatch(step::equalsIgnoreCase)) {
+                if (out.isEmpty() || !out.get(out.size() - 1).equalsIgnoreCase(step)) {
                     out.add(step);
                 }
                 continue;
@@ -339,17 +361,15 @@ final class ProgressPlanner {
             String verb = matcher.group(1).equals("craft") ? "craft" : "mine";
             int count = Integer.parseInt(matcher.group(2));
             String item = "minecraft:" + matcher.group(3);
-            String key = verb + " " + item;
-            Integer index = firstIndex.get(key);
-            if (index == null) {
-                firstIndex.put(key, out.size());
-                out.add(matcher.group(1) + " " + count + " " + item + matcher.group(4));
-            } else {
-                Matcher existing = LOOSE_STEP.matcher(out.get(index));
-                if (existing.matches() && count > Integer.parseInt(existing.group(2))) {
-                    out.set(index, existing.group(1) + " " + count + " " + item + existing.group(4));
+            if (!out.isEmpty()) {
+                Matcher previous = LOOSE_STEP.matcher(out.get(out.size() - 1));
+                if (previous.matches() && previous.group(1).equals(verb) && previous.group(3).equals(item.substring(10))) {
+                    int largest = Math.max(count, Integer.parseInt(previous.group(2)));
+                    out.set(out.size() - 1, verb + " " + largest + " " + item + previous.group(4));
+                    continue;
                 }
             }
+            out.add(verb + " " + count + " " + item + matcher.group(4));
         }
         return List.copyOf(out);
     }
@@ -419,6 +439,15 @@ final class ProgressPlanner {
     static Optional<Boolean> stepSatisfied(String step, Map<String, Integer> inventory, boolean tableNearby,
             Facts facts) {
         String text = step.strip();
+        if (text.equalsIgnoreCase(NetherProgress.ENTER)) {
+            return Optional.of(facts != null && facts.inNether());
+        }
+        if (text.equalsIgnoreCase("fill water bucket")) {
+            return Optional.of(inventory.getOrDefault("minecraft:water_bucket", 0) > 0);
+        }
+        if (text.equalsIgnoreCase(GO_TABLE)) {
+            return Optional.of(tableNearby);
+        }
         if (facts != null && text.equalsIgnoreCase(PLACE_TABLE_IN_HOUSE)) {
             return Optional.of(facts.tableInHouse());
         }
@@ -463,6 +492,10 @@ final class ProgressPlanner {
      * director goals like "mine 20 stone" when the player has no pickaxe.
      */
     static Optional<String> goalProblem(String goal, Map<String, Integer> inventory) {
+        if (goal.strip().toLowerCase(Locale.ROOT).startsWith("explore")) {
+            return Optional.of("exploring is not available; pick a milestone goal, or " + FALLBACK_GOAL
+                    + " to find diamonds");
+        }
         Optional<QuantifiedStep> parsed = parse(goal);
         if (parsed.isEmpty()) {
             return Optional.empty();
@@ -503,8 +536,8 @@ final class ProgressPlanner {
     }
 
     /**
-     * As above, but a table placed elsewhere is fetched by mining it rather than crafting a new one,
-     * and a plan that used a table ends by mining it so the player carries it to the next job.
+     * As above, but a table placed elsewhere is walked to rather than crafting a new one,
+     * and placed tables stay in the world for the next crafting job.
      */
     static List<String> stepsFor(String item, int count, Map<String, Integer> inventory, TableAccess table,
             String preferredLog) {
@@ -523,7 +556,6 @@ final class ProgressPlanner {
         try {
             Expansion first = new Expansion(inventory, table, preferredLog, List.of());
             needs.forEach(need -> first.need(need.getKey(), need.getValue()));
-            first.pickUpTable();
             // Mining that needs no new tool is hoisted to the front; otherwise held materials get used up
             // by early crafts and the remainder is mined mid-plan, adding steps.
             List<Op> hoisted = first.ops.stream()
@@ -533,7 +565,6 @@ final class ProgressPlanner {
             }
             Expansion second = new Expansion(inventory, table, preferredLog, hoisted);
             needs.forEach(need -> second.need(need.getKey(), need.getValue()));
-            second.pickUpTable();
             return second.steps(inventory);
         } catch (IllegalArgumentException unknown) {
             return List.of();
@@ -549,6 +580,7 @@ final class ProgressPlanner {
     static List<String> stepsForGoal(String goal, Map<String, Integer> inventory, TableAccess table,
             String preferredLog) {
         String log = preferredLog == null || preferredLog.isBlank() ? "minecraft:oak_log" : preferredLog;
+        if (goal.strip().equalsIgnoreCase("fill water bucket")) return List.of("fill water bucket");
         if (goal.strip().equalsIgnoreCase(BUILD_HOUSE)) {
             List<String> steps = new ArrayList<>(stepsFor(TechTree.planksFor(log), HOUSE_PLANKS, inventory, table, log));
             steps.add(BUILD_HOUSE);
@@ -595,7 +627,7 @@ final class ProgressPlanner {
             return List.copyOf(steps);
         }
         if (goal.strip().equalsIgnoreCase(PLACE_BED)) {
-            List<String> steps = new ArrayList<>(inventory.getOrDefault(TechTree.WHITE_BED, 0) > 0 ? List.of()
+            List<String> steps = new ArrayList<>(inventory.keySet().stream().anyMatch(TechTree::isBed) ? List.of()
                     : stepsFor(TechTree.WHITE_BED, 1, inventory, table, log));
             steps.add(PLACE_BED);
             return List.copyOf(steps);
@@ -608,9 +640,28 @@ final class ProgressPlanner {
             return List.copyOf(steps);
         }
         return quantified
-                .map(parsed -> stepsFor(parsed.verb().equals("mine") ? TechTree.dropOf(TechTree.blockToMine(parsed.item()))
+                .map(parsed -> stepsFor(parsed.verb().equals("mine") && !parsed.item().equals("minecraft:flint")
+                        ? TechTree.dropOf(TechTree.blockToMine(parsed.item()))
                         : parsed.item(), parsed.count(), inventory, table, preferredLog))
                 .orElse(List.of());
+    }
+
+    static boolean needsHouse(String goal) {
+        String text = goal.strip();
+        return text.equalsIgnoreCase(PLACE_TABLE_IN_HOUSE) || text.equalsIgnoreCase(PLACE_BED)
+                || text.equalsIgnoreCase(PLACE_DOOR) || text.equalsIgnoreCase(LAY_FLOOR)
+                || text.equalsIgnoreCase(GO_HOME) || text.equalsIgnoreCase(NeedsPlanner.PLACE_FURNACE)
+                || text.equalsIgnoreCase(NeedsPlanner.SMELT) || HOUSE_MINE.matcher(text.toLowerCase(Locale.ROOT)).matches();
+    }
+
+    static List<String> stepsForGoal(String goal, Map<String, Integer> inventory, TableAccess table,
+            String preferredLog, Facts facts) {
+        if (needsHouse(goal) && !facts.houseBuilt()) {
+            List<String> steps = new ArrayList<>(stepsForGoal(BUILD_HOUSE, inventory, table, preferredLog));
+            steps.addAll(stepsForGoal(goal, inventory, table, preferredLog));
+            return List.copyOf(steps);
+        }
+        return stepsForGoal(goal, inventory, table, preferredLog);
     }
 
     /** The ordered progression from "get wood" to the Ender Dragon, loaded from the mod's resources. */
@@ -661,7 +712,7 @@ final class ProgressPlanner {
                 text.append("\n- milestone_plan=").append(steps);
             }
         } else {
-            text.append("\n- next_milestone=none (early-game milestones done; explore or gather what a plan needs)");
+            text.append("\n- next_milestone=none (early-game milestones done; gather what a plan needs, or mine diamonds)");
         }
         text.append("\n- craftable_now=").append(TechTree.craftableNow(inventory, tableNearby));
         text.append("\n- inventory_uses=").append(inventoryUses(inventory));
@@ -685,11 +736,11 @@ final class ProgressPlanner {
                     + "; never pick it up and never craft another";
         }
         if (inventory.getOrDefault(TechTree.CRAFTING_TABLE, 0) > 0) {
-            return "in inventory (place it where you craft, mine it afterwards to take it along; do not craft another)";
+            return "in inventory (place it where you craft and leave it standing; do not craft another)";
         }
         return switch (table) {
-            case NEARBY -> "placed within reach (use it, then mine it to take it along; do not craft another)";
-            case ELSEWHERE -> "placed nearby, see nearest_crafting_table (mine it to pick it up and reuse it;"
+            case NEARBY -> "placed within reach (reuse it and leave it standing; do not craft another)";
+            case ELSEWHERE -> "placed nearby, see nearest_crafting_table (go to crafting table and leave it standing;"
                     + " do not craft another)";
             case NONE -> "none (craft one from 4 planks, then keep reusing it)";
             default -> "kept inside the house";
@@ -714,7 +765,6 @@ final class ProgressPlanner {
         private TechTree.Tier tier;
         private final TableAccess table;
         private boolean tableReady;
-        private boolean tableUsed;
         private int tableReadyAt = -1;
         private int depth;
 
@@ -741,6 +791,12 @@ final class ProgressPlanner {
                     return -1;
                 }
                 String item = concrete(key);
+                Optional<String> smeltInput = FurnacePlan.inputFor(item);
+                if (smeltInput.isPresent()) {
+                    int dependency = need(smeltInput.get(), missing);
+                    dependency = Math.max(dependency, need(TechTree.COALS, (missing + 7) / 8));
+                    return add("smelt", item, missing, dependency);
+                }
                 Optional<TechTree.Recipe> recipe = TechTree.recipeFor(item);
                 if (recipe.isPresent()) {
                     int crafts = (missing + recipe.get().yield() - 1) / recipe.get().yield();
@@ -766,7 +822,7 @@ final class ProgressPlanner {
                 }
                 TechTree.Source source = TechTree.sourceFor(item)
                         .orElseThrow(() -> new IllegalArgumentException("no known source for " + item));
-                return add("mine", source.block(), missing, ensureTier(source.tool()));
+                return add("mine", item.equals("minecraft:flint") ? item : source.block(), missing, ensureTier(source.tool()));
             } finally {
                 depth--;
             }
@@ -781,7 +837,6 @@ final class ProgressPlanner {
         }
 
         private int ensureTable() {
-            tableUsed = true;
             if (tableReady) {
                 return tableReadyAt;
             }
@@ -791,25 +846,15 @@ final class ProgressPlanner {
                 tableReadyAt = add("goto", "house", 1, -1);
                 return tableReadyAt;
             }
-            int pickup = -1;
-            if (table == TableAccess.ELSEWHERE && TechTree.count(stock, TechTree.CRAFTING_TABLE) == 0) {
-                // A table already placed somewhere is mined to pick it up; crafting another wastes planks.
-                pickup = add("mine", TechTree.CRAFTING_TABLE, 1, -1);
-                stock.merge(TechTree.CRAFTING_TABLE, 1, Integer::sum);
+            if (table == TableAccess.ELSEWHERE) {
+                tableReady = true;
+                tableReadyAt = add("goto", "crafting_table", 1, -1);
+                return tableReadyAt;
             }
-            int dependency = Math.max(pickup, need(TechTree.CRAFTING_TABLE, 1));
+            int dependency = need(TechTree.CRAFTING_TABLE, 1);
             tableReady = true;
             tableReadyAt = add("place", TechTree.CRAFTING_TABLE, 1, dependency);
             return tableReadyAt;
-        }
-
-        /**
-         * Ends a plan that crafted at a table by mining that table, so it travels with the player.
-         */
-        void pickUpTable() {
-            if (tableUsed && !table.home() && !ops.isEmpty()) {
-                ops.add(new Op("mine", TechTree.CRAFTING_TABLE, 1, ops.size() - 1));
-            }
         }
 
         /** Removes up to {@code quantity} matching items from stock and returns how many were taken. */
@@ -868,7 +913,13 @@ final class ProgressPlanner {
                         simulated.merge(op.item, op.amount, Integer::sum);
                         steps.add("craft " + TechTree.held(simulated, op.item) + " " + op.item);
                     }
-                    case "goto" -> steps.add(GO_HOME);
+                    case "goto" -> steps.add(op.item.equals("house") ? GO_HOME : GO_TABLE);
+                    case "smelt" -> {
+                        remove(simulated, FurnacePlan.inputFor(op.item).orElseThrow(), op.amount);
+                        remove(simulated, TechTree.COALS, (op.amount + 7) / 8);
+                        simulated.merge(op.item, op.amount, Integer::sum);
+                        steps.add(NeedsPlanner.SMELT);
+                    }
                     default -> {
                         remove(simulated, op.item, 1);
                         steps.add("place " + op.item + " nearby");

@@ -44,11 +44,16 @@ final class WorldSynopsis {
                 .append("; block_below_player=").append(blockId(level.getBlockState(playerPos.below()).getBlock()))
                 .append("; nearby_placement_candidates=").append(placementSurface(level, playerPos))
                 .append("; nearby_resource_hints=").append(nearbyResources(level, playerPos))
+                .append("; nearby_fluid_sources=").append(fluidSources(level, playerPos))
                 .append("; health=").append(Math.round(player.getHealth()))
                 .append("; food=").append(player.getFoodData().getFoodLevel())
+                .append("; air=").append(player.getAirSupply()).append('/').append(player.getMaxAirSupply())
+                .append("; submerged=").append(player.isUnderWater())
                 .append("; armor=").append(player.getArmorValue())
                 .append("; ").append(WorldProbe.safety(client).describe())
                 .append("; nearest_crafting_table=").append(nearestTable(level, playerPos))
+                .append("; house_structure=").append(WorldProbe.describeHouse(level))
+                .append("; ").append(InventoryAccess.describe(player))
                 .append("; inventory=").append(inventorySlots(player))
                 .append("; totals=").append(topEntries(WorldProbe.inventory(player), 24));
 
@@ -69,8 +74,8 @@ final class WorldSynopsis {
         StringBuilder threats = new StringBuilder();
         int threatCount = 0;
         for (Entity entity : level.entitiesForRendering()) {
-            if (entity instanceof Monster monster && monster.isAlive()
-                    && monster.distanceToSqr(player) <= 144 && threatCount < 6) {
+            if (entity instanceof net.minecraft.world.entity.LivingEntity monster && ThreatProbe.hostile(client, entity)
+                    && monster.distanceToSqr(player) <= 256 && threatCount < 6) {
                 if (threatCount++ > 0) {
                     threats.append(',');
                 }
@@ -82,7 +87,7 @@ final class WorldSynopsis {
                         .append("(d=").append(Math.round(monster.distanceTo(player)))
                         .append(",health=").append(Math.round(monster.getHealth()))
                         .append(",melee_reachable=").append(MeleeCombat.reachable(client, monster))
-                        .append(monster.getTarget() == player ? ",targeting_player" : "").append(')');
+                        .append(ThreatProbe.targeting(client, monster) ? ",targeting_player" : "").append(')');
             }
         }
         synopsis.append("; nearby_hostile_mobs=").append(threatCount == 0 ? "none" : threats);
@@ -175,7 +180,9 @@ final class WorldSynopsis {
                         continue;
                     }
                     String id = blockId(level.getBlockState(sample).getBlock());
-                    if (!id.endsWith("_log") && !id.endsWith("_ore")) {
+                    if (!id.endsWith("_log") && !id.endsWith("_ore") && !java.util.Set.of(
+                            "minecraft:gravel", "minecraft:obsidian", "minecraft:water", "minecraft:lava",
+                            "minecraft:nether_portal").contains(id)) {
                         continue;
                     }
                     double distance = Math.sqrt((double) dx * dx + (double) dy * dy + (double) dz * dz);
@@ -202,6 +209,22 @@ final class WorldSynopsis {
                         + ",distance=" + Math.round(entry.getValue().distance()) + ')')
                 .toList()
                 .toString();
+    }
+
+    private static String fluidSources(ClientLevel level, BlockPos origin) {
+        var water = new java.util.ArrayList<BlockPos>();
+        var lava = new java.util.ArrayList<BlockPos>();
+        for (BlockPos pos : BlockPos.betweenClosed(origin.offset(-8, -4, -8), origin.offset(8, 4, 8))) {
+            if (!level.hasChunk(pos.getX() >> 4, pos.getZ() >> 4)) continue;
+            var fluid = level.getFluidState(pos);
+            if (!fluid.isSource()) continue;
+            if (fluid.getType() == net.minecraft.world.level.material.Fluids.WATER) water.add(pos.immutable());
+            if (fluid.getType() == net.minecraft.world.level.material.Fluids.LAVA) lava.add(pos.immutable());
+        }
+        java.util.function.Function<java.util.List<BlockPos>, String> describe = positions -> positions.stream()
+                .sorted(java.util.Comparator.comparingDouble(pos -> pos.distSqr(origin))).limit(6)
+                .map(pos -> pos.getX() + "," + pos.getY() + "," + pos.getZ()).toList().toString();
+        return "{water=" + describe.apply(water) + ",lava=" + describe.apply(lava) + "}";
     }
 
     private static double wrapDegrees(double degrees) {

@@ -11,6 +11,8 @@ import java.util.Optional;
 final class MiningPolicy {
     /** Deepest a deposit may sit below the local surface without cave gear. */
     static final int MAX_SAFE_DEPTH = 30;
+    /** Deposits farther than this are walked to before mining, so Baritone starts near the right one. */
+    static final int WALK_FIRST_DISTANCE = 8;
     /** Places the client retreated from are avoided within this radius. */
     static final int AVOID_RADIUS = 12;
 

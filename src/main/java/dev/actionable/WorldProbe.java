@@ -32,6 +32,13 @@ final class WorldProbe {
                 items.merge(item, stack.getCount(), Integer::sum);
             }
         }
+        for (net.minecraft.world.entity.EquipmentSlot slot : java.util.List.of(
+                net.minecraft.world.entity.EquipmentSlot.HEAD, net.minecraft.world.entity.EquipmentSlot.CHEST,
+                net.minecraft.world.entity.EquipmentSlot.LEGS, net.minecraft.world.entity.EquipmentSlot.FEET,
+                net.minecraft.world.entity.EquipmentSlot.OFFHAND)) {
+            ItemStack stack = player.getItemBySlot(slot);
+            if (!stack.isEmpty()) items.merge(BuiltInRegistries.ITEM.getKey(stack.getItem()).toString(), stack.getCount(), Integer::sum);
+        }
         return items;
     }
 
@@ -50,13 +57,14 @@ final class WorldProbe {
         int light = Math.max(level.getMaxLocalRawBrightness(feet), level.getMaxLocalRawBrightness(feet.above()));
         int hostiles = 0;
         for (Entity entity : level.entitiesForRendering()) {
-            if (entity instanceof Monster monster && monster.isAlive() && monster.distanceToSqr(player) <= 256) {
+            if (ThreatProbe.hostile(client, entity) && entity.distanceToSqr(player) <= 256) {
                 hostiles++;
             }
         }
         // Dimensions without sky light (the Nether) have a bedrock roof, so depth below it means nothing.
         // Inside the house the roof hides the sky; that is shelter, not being underground.
-        boolean sheltered = HouseDesign.nearHouse(home, feet.getX(), feet.getY(), feet.getZ()) || (home != null
+        boolean sheltered = (HouseDesign.nearHouse(home, feet.getX(), feet.getY(), feet.getZ())
+                && houseStructure(level, home).enclosed()) || (home != null
                 && StairMine.onStairs(feet.getX() - home[0], feet.getY() - home[1], feet.getZ() - home[2]));
         int depth = level.dimensionType().hasSkyLight() && !sheltered
                 ? Math.max(0, surfaceY(level, feet.getX(), feet.getZ()) - feet.getY()) : 0;
@@ -178,11 +186,15 @@ final class WorldProbe {
 
     /** Nearest dry standing cell from which {@code target} is within reach, or null if only water reaches it. */
     static BlockPos dryStandNear(ClientLevel level, BlockPos target) {
+        return dryStandNear(level, target, pos -> true);
+    }
+
+    static BlockPos dryStandNear(ClientLevel level, BlockPos target, java.util.function.Predicate<BlockPos> allowed) {
         BlockPos best = null;
         double bestDistance = Double.MAX_VALUE;
         for (BlockPos feet : BlockPos.betweenClosed(target.offset(-3, -5, -3), target.offset(3, 1, 3))) {
             if (!MiningPolicy.inReach(feet.getX(), feet.getY(), feet.getZ(), target.getX(), target.getY(), target.getZ())
-                    || !dryStandable(level, feet)) {
+                    || !dryStandable(level, feet) || !allowed.test(feet)) {
                 continue;
             }
             double distance = feet.distSqr(target);
@@ -192,6 +204,38 @@ final class WorldProbe {
             }
         }
         return best;
+    }
+
+    static List<BucketPlan.Source> bucketSources(Minecraft client) {
+        var level = java.util.Objects.requireNonNull(client.level);
+        var player = java.util.Objects.requireNonNull(client.player);
+        BlockPos origin = player.blockPosition();
+        var positions = new ArrayList<BlockPos>();
+        for (BlockPos pos : BlockPos.betweenClosed(origin.offset(-16, -8, -16), origin.offset(16, 8, 16))) {
+            if (!level.hasChunk(pos.getX() >> 4, pos.getZ() >> 4)) continue;
+            var fluid = level.getFluidState(pos);
+            if (fluid.isSource() && fluid.getType() == net.minecraft.world.level.material.Fluids.WATER) positions.add(pos.immutable());
+        }
+        var sources = new ArrayList<BucketPlan.Source>();
+        for (BlockPos pos : positions.stream().sorted(java.util.Comparator.comparingDouble(p -> p.distSqr(origin))).limit(32).toList()) {
+            var target = net.minecraft.world.phys.Vec3.atCenterOf(pos);
+            var hit = level.clip(new net.minecraft.world.level.ClipContext(player.getEyePosition(), target,
+                    net.minecraft.world.level.ClipContext.Block.OUTLINE, net.minecraft.world.level.ClipContext.Fluid.SOURCE_ONLY, player));
+            boolean visible = hit.getType() == net.minecraft.world.phys.HitResult.Type.BLOCK && hit.getBlockPos().equals(pos);
+            BlockPos stand = dryStandNear(level, pos);
+            boolean bank = false;
+            if (stand != null) {
+                var bankEye = net.minecraft.world.phys.Vec3.atCenterOf(stand).add(0, 1.12, 0);
+                var bankHit = level.clip(new net.minecraft.world.level.ClipContext(bankEye, target,
+                        net.minecraft.world.level.ClipContext.Block.OUTLINE, net.minecraft.world.level.ClipContext.Fluid.SOURCE_ONLY, player));
+                bank = bankEye.distanceToSqr(target) <= 20.25 && bankHit.getType() == net.minecraft.world.phys.HitResult.Type.BLOCK
+                        && bankHit.getBlockPos().equals(pos);
+            }
+            BlockPos from = stand == null ? origin : stand;
+            sources.add(new BucketPlan.Source(pos.getX(), pos.getY(), pos.getZ(), from.getX(), from.getY(), from.getZ(),
+                    Math.sqrt(from.distSqr(origin)), player.getEyePosition().distanceToSqr(target) <= 20.25, visible, bank));
+        }
+        return sources;
     }
 
     /** A goto command to a free standing cell within reach of the target, never the target block itself. */
@@ -341,6 +385,56 @@ final class WorldProbe {
         return nearest;
     }
 
+    static BlockPos escapeTarget(ClientLevel level, BlockPos origin, double threatX, double threatZ, int attempt) {
+        var sites = new ArrayList<EscapeRoutes.Site>();
+        for (int direction = 0; direction < 16; direction++) {
+            double angle = (direction + (attempt % 2) * 0.5) * Math.PI / 8;
+            for (int distance : new int[] {8, 16}) {
+                int x = origin.getX() + (int) Math.round(Math.cos(angle) * distance);
+                int z = origin.getZ() + (int) Math.round(Math.sin(angle) * distance);
+                if (!level.hasChunk(x >> 4, z >> 4)) continue;
+                for (int y = origin.getY() - 3; y <= origin.getY() + 3; y++) {
+                    BlockPos feet = new BlockPos(x, y, z);
+                    var ground = level.getBlockState(feet.below());
+                    boolean dry = ground.getFluidState().isEmpty()
+                            && !ground.is(net.minecraft.world.level.block.Blocks.MAGMA_BLOCK)
+                            && !ground.is(net.minecraft.world.level.block.Blocks.CACTUS)
+                            && !ground.is(net.minecraft.world.level.block.Blocks.CAMPFIRE)
+                            && !ground.is(net.minecraft.world.level.block.Blocks.SOUL_CAMPFIRE);
+                    sites.add(new EscapeRoutes.Site(x, y, z, dry,
+                            level.getBlockState(feet).isAir() && level.getBlockState(feet.above()).isAir(),
+                            ground.isFaceSturdy(level, feet.below(), Direction.UP)));
+                }
+            }
+        }
+        return EscapeRoutes.choose(sites, origin.getX(), origin.getY(), origin.getZ(), threatX, threatZ)
+                .map(site -> new BlockPos(site.x(), site.y(), site.z())).orElse(null);
+    }
+
+    /** Loaded air cells above water or solid ground, including surfaces above a submerged player. */
+    static BlockPos nearestWaterExit(ClientLevel level, BlockPos origin, int radius) {
+        BlockPos nearest = null;
+        double best = Double.MAX_VALUE;
+        for (BlockPos pos : BlockPos.betweenClosed(origin.offset(-radius, -2, -radius),
+                origin.offset(radius, 24, radius))) {
+            if (!level.hasChunk(pos.getX() >> 4, pos.getZ() >> 4)
+                    || !level.getBlockState(pos).isAir() || !level.getBlockState(pos.above()).isAir()) {
+                continue;
+            }
+            var below = level.getBlockState(pos.below());
+            if (!below.getFluidState().is(net.minecraft.tags.FluidTags.WATER)
+                    && !below.isFaceSturdy(level, pos.below(), Direction.UP)) {
+                continue;
+            }
+            double distance = pos.distSqr(origin);
+            if (distance < best) {
+                best = distance;
+                nearest = pos.immutable();
+            }
+        }
+        return nearest;
+    }
+
     /**
      * The next house cell needing a plank: a floor cell that is a hole or water, then a walkable cell
      * holding water. Null when the floor is sound and dry.
@@ -402,6 +496,11 @@ final class WorldProbe {
     }
 
     static BlockPos houseFloorProblem(ClientLevel level, int[] origin) {
+        return houseFloorProblem(level, origin, pos -> false);
+    }
+
+    /** As above, ignoring cells {@code skip} accepts (furniture already displaced once and put back). */
+    static BlockPos houseFloorProblem(ClientLevel level, int[] origin, java.util.function.Predicate<BlockPos> skip) {
         for (int[] cell : HouseDesign.floorCells()) {
             BlockPos pos = new BlockPos(origin[0] + cell[0], origin[1] + cell[1], origin[2] + cell[2]);
             var state = level.getBlockState(pos);
@@ -413,6 +512,20 @@ final class WorldProbe {
             BlockPos pos = new BlockPos(origin[0] + cell[0], origin[1] + cell[1], origin[2] + cell[2]);
             if (!level.getBlockState(pos).getFluidState().isEmpty()) {
                 return pos;
+            }
+        }
+        for (int y = 0; y <= 1; y++) {
+            BlockPos entry = new BlockPos(origin[0] + HouseDesign.DOOR_STAND[0], origin[1] + y,
+                    origin[2] + HouseDesign.DOOR_STAND[2]);
+            if (!level.getBlockState(entry).getCollisionShape(level, entry).isEmpty() && !skip.test(entry)) return entry;
+        }
+        for (int y = 0; y < HouseDesign.HEIGHT - 1; y++) {
+            for (int z = 1; z < HouseDesign.LENGTH - 1; z++) {
+                for (int x = 1; x < HouseDesign.WIDTH - 1; x++) {
+                    BlockPos pos = new BlockPos(origin[0] + x, origin[1] + y, origin[2] + z);
+                    var state = level.getBlockState(pos);
+                    if (!state.getCollisionShape(level, pos).isEmpty() && !houseFixture(state, y) && !skip.test(pos)) return pos;
+                }
             }
         }
         return null;
@@ -489,10 +602,84 @@ final class WorldProbe {
         if (!level.hasChunk(origin[0] >> 4, origin[2] >> 4)) {
             return 0;
         }
-        return HouseDesign.completion((x, y, z) -> {
-            var state = level.getBlockState(new BlockPos(origin[0] + x, origin[1] + y, origin[2] + z));
-            return !state.isAir() && state.getFluidState().isEmpty();
-        });
+        return HouseDesign.completion((x, y, z) ->
+                houseBarrier(level, new BlockPos(origin[0] + x, origin[1] + y, origin[2] + z)));
+    }
+
+    private static boolean houseBarrier(ClientLevel level, BlockPos pos) {
+        var state = level.getBlockState(pos);
+        return state.getFluidState().isEmpty() && !state.is(net.minecraft.tags.BlockTags.LEAVES)
+                && state.isCollisionShapeFullBlock(level, pos);
+    }
+
+    static HouseStructure.Result houseStructure(ClientLevel level, int[] origin) {
+        return HouseStructure.inspect((x, y, z) -> {
+            BlockPos pos = new BlockPos(origin[0] + x, origin[1] + y, origin[2] + z);
+            boolean loaded = level.hasChunk(pos.getX() >> 4, pos.getZ() >> 4);
+            if (!loaded) return new HouseStructure.Cell(false, false, false, false, false);
+            var state = level.getBlockState(pos);
+            return new HouseStructure.Cell(true, houseBarrier(level, pos), state.isFaceSturdy(level, pos, Direction.UP),
+                    state.getFluidState().isEmpty(), state.getCollisionShape(level, pos).isEmpty(), houseFixture(state, y));
+        }, houseDoor(level, origin));
+    }
+
+    private static boolean houseFixture(net.minecraft.world.level.block.state.BlockState state, int relativeY) {
+        // Furniture named explicitly: a bed may not report a block entity, and it was broken as "terrain".
+        return (relativeY == 0 && (state.hasBlockEntity() || furniture(state))) || isBedOrDoor(state);
+    }
+
+    /** Blocks the player owns and wants back: never terrain to be cleared without picking them up. */
+    static boolean furniture(net.minecraft.world.level.block.state.BlockState state) {
+        return isBedOrDoor(state) || state.is(net.minecraft.world.level.block.Blocks.CRAFTING_TABLE)
+                || state.is(net.minecraft.world.level.block.Blocks.FURNACE)
+                || state.is(net.minecraft.world.level.block.Blocks.CHEST)
+                || state.is(net.minecraft.world.level.block.Blocks.BARREL);
+    }
+
+    private static boolean isBedOrDoor(net.minecraft.world.level.block.state.BlockState state) {
+        return state.getBlock() instanceof net.minecraft.world.level.block.BedBlock
+                || state.getBlock() instanceof net.minecraft.world.level.block.DoorBlock;
+    }
+
+    static String describeHouse(ClientLevel level) {
+        if (home == null) return "none";
+        var structure = houseStructure(level, home);
+        if (!structure.loaded()) return "unknown (chunks unloaded; last known facts retained)";
+        return "{shell=" + structure.shellReady() + ",enclosed=" + structure.enclosed()
+                + ",missing_barriers=" + structure.missingShell() + ",reason=" + structure.reason() + "}";
+    }
+
+    private static HouseStructure.Door houseDoor(ClientLevel level, int[] origin) {
+        BlockPos lowerPos = new BlockPos(origin[0] + HouseDesign.DOOR_CELL[0], origin[1], origin[2]);
+        if (!level.hasChunk(lowerPos.getX() >> 4, lowerPos.getZ() >> 4)) return new HouseStructure.Door(false, false);
+        var lower = level.getBlockState(lowerPos);
+        var upper = level.getBlockState(lowerPos.above());
+        if (!(lower.getBlock() instanceof net.minecraft.world.level.block.DoorBlock) || !upper.is(lower.getBlock())
+                || !TechTree.isDoor(BuiltInRegistries.BLOCK.getKey(lower.getBlock()).toString()))
+            return new HouseStructure.Door(false, false);
+        var half = net.minecraft.world.level.block.DoorBlock.HALF;
+        var facing = net.minecraft.world.level.block.DoorBlock.FACING;
+        var hinge = net.minecraft.world.level.block.DoorBlock.HINGE;
+        var open = net.minecraft.world.level.block.DoorBlock.OPEN;
+        boolean installed = lower.getValue(half) == net.minecraft.world.level.block.state.properties.DoubleBlockHalf.LOWER
+                && upper.getValue(half) == net.minecraft.world.level.block.state.properties.DoubleBlockHalf.UPPER
+                && lower.getValue(facing) == upper.getValue(facing) && lower.getValue(hinge) == upper.getValue(hinge)
+                && lower.getValue(open).equals(upper.getValue(open)) && lower.getValue(facing).getAxis() == Direction.Axis.Z;
+        return new HouseStructure.Door(installed, installed && !lower.getValue(open));
+    }
+
+    /** First missing/non-barrier shell cell; never selects interior furniture or the intentional doorway. */
+    static BlockPos houseShellProblem(ClientLevel level, int[] origin) {
+        if (!houseStructure(level, origin).loaded()) return null;
+        for (int y = 0; y < HouseDesign.HEIGHT; y++) {
+            for (int z = 0; z < HouseDesign.LENGTH; z++) {
+                for (int x = 0; x < HouseDesign.WIDTH; x++) {
+                    BlockPos pos = new BlockPos(origin[0] + x, origin[1] + y, origin[2] + z);
+                    if (HouseDesign.solid(x, y, z) && !houseBarrier(level, pos)) return pos;
+                }
+            }
+        }
+        return null;
     }
 
     /** The planks type the player holds most of, or the planks of the preferred log. */

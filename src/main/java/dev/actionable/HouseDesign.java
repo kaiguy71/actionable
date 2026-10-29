@@ -38,8 +38,6 @@ final class HouseDesign {
     static final int[] FURNACE_CELL = {2, 0, 2};
     /** Top of the staircase mine, at floor level. */
     static final int[] STAIR_TOP = {3, 0, 1};
-    /** A built house this complete counts as done; Baritone may leave a block or two to terrain. */
-    static final double COMPLETE = 0.85;
 
     private HouseDesign() {
     }
@@ -63,11 +61,11 @@ final class HouseDesign {
         return cells;
     }
 
-    /** Walkable cells (interior and doorway, feet and head height) that must not hold water. */
+    /** Interior airspace and doorway that must not hold fluid. Furniture remains allowed. */
     static java.util.List<int[]> dryCells() {
         java.util.List<int[]> cells = new java.util.ArrayList<>();
-        for (int y = 0; y <= 1; y++) {
-            cells.add(new int[] {DOOR_CELL[0], y, DOOR_CELL[2]});
+        for (int y = 0; y < HEIGHT - 1; y++) {
+            if (y <= 1) cells.add(new int[] {DOOR_CELL[0], y, DOOR_CELL[2]});
             for (int z = 1; z < LENGTH - 1; z++) {
                 for (int x = 1; x < WIDTH - 1; x++) {
                     cells.add(new int[] {x, y, z});
@@ -133,7 +131,7 @@ final class HouseDesign {
         boolean solidAt(int x, int y, int z);
     }
 
-    /** Fraction of the house's plank cells that are filled. */
+    /** Progress display only; structural completion is checked separately by HouseStructure. */
     static double completion(Probe probe) {
         int filled = 0;
         int total = 0;

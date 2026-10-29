@@ -69,7 +69,7 @@ class HouseAndHomeTest {
         assertTrue(floor.stream().allMatch(cell -> cell[1] == -1), "floor cells are one below floor level");
         assertTrue(floor.stream().anyMatch(cell -> cell[0] == 2 && cell[2] == -1), "the step outside the door");
         assertTrue(floor.stream().anyMatch(cell -> cell[0] == 2 && cell[2] == 0), "under the doorway");
-        assertEquals(20, HouseDesign.dryCells().size());
+        assertEquals(29, HouseDesign.dryCells().size());
     }
 
     @Test
@@ -89,7 +89,7 @@ class HouseAndHomeTest {
         assertEquals(1.0, HouseDesign.completion((x, y, z) -> true));
         assertEquals(0.0, HouseDesign.completion((x, y, z) -> false));
         double wallsOnly = HouseDesign.completion((x, y, z) -> y < HouseDesign.HEIGHT - 1);
-        assertTrue(wallsOnly < HouseDesign.COMPLETE, "a house without a roof is not done");
+        assertTrue(wallsOnly < 1.0, "progress is not complete without every roof cell");
     }
 
     @Test

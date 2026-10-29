@@ -10,6 +10,13 @@ import org.junit.jupiter.api.Test;
 
 class TechTreeTest {
     @Test
+    void briefingKnowledgeMatchesImplementedTableAndFurnaceBehavior() {
+        assertTrue(TechTree.useOf(TechTree.CRAFTING_TABLE).orElseThrow().contains("leave it standing"));
+        assertTrue(TechTree.useOf("minecraft:furnace").orElseThrow().contains("smelt in house furnace"));
+        assertFalse(TechTree.useOf("minecraft:raw_iron").orElseThrow().contains("not automated"));
+    }
+
+    @Test
     void cobblestoneIsMinedFromStoneNotFromPlacedCobblestone() {
         assertEquals("minecraft:stone", TechTree.blockToMine("minecraft:cobblestone"));
         assertEquals("minecraft:stone", TechTree.blockToMine("minecraft:stone"));

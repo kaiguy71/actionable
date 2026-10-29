@@ -18,6 +18,10 @@ final class ClaudeCli {
     }
 
     static String request(String system, String prompt, String schema) {
+        return request(system, prompt, schema, response -> { });
+    }
+
+    static String request(String system, String prompt, String schema, java.util.function.Consumer<String> responseLog) {
         Path directory = null;
         Process process = null;
         try {
@@ -56,6 +60,8 @@ final class ClaudeCli {
             if (!process.waitFor(180, TimeUnit.SECONDS)) {
                 throw new IllegalStateException("CLAUDE_TIMEOUT: Claude did not respond within 180 seconds");
             }
+            String response = Files.readString(output, StandardCharsets.UTF_8);
+            responseLog.accept(response);
             if (process.exitValue() != 0) {
                 String detail = Files.readString(errors, StandardCharsets.UTF_8).strip();
                 if (detail.isEmpty()) {
@@ -64,7 +70,7 @@ final class ClaudeCli {
                 throw new IllegalStateException("CLAUDE_REQUEST_FAILED: exit " + process.exitValue()
                         + ": " + detail.substring(0, Math.min(detail.length(), 500)));
             }
-            return parseResponse(Files.readString(output, StandardCharsets.UTF_8));
+            return parseResponse(response);
         } catch (InterruptedException exception) {
             Thread.currentThread().interrupt();
             throw new IllegalStateException("CLAUDE_REQUEST_FAILED: request interrupted");

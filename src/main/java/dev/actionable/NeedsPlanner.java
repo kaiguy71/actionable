@@ -59,7 +59,8 @@ final class NeedsPlanner {
         if (!table) {
             candidates.add(new Task(ProgressPlanner.PLACE_TABLE_IN_HOUSE, "every tool and the bed are crafted at it"));
         }
-        if (!facts.bedPlaced() && TechTree.held(inventory, TechTree.WHITE_WOOL) >= 3) {
+        boolean bedInHand = inventory.keySet().stream().anyMatch(TechTree::isBed);
+        if (!facts.bedPlaced() && (bedInHand || TechTree.held(inventory, TechTree.WHITE_WOOL) >= 3)) {
             candidates.add(new Task(ProgressPlanner.PLACE_BED, "the wool for a bed is already here; then sleep"));
         }
         if (tier == TechTree.Tier.NONE) {
@@ -140,7 +141,7 @@ final class NeedsPlanner {
                 .append(TechTree.count(inventory, TechTree.PLANKS)).append(" planks")
                 .append(", cobblestone=").append(TechTree.count(inventory, TechTree.STONE_MATERIAL))
                 .append(", raw_iron=").append(inventory.getOrDefault("minecraft:raw_iron", 0))
-                .append(", house=").append(facts.houseBuilt() ? "built" : "none")
+                .append(", house_shell=").append(facts.houseBuilt() ? "complete" : "incomplete/unknown")
                 .append(", door=").append(facts.doorPlaced()).append(", table=").append(facts.tableInHouse())
                 .append(", furnace=").append(situation.furnaceInHouse()).append(", bed=").append(facts.bedPlaced())
                 .append('.');

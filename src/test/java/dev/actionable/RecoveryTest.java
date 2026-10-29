@@ -47,6 +47,12 @@ class RecoveryTest {
     }
 
     @Test
+    void equipmentChangesAreObservedWithinASecond() {
+        assertEquals(20, Recovery.delayAfter("equip", "EQUIP_SENT: minecraft:iron_sword"));
+        assertEquals(20, Recovery.delayAfter("equip", "EQUIP_ALREADY: minecraft:iron_sword"));
+    }
+
+    @Test
     void runningBaritoneCommandsStillGetTimeToWork() {
         // Baritone completion is detected separately and triggers an immediate re-plan.
         assertEquals(200, Recovery.delayAfter("baritone", "Started Baritone command; baritone_task=running"));

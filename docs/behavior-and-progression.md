@@ -119,3 +119,29 @@ In autonomous mode, three or more melee mobs within 9 blocks trigger a four-bloc
 blocks. Two or more skeletons in line of sight at 9 or more blocks trigger a four-sided, two-block
 high wall with a roof. Actionable opens a gap and resumes after the threat has been gone for about
 four seconds, or after 60 seconds.
+
+### Diamond mine
+
+Any `mine N minecraft:diamond` (or `diamond_ore`) is run by code (`DeepMiner`, rules in `DeepMine`), not
+sent to Baritone directly, because diamonds are rarely loaded near the surface. It needs the Overworld,
+a pickaxe that can harvest diamonds, and cave gear (a pickaxe and a weapon). It then:
+
+1. walks clear of the house if needed, then digs a three-tall staircase down from where the player
+   stands to y=-58, heading east; it refuses to dig the house shell or floor;
+2. digs level two-tall tunnels there in a square spiral (legs of 16, 16, 32, 32, ... up to 64 blocks);
+3. while tunneling, every 2 seconds scans the loaded blocks within 32 blocks sideways and 16 up and down for diamond
+   ore. Ore within 40 blocks is handed to Baritone (`mine N <ore block>`); when Baritone goes idle,
+   or after 2 minutes, the mine looks again and resumes digging from where the player is. Ore Baritone
+   fails to reach after 3 tries is skipped;
+4. turns to another heading when the next cell touches lava, water, unloaded terrain, falling blocks,
+   damaging ground, or has no solid floor, and ends if all
+   four headings are blocked. It also ends at low health or food, a full inventory, 600 blocks dug with
+   no diamond, or 20 minutes, then walks back to the house door.
+
+It also returns when its diamond-capable pickaxe is lost. The mining step cannot advance until the
+return finishes (or times out after five minutes). Failed runs enter the normal goal retry cooldown.
+Night, danger, drowning, a new task and disconnect cancel its block breaking. Not verified in-game yet.
+Baritone's ability to reach buried ore selected by the scan remains an in-game assumption.
+The default diamond fallback is Overworld-only and reports `MINE_FAILED_WRONG_DIMENSION` in the Nether;
+autonomous fortress exploration is not implemented. Interrupted runs start from the current position;
+there is no persisted deep-mine entrance or tunnel-resume state.

@@ -125,6 +125,12 @@ class SafetyAndMiningTest {
     }
 
     @Test
+    void distantSurfaceDepositsRemainEligibleWithoutGear() {
+        MiningPolicy.Site distant = site(160, 70, 0, 15, true, 0, 160);
+        assertEquals(distant, MiningPolicy.choose(List.of(distant), false, List.of()).orElseThrow());
+    }
+
+    @Test
     void treesAtNightAreStillMinable() {
         // Trunk side under a dark canopy at night: no sky, low light, but at surface level.
         assertTrue(MiningPolicy.safe(site(0, 70, 0, 3, false, 0, 6), false));

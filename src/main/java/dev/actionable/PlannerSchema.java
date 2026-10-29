@@ -22,7 +22,8 @@ final class PlannerSchema {
                     {"type":"object","properties":{"summary":{"type":"string"},"goal":{"type":"string"},
                     "complete":{"type":"boolean"},"step_complete":{"type":"boolean"},"action":{
                     "type":"object","properties":{"type":{"type":"string","enum":["baritone","wait",
-                    "lookup","place_block","attack","craft","use_block","menu","screenshot","break_block","white_flag"]},
+                    "lookup","place_block","jump_place","attack","craft","equip","use_block","use_item","menu","screenshot","break_block","white_flag"]},
+                    "face":{"type":"string","enum":["up","down","north","south","east","west"]},
                     "op":{"type":"string","enum":["read","quick_move","move","drop","close"]},
                     "slot":{"type":"integer"},"to_slot":{"type":"integer"},"command":{"type":"string"},
                     "query":{"type":"string"},"block":{"type":"string"},"item":{"type":"string"},

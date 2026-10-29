@@ -29,6 +29,10 @@ final class MenuActions {
             return "USE_FAILED_NO_WORLD: no active world";
         }
         BlockPos pos = new BlockPos(x, y, z);
+        if (client.level.getBlockState(pos).getBlock() instanceof net.minecraft.world.level.block.BedBlock
+                && !ItemUseRules.mayUseBed(client.level.dimension().identifier().toString())) {
+            return "USE_FAILED_EXPLOSIVE_BED: beds cannot be used safely in this dimension";
+        }
         if (client.level.getBlockState(pos).isAir()) {
             return "USE_FAILED_AIR: no block at " + x + "," + y + "," + z;
         }

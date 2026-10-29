@@ -21,7 +21,8 @@ final class ActionPlanner {
     static final Set<String> MENU_OPS = Set.of("read", "quick_move", "move", "drop", "close");
     private static final Set<String> ALLOWED_COMMANDS =
             Set.of("mine", "goto", "cancel");
-    private static final String SYSTEM_PROMPT = """
+    private static final String GOAL_HEADER = "GET TO THE NETHER!!!\n\n";
+    private static final String SYSTEM_PROMPT = GOAL_HEADER + """
             You plan Minecraft tasks and can issue one next action per turn.
             Coordinates are integer block positions x,y,z. Minecraft convention: +X is east, +Z is south,
             +Y is up; -X west and -Z north. Yaw 0 faces +Z (south), yaw 90 faces -X (west),
@@ -37,9 +38,11 @@ final class ActionPlanner {
               mining until the quantity is reached or the command is replaced. Quantity comes first; no
               coordinates or extra args.
             - goto <x> <y> <z>: exactly three integer coordinates; goto does not accept block IDs.
+            - mine <n> minecraft:diamond: code digs a staircase down to y=-58, tunnels there, scans the
+              loaded blocks every two seconds for diamond ore and mines it. Use it to find diamonds.
             - cancel: stops the running Baritone command.
-            Never emit coordinates after mine and never emit a block ID to goto. Do not invent other
-            commands.
+            Never emit coordinates after mine and never emit a block ID to goto.
+            Do not invent other commands.
 
             Travel (long-distance search): {"type":"travel","direction":"NORTH"} (or SOUTH, EAST, WEST)
             walks about 500 blocks that way to the surface, over loaded and unloaded terrain alike. It is the
@@ -85,9 +88,9 @@ final class ActionPlanner {
             (planks, sticks, crafting table, torches) work anywhere; 3x3 recipes (pickaxes, axes, swords,
             shovels, furnace, chest) need a placed crafting table within 4 blocks: place one, or goto the
             nearest_crafting_table first. A crafting table is reusable: mining a placed table (by hand
-            is fine) puts it back in your inventory. After crafting, mine it to take it along, and when a
-            table is in your inventory or nearest_crafting_table shows one, reuse it; never craft a second
-            table. Plan steps map directly to actions: "craft N X" ->
+            is fine) puts it back in your inventory. Leave placed tables standing after crafting. If nearest_crafting_table shows one,
+            walk to it and reuse it; never craft a second table. Reclaim one only for an explicit
+            relocation into an already built house. Plan steps map directly to actions: "craft N X" ->
             {"type":"craft","item":X,"count":N}; "mine N X" -> Baritone "mine N X"; "place
             minecraft:crafting_table nearby" -> place_block at a nearby_placement_candidates position.
 
@@ -101,6 +104,25 @@ final class ActionPlanner {
             the surface when health is low. Torches are placed automatically when it is dark and you hold some,
             and blocks, tools and food are moved to the hotbar for you: just name the item.
             Use "lookup" with a short search query to find registered block/item IDs or player-known recipes.
+            Nether entry is the objective. Iron/diamond tools and armor, a shield, bucket, flint and steel,
+            and golden boots are craftable. Smelt raw iron/gold before crafting ingot items.
+            Use {"type":"use_item","item":"minecraft:bucket","x":0,"y":64,"z":0} on an observed
+            water/lava SOURCE to fill a bucket. With a full bucket, specify the solid clicked block and
+            its face (up/down/north/south/east/west); fluid goes into the adjacent cell. Move within
+            reach with clear sight first; keep lava away from yourself and never place water in the Nether.
+            Water placed beside lava sources makes obsidian; flowing lava may make cobblestone instead.
+            Harvest ordinary obsidian with a diamond pickaxe. Do not use crying obsidian for a portal.
+            The reliable supported portal route is 10 obsidian plus flint and steel. Choose dry clear
+            ground, clear a 4-wide by 5-high plane and keep access on both sides. For a frame in the X/Y
+            plane with origin (X,Y,Z), place the bottom at (X+1,Y,Z),(X+2,Y,Z), the sides at
+            (X,Y+1..Y+3,Z),(X+3,Y+1..Y+3,Z), and the top at (X+1,Y+4,Z),(X+2,Y+4,Z).
+            The four corners can be spare solid blocks; keep the 2x3 interior empty. Place blocks one at
+            a time using supports or temporary scaffolding, verifying each placement. Ignite by using
+            {"type":"use_item","item":"minecraft:flint_and_steel","x":X+1,"y":Y,"z":Z,"face":"up"}
+            with actual integer coordinates. Observe minecraft:nether_portal blocks, walk into the
+            interior and stay there for the transition. Do not claim Nether entry until dimension is
+            minecraft:the_nether. Equip armor before entering. A shield can be equipped but active
+            shield blocking and ranged attacks are not automated. Beds explode in the Nether: do not sleep there.
             Lookup results are local game data and will be supplied in the next turn. Do not invent global
             biome/dimension/ore-generation ranges; only report nearby loaded observations in the synopsis.
             Basic melee combat is available: {"type":"attack","entity_id":123} sends one hit to a
@@ -114,6 +136,12 @@ final class ActionPlanner {
             itself in (4 sides, 2 high, plus a roof), then opens a gap once they are gone. Carry spare cobblestone.
             Never target players or neutral mobs. Flee when health is 6 or lower.
             Observe target health/death before claiming damage or kills; repeat attack if still needed.
+            The synopsis lists everything carried: occupied inventory slots, totals, held_item, offhand, armor worn
+            (head/chest/legs/feet) and free_inventory_slots. Use {"type":"equip","item":"minecraft:iron_sword"}
+            to hold a tool or weapon, or to wear armor or a shield, that is already in the inventory.
+            Equip only items the inventory lists; equipping cannot create items. When an item is already
+            held or worn the result is EQUIP_ALREADY: do not repeat it.
+            A result starting REPEAT_BLOCKED means the action was refused for looping; choose something else.
 
             Counting: every quantity is a TOTAL to hold, never an amount to add. "mine 18 minecraft:birch_log"
             mines only until the inventory holds 18 birch logs in total. Read the inventory/totals fields
@@ -169,6 +197,8 @@ final class ActionPlanner {
                 "action":{"type":"place_block","block":"minecraft:crafting_table","x":-11,"y":120,"z":15}}
             or {"summary":"identify item","goal":"look up crafting table","complete":false,
                 "action":{"type":"lookup","query":"crafting table"}}
+            or {"summary":"hold sword","goal":"prepare to fight","complete":false,
+                "action":{"type":"equip","item":"minecraft:stone_sword"}}
             or {"summary":"make handles","goal":"craft sticks","complete":false,
                 "action":{"type":"craft","item":"minecraft:stick","count":4}}
             or {"summary":"open the table","goal":"use crafting table","complete":false,
@@ -196,12 +226,15 @@ final class ActionPlanner {
             missing, continue working instead. A completion that fails that check is sent back to you.
             """;
 
-    private static final String DECOMPOSE_PROMPT = """
+    private static final String DECOMPOSE_PROMPT = GOAL_HEADER + """
             You break a Minecraft task into an ordered plan of concrete, verifiable steps.
             Each step must be achievable with these abilities only: Baritone navigation and mining
             (mine, goto, travel), crafting items in craftable_catalog,
-            placing a single block from inventory, close-range melee against hostile mobs, and looking up
-            block/item IDs. Building from schematics is NOT available.
+            placing a single block from inventory, using buckets/flint and steel on observed coordinates,
+            close-range melee against hostile mobs, equipping items
+            already carried, and looking up block/item IDs. Building from schematics is NOT available.
+            Avoid adjacent duplicate steps and cap each gathering step at 64 items.
+            A later gathering step may repeat an earlier one if crafting consumed the first batch.
             Every material you gather must be used by a later step or by the task itself; know why you
             collect it. Use the progression briefing: tools come before the blocks that need them (stone,
             coal and ores drop nothing without the right pickaxe), and cobblestone is obtained by mining
@@ -210,32 +243,35 @@ final class ActionPlanner {
             "craft 12 minecraft:oak_planks", "place minecraft:crafting_table nearby", "build house",
             "hunt 3 minecraft:white_wool" (kill white sheep), "place minecraft:white_bed in house",
             "place minecraft:crafting_table in house", "place door in house", "go to house" (to craft at
-            the house table). "build house" runs a Baritone schematic that finishes the whole house by itself; never place planks
-            by hand to complete or extend it, and treat HOUSE_BUILD_DONE as final. The house crafting table is never picked up. Quantities are totals
+            the house table). Build the house before any step that places furniture inside it. "build house" runs a
+            Baritone schematic that finishes the whole house by itself; never place planks by hand to complete or
+            extend it, and treat HOUSE_BUILD_DONE as final. The house crafting table is never picked up. Quantities are totals
             to hold when the step finishes. 3x3 recipes need a placed crafting table. Reuse the crafting
-            table: if one is in inventory, place it; if one is placed elsewhere, "mine 1
-            minecraft:crafting_table" picks it up. Never plan to craft a second table. End a plan that
-            used a table with "mine 1 minecraft:crafting_table" to take it along.
-            Use the fewest steps that actually accomplish the task.
-            Each (verb, item) pair appears at most once: "mine 18 minecraft:birch_log" already collects all
-            18 logs. Never split one quantity into repeated steps. Use the exact wood/stone type the task
+            table: if one is in inventory, place it; if one is placed elsewhere, "go to crafting table"
+            walks there to use it. Never plan a second table or a pickup after crafting. Only reclaim
+            a table when explicitly relocating it into an already built house.
+            Use the fewest steps that actually accomplish the task, at most 8.
+            Combine gathering requirements when possible: "mine 18 minecraft:birch_log" collects a total
+            of 18 logs. Repeat gathering only when an intervening craft consumes the earlier batch.
+            Use the exact wood/stone type the task
             names, and check the inventory first; hold-totals already met need no step.
             Return only JSON: {"steps":["mine 3 minecraft:oak_log","craft 12 minecraft:oak_planks"]}
             """;
-    private static final String JUDGE_PROMPT = """
+    private static final String JUDGE_PROMPT = GOAL_HEADER + """
             You judge whether one Minecraft objective is already satisfied.
             You are given the objective, the player's inventory, and what was recently done.
             Answer only from that evidence. If the objective names a quantity of an item, it is
             satisfied only when the inventory holds at least that quantity.
             Return only JSON: {"done":true,"why":"short reason"} or {"done":false,"why":"short reason"}
             """;
-    private static final String DIRECTOR_PROMPT = """
+    private static final String DIRECTOR_PROMPT = GOAL_HEADER + """
             You decide what a Minecraft player should do next, with no human giving instructions.
             You are given a progression briefing, the world state (including a safety assessment), goals
             already achieved, and goals recently attempted.
             Abilities: Baritone navigation and mining (mine, goto, travel),
             crafting the items in craftable_catalog (2x2 anywhere, 3x3 at a placed crafting table), placing
-            a block from inventory, close-range melee against hostile mobs, and looking up IDs.
+            a block from inventory, close-range melee against hostile mobs, equipping items already
+            carried, and looking up IDs.
             Schematic building is NOT available.
             Decide WHY before WHAT. Every material must be for something: name what the goal unlocks or
             lets you craft, using inventory_uses and next_milestone. Never gather a material that nothing
@@ -243,7 +279,7 @@ final class ActionPlanner {
             Tools gate mining: stone, coal ore and every ore drop nothing without a pickaxe, and iron ore
             needs a stone pickaxe. Never choose to mine a block in cannot_mine_yet; craft the tool instead.
             Cobblestone comes from mining minecraft:stone; never go looking for placed cobblestone.
-            A crafting table is reusable (mine it to pick it up); never choose to craft a second one while
+            A crafting table is reusable: walk to it and leave it standing after crafting. Never choose a second one while
             crafting_table shows one in inventory or placed nearby.
             Safety comes first. Darkness alone is only caution: at night keep working, or prepare (weapon,
             torches, lantern/campfire, bed) and sleep. If safety level=danger because of low health or
@@ -272,12 +308,32 @@ final class ActionPlanner {
             unless the state shows it clearly failed and is still worth doing.
             Goal forms: "craft 1 minecraft:wooden_pickaxe", "mine 8 minecraft:oak_log", "build house",
             "hunt 3 minecraft:white_wool", "place minecraft:crafting_table in house", "place door in house",
-            "place minecraft:white_bed in house".
+            "place minecraft:white_bed in house", "mine 3 minecraft:diamond" (stairs down to the diamond layer,
+            then tunnels and scans for ore; needs an iron pickaxe and a weapon).
             Return only JSON: {"goal":"craft 1 minecraft:wooden_pickaxe",
              "why":"stone and coal drop nothing without a pickaxe; it unlocks cobblestone for stone tools"}
             """;
+    static String systemPrompt(String stage) {
+        return switch (stage) {
+            case "director" -> DIRECTOR_PROMPT;
+            case "decomposition" -> DECOMPOSE_PROMPT;
+            case "action" -> SYSTEM_PROMPT;
+            case "judge" -> JUDGE_PROMPT;
+            default -> throw new IllegalArgumentException("Unknown planner stage: " + stage);
+        };
+    }
+
     private static final String DEFAULT_ENDPOINT = "http://localhost:11434/api/chat";
     private static final java.util.concurrent.atomic.AtomicLong REQUEST_IDS = new java.util.concurrent.atomic.AtomicLong();
+
+    private record RequestContext(long id, String stage, String provider) { }
+    private final ThreadLocal<RequestContext> requestContext = new ThreadLocal<>();
+
+    private void logResponseBody(String body) {
+        RequestContext context = requestContext.get();
+        ActionableLog.LOGGER.info("{}", ActionableLog.modelResponseBody(
+                context.id(), context.stage(), context.provider(), body));
+    }
 
     private <T> T loggedRequest(String stage, java.util.function.Supplier<T> request) {
         long id = REQUEST_IDS.incrementAndGet();
@@ -288,6 +344,7 @@ final class ActionPlanner {
                 : System.getProperty("actionable.ollama.model", "gemma3:4b");
         ActionableLog.LOGGER.info("[Actionable] model_request id={} stage={} provider={} model={}",
                 id, stage, ActionableLog.text(provider), ActionableLog.text(model));
+        requestContext.set(new RequestContext(id, stage, provider));
         try {
             T result = request.get();
             ActionableLog.LOGGER.info("[Actionable] model_response id={} stage={} elapsed_ms={}",
@@ -298,6 +355,8 @@ final class ActionPlanner {
                     id, stage, (System.nanoTime() - started) / 1_000_000,
                     ActionableLog.text(safeMessage(exception)));
             throw exception;
+        } finally {
+            requestContext.remove();
         }
     }
 
@@ -353,7 +412,7 @@ final class ActionPlanner {
         body.addProperty("format", "json");
 
         JsonArray messages = new JsonArray();
-        messages.add(message("system", DIRECTOR_PROMPT));
+        messages.add(message("system", systemPrompt("director")));
         messages.add(message("user", briefing
                 + "\nGoals already achieved: " + (achieved.isBlank() ? "none" : achieved)
                 + "\nGoals recently attempted: " + (attempted.isBlank() ? "none" : attempted)
@@ -385,7 +444,7 @@ final class ActionPlanner {
         body.addProperty("format", "json");
 
         JsonArray messages = new JsonArray();
-        messages.add(message("system", JUDGE_PROMPT));
+        messages.add(message("system", systemPrompt("judge")));
         messages.add(message("user", "Objective: " + objective + "\nInventory: "
                 + (inventory.isBlank() ? "unknown" : inventory)
                 + "\nRecently done: " + (recent.isBlank() ? "none" : recent)));
@@ -405,7 +464,7 @@ final class ActionPlanner {
         body.addProperty("format", "json");
 
         JsonArray messages = new JsonArray();
-        messages.add(message("system", SYSTEM_PROMPT));
+        messages.add(message("system", systemPrompt("action")));
         messages.add(message("user", "Task: " + task + "\n" + planContext
                 + "\nRecent action history (oldest first): " + (history.isEmpty() ? "none" : history)
                 + "\nPrevious action: "
@@ -432,7 +491,7 @@ final class ActionPlanner {
         body.addProperty("format", "json");
 
         JsonArray messages = new JsonArray();
-        messages.add(message("system", DECOMPOSE_PROMPT));
+        messages.add(message("system", systemPrompt("decomposition")));
         messages.add(message("user", "Task: " + task + "\n" + briefing + "\nCurrent world state: " + synopsis));
         body.add("messages", messages);
 
@@ -440,15 +499,14 @@ final class ActionPlanner {
     }
 
     private String send(String endpoint, JsonObject body) {
+        String stage = requestContext.get().stage();
         JsonArray sent = body.getAsJsonArray("messages");
         String system = sent.get(0).getAsJsonObject().get("content").getAsString();
-        String stage = system.equals(DIRECTOR_PROMPT) ? "director" : system.equals(DECOMPOSE_PROMPT)
-                ? "decomposition" : system.equals(JUDGE_PROMPT) ? "judge" : "action";
         String user = sent.get(1).getAsJsonObject().get("content").getAsString();
         boolean hasImage = sent.get(1).getAsJsonObject().has("images");
         long started = System.nanoTime();
         try {
-            String response = sendRequest(endpoint, body);
+            String response = sendRequest(endpoint, body, stage);
             ContextCapture.exchange(stage, system, user, hasImage, response,
                     (System.nanoTime() - started) / 1_000_000, null);
             return response;
@@ -459,19 +517,18 @@ final class ActionPlanner {
         }
     }
 
-    private String sendRequest(String endpoint, JsonObject body) {
+    private String sendRequest(String endpoint, JsonObject body, String stage) {
         String provider = System.getProperty("actionable.model.provider", "ollama");
         if (provider.equalsIgnoreCase("claude")) {
             JsonArray messages = body.getAsJsonArray("messages");
             String system = messages.get(0).getAsJsonObject().get("content").getAsString();
-            String stage = system.equals(DIRECTOR_PROMPT) ? "director" : system.equals(DECOMPOSE_PROMPT)
-                    ? "decomposition" : system.equals(JUDGE_PROMPT) ? "judge" : "action";
             return ClaudeCli.request(system,
-                    messages.get(1).getAsJsonObject().get("content").getAsString(), PlannerSchema.forStage(stage));
+                    messages.get(1).getAsJsonObject().get("content").getAsString(), PlannerSchema.forStage(stage), this::logResponseBody);
         }
         if (!provider.equalsIgnoreCase("ollama")) {
             throw new IllegalStateException("Unknown actionable.model.provider: " + provider);
         }
+        OllamaProtocol.configure(body, stage);
         // Keep the model loaded between calls; reloading it cost about 10 seconds after any pause.
         body.addProperty("keep_alive", System.getProperty("actionable.ollama.keepAlive", "30m"));
         HttpRequest request = HttpRequest.newBuilder(URI.create(endpoint))
@@ -481,11 +538,11 @@ final class ActionPlanner {
                 .build();
         try {
             HttpResponse<String> response = http.send(request, HttpResponse.BodyHandlers.ofString());
+            logResponseBody(response.body());
             if (response.statusCode() < 200 || response.statusCode() >= 300) {
                 throw new IllegalStateException("Ollama returned HTTP " + response.statusCode());
             }
-            JsonObject responseJson = JsonParser.parseString(response.body()).getAsJsonObject();
-            return responseJson.getAsJsonObject("message").get("content").getAsString();
+            return OllamaProtocol.content(response.body());
         } catch (Exception exception) {
             throw new IllegalStateException("Could not get a plan from Ollama: " + safeMessage(exception), exception);
         }
@@ -556,6 +613,14 @@ final class ActionPlanner {
             }
             return Optional.empty();
         }
+        if (type.equals("equip")) {
+            String item = action.has("item") ? action.get("item").getAsString()
+                    : action.has("block") ? action.get("block").getAsString() : "";
+            if (item.matches("[a-z0-9_.-]+:[a-z0-9_./-]+")) {
+                return Optional.of(new PlannedAction("equip", item, "", 0, 0, 0, ""));
+            }
+            return Optional.empty();
+        }
         if (type.equals("craft") && action.has("item")) {
             String item = cleanText(action, "item", "", 80).strip().toLowerCase(Locale.ROOT);
             int count = action.has("count") && action.get("count").isJsonPrimitive()
@@ -572,6 +637,20 @@ final class ActionPlanner {
             String query = cleanText(action, "query", "", 80);
             return query.isBlank() ? Optional.empty()
                     : Optional.of(new PlannedAction("lookup", "", "", 0, 0, 0, query));
+        }
+        if (type.equals("use_item") && action.has("item") && action.has("x") && action.has("y") && action.has("z")) {
+            String item = cleanText(action, "item", "", 80).strip().toLowerCase(Locale.ROOT);
+            String face = cleanText(action, "face", "up", 10).strip().toLowerCase(Locale.ROOT);
+            try {
+                long x = Long.parseLong(action.get("x").toString());
+                long y = Long.parseLong(action.get("y").toString());
+                long z = Long.parseLong(action.get("z").toString());
+                return ItemUseRules.valid(item, face, x, y, z)
+                        ? Optional.of(new PlannedAction("use_item", face, item, (int) x, (int) y, (int) z, ""))
+                        : Optional.empty();
+            } catch (NumberFormatException malformed) {
+                return Optional.empty();
+            }
         }
         if (type.equals("travel") || type.equals("explore")) {
             String direction = firstOf(action, "", "direction", "dir", "heading").toUpperCase(Locale.ROOT);
@@ -644,7 +723,7 @@ final class ActionPlanner {
                     + " " + firstOf(action, "", "block", "block_id", "blockID", "item", "target");
             case "goto" -> verb + " " + firstOf(action, "", "x") + " " + firstOf(action, "", "y")
                     + " " + firstOf(action, "", "z");
-            case "cancel" -> verb;
+            case "cancel", "come" -> verb;
             default -> verb + " " + firstOf(action, "", "target", "block", "block_id", "item", "name");
         };
     }
@@ -685,7 +764,7 @@ final class ActionPlanner {
                     return Optional.empty();
                 }
             }
-            case "cancel" -> {
+            case "come", "cancel" -> {
                 if (parts.length != 1) {
                     return Optional.empty();
                 }

@@ -5,21 +5,16 @@ import net.minecraft.commands.arguments.EntityAnchorArgument;
 import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.world.InteractionHand;
 import net.minecraft.world.entity.Entity;
-import net.minecraft.world.entity.monster.Monster;
 
 /** Close-range melee only: no pathfinding, player targets, or neutral-mob provocation. */
 final class MeleeCombat {
     private MeleeCombat() { }
 
     static boolean allowed(Entity entity) {
-        if (!(entity instanceof Monster monster) || !entity.isAlive()) {
-            return false;
-        }
-        String id = BuiltInRegistries.ENTITY_TYPE.getKey(entity.getType()).toString();
-        return !id.equals("minecraft:creeper") && !id.equals("minecraft:enderman")
-                && !id.equals("minecraft:zombified_piglin") && !id.equals("minecraft:piglin")
-                && ((!id.equals("minecraft:spider") && !id.equals("minecraft:cave_spider"))
-                    || (monster.getTarget() != null && monster.getTarget() == Minecraft.getInstance().player));
+        if (!(entity instanceof net.minecraft.world.entity.LivingEntity)
+                || entity instanceof net.minecraft.world.entity.player.Player || !entity.isAlive()) return false;
+        String kind = BuiltInRegistries.ENTITY_TYPE.getKey(entity.getType()).toString();
+        return ThreatProbe.hostile(Minecraft.getInstance(), entity) && !ThreatRules.avoidMelee(kind);
     }
 
     static boolean reachable(Minecraft client, Entity entity) {
@@ -44,9 +39,15 @@ final class MeleeCombat {
         return nearest;
     }
 
+    static boolean inputAvailable(Minecraft client) {
+        return InteractionPolicy.mayAttack(Boolean.getBoolean("actionable.background"),
+                client.isWindowActive(), client.mouseHandler.isMouseGrabbed(),
+                client.gui.screen() != null, client.isPaused());
+    }
+
     static String attack(Minecraft client, int entityId) {
         if (client.player == null || client.level == null || client.gameMode == null
-                || !client.player.isAlive() || !client.mouseHandler.isMouseGrabbed() || !client.isWindowActive()) {
+                || !client.player.isAlive() || !inputAvailable(client)) {
             return "ATTACK_FAILED_UNAVAILABLE";
         }
         if (client.player.getHealth() <= 6) {

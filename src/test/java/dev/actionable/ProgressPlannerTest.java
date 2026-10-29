@@ -87,6 +87,18 @@ class ProgressPlannerTest {
     }
 
     @Test
+    void houseIsBuiltBeforeItsTableIsRelocated() {
+        var plan = ProgressPlanner.stepsForGoal(ProgressPlanner.PLACE_TABLE_IN_HOUSE,
+                Map.of("minecraft:oak_planks", 100), ProgressPlanner.TableAccess.ELSEWHERE, OAK,
+                ProgressPlanner.Facts.NONE);
+        assertTrue(plan.indexOf(ProgressPlanner.BUILD_HOUSE) >= 0);
+        assertTrue(plan.indexOf(ProgressPlanner.BUILD_HOUSE) < plan.indexOf("mine 1 minecraft:crafting_table"));
+        assertTrue(plan.indexOf("mine 1 minecraft:crafting_table") < plan.indexOf(ProgressPlanner.PLACE_TABLE_IN_HOUSE));
+        assertEquals(Optional.of(false), ProgressPlanner.stepSatisfied(ProgressPlanner.GO_TABLE, Map.of(), false));
+        assertEquals(Optional.of(true), ProgressPlanner.stepSatisfied(ProgressPlanner.GO_TABLE, Map.of(), true));
+    }
+
+    @Test
     void doorIsCraftedAtTheHouseTableAndHung() {
         assertEquals(List.of("craft 3 minecraft:oak_door", "place door in house"), ProgressPlanner.stepsForGoal(
                 "place door in house", Map.of("minecraft:oak_planks", 6), ProgressPlanner.TableAccess.HOME_NEARBY, OAK));
@@ -131,10 +143,10 @@ class ProgressPlannerTest {
                 "minecraft:wooden_pickaxe", 1, "minecraft:stone_axe", 1, "minecraft:stone_shovel", 1),
                 furnace).orElseThrow();
         assertEquals("mine 12 minecraft:iron_ore", iron.goal());
-        assertTrue(ProgressPlanner.nextMilestone(Map.of("minecraft:iron_pickaxe", 1, "minecraft:iron_sword", 1,
+        assertEquals("craft 1 minecraft:shield", ProgressPlanner.nextMilestone(Map.of("minecraft:iron_pickaxe", 1, "minecraft:iron_sword", 1,
                 "minecraft:torch", 20, "minecraft:cooked_beef", 3, "minecraft:raw_iron", 12, "minecraft:wooden_axe", 1,
                 "minecraft:wooden_pickaxe", 1, "minecraft:stone_axe", 1, "minecraft:stone_shovel", 1),
-                furnace).isEmpty());
+                furnace).orElseThrow().goal());
     }
 
     @Test
@@ -181,7 +193,7 @@ class ProgressPlannerTest {
     }
 
     @Test
-    void woodenPickaxeFromNothingCraftsATableAndTakesItAlong() {
+    void woodenPickaxeFromNothingLeavesTheTableStanding() {
         List<String> steps = ProgressPlanner.stepsFor("minecraft:wooden_pickaxe", 1, Map.of(), false, OAK);
         assertEquals(List.of(
                 "mine 3 minecraft:oak_log",
@@ -189,24 +201,21 @@ class ProgressPlannerTest {
                 "craft 4 minecraft:stick",
                 "craft 1 minecraft:crafting_table",
                 "place minecraft:crafting_table nearby",
-                "craft 1 minecraft:wooden_pickaxe",
-                "mine 1 minecraft:crafting_table"), steps);
+                "craft 1 minecraft:wooden_pickaxe"), steps);
     }
 
     @Test
     void existingTableAndPlanksShortenThePlan() {
         List<String> steps = ProgressPlanner.stepsFor("minecraft:wooden_pickaxe", 1,
                 Map.of("minecraft:birch_planks", 5), true, "minecraft:birch_log");
-        assertEquals(List.of("craft 4 minecraft:stick", "craft 1 minecraft:wooden_pickaxe",
-                "mine 1 minecraft:crafting_table"), steps);
+        assertEquals(List.of("craft 4 minecraft:stick", "craft 1 minecraft:wooden_pickaxe"), steps);
     }
 
     @Test
     void heldTableIsPlacedInsteadOfCrafted() {
         List<String> steps = ProgressPlanner.stepsFor("minecraft:wooden_pickaxe", 1,
                 Map.of("minecraft:oak_planks", 3, "minecraft:stick", 2, "minecraft:crafting_table", 1), false, OAK);
-        assertEquals(List.of("place minecraft:crafting_table nearby", "craft 1 minecraft:wooden_pickaxe",
-                "mine 1 minecraft:crafting_table"), steps);
+        assertEquals(List.of("place minecraft:crafting_table nearby", "craft 1 minecraft:wooden_pickaxe"), steps);
     }
 
     @Test
@@ -218,19 +227,16 @@ class ProgressPlannerTest {
                 "mine 1 minecraft:oak_log",
                 "craft 4 minecraft:oak_planks",
                 "craft 4 minecraft:stick",
-                "craft 1 minecraft:stone_pickaxe",
-                "mine 1 minecraft:crafting_table"), steps);
+                "craft 1 minecraft:stone_pickaxe"), steps);
     }
 
     @Test
-    void aTablePlacedElsewhereIsPickedUpInsteadOfCrafted() {
+    void aTablePlacedElsewhereIsWalkedToInsteadOfReclaimed() {
         List<String> steps = ProgressPlanner.stepsFor("minecraft:wooden_pickaxe", 1,
                 Map.of("minecraft:oak_planks", 3, "minecraft:stick", 2), ProgressPlanner.TableAccess.ELSEWHERE, OAK);
         assertEquals(List.of(
-                "mine 1 minecraft:crafting_table",
-                "place minecraft:crafting_table nearby",
-                "craft 1 minecraft:wooden_pickaxe",
-                "mine 1 minecraft:crafting_table"), steps);
+                "go to crafting table",
+                "craft 1 minecraft:wooden_pickaxe"), steps);
         assertTrue(steps.stream().noneMatch(step -> step.startsWith("craft 1 minecraft:crafting_table")));
     }
 
@@ -271,7 +277,7 @@ class ProgressPlannerTest {
     @Test
     void briefingSaysWhereTheTableIsAndToReuseIt() {
         assertTrue(ProgressPlanner.briefing(Map.of(), ProgressPlanner.TableAccess.ELSEWHERE, OAK)
-                .contains("crafting_table=placed nearby, see nearest_crafting_table (mine it to pick it up"));
+                .contains("crafting_table=placed nearby, see nearest_crafting_table (go to crafting table"));
         assertTrue(ProgressPlanner.briefing(Map.of("minecraft:crafting_table", 1), ProgressPlanner.TableAccess.NONE, OAK)
                 .contains("crafting_table=in inventory"));
         assertTrue(ProgressPlanner.briefing(Map.of(), ProgressPlanner.TableAccess.NONE, OAK)
@@ -349,7 +355,18 @@ class ProgressPlannerTest {
         assertTrue(ProgressPlanner.goalProblem("craft 1 minecraft:beacon", Map.of()).isPresent());
         assertEquals(Optional.empty(), ProgressPlanner.goalProblem("mine 16 minecraft:oak_log", Map.of()));
         assertEquals(Optional.empty(), ProgressPlanner.goalProblem("craft 1 minecraft:wooden_pickaxe", Map.of()));
-        assertEquals(Optional.empty(), ProgressPlanner.goalProblem("explore", Map.of()));
+        // Exploring was removed: it circled and gave up, so the planner is pointed at diamonds instead.
+        assertTrue(ProgressPlanner.goalProblem("explore", Map.of()).orElseThrow().contains("not available"));
+        assertTrue(ProgressPlanner.goalProblem("Explore to find new resources", Map.of()).isPresent());
+        assertEquals(Optional.empty(), ProgressPlanner.goalProblem(ProgressPlanner.FALLBACK_GOAL,
+                Map.of("minecraft:iron_pickaxe", 1)));
+    }
+
+    @Test
+    void fallbackGoalIsADiamondGoalThatNeedsAnIronPickaxe() {
+        assertEquals("mine 3 minecraft:diamond", ProgressPlanner.FALLBACK_GOAL);
+        assertTrue(ProgressPlanner.goalProblem(ProgressPlanner.FALLBACK_GOAL,
+                Map.of("minecraft:stone_pickaxe", 1)).isPresent());
     }
 
     @Test
@@ -459,17 +476,6 @@ class ProgressPlannerTest {
         assertEquals(List.of("craft 4 minecraft:stick", "craft 1 minecraft:wooden_sword", "gather food"),
                 ProgressPlanner.stepsForGoal("gather food", Map.of("minecraft:oak_planks", 6),
                         ProgressPlanner.TableAccess.HOME_NEARBY, OAK), "never hunt bare-handed");
-    }
-
-    @Test
-    void backToBackCraftsKeepTheTable() {
-        Map<String, Integer> inventory = Map.of("minecraft:oak_log", 8);
-        String goal = "craft 1 minecraft:wooden_pickaxe";
-        var access = ProgressPlanner.TableAccess.NONE;
-        var steps = ProgressPlanner.stepsForGoal(goal, inventory, access, "minecraft:oak_log");
-        assertEquals("mine 1 minecraft:crafting_table", steps.get(steps.size() - 1));
-        var kept = ProgressPlanner.keepTableForNext(goal, steps, inventory, access, "minecraft:oak_log");
-        assertEquals(steps.size() - 1, kept.size());
     }
 
     @Test
